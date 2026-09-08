@@ -24,8 +24,10 @@ GET /rotate/status (device-key auth) returns live state for the admin page.
 
 import asyncio
 import json
+import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -104,7 +106,11 @@ STATE = load_state()
 
 
 def save_state() -> None:
-    STATE_PATH.write_text(json.dumps(STATE, indent=2))
+    # Write-then-rename so a crash mid-write can never leave a truncated
+    # state.json (which would refuse to parse on the next start).
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(STATE, indent=2))
+    tmp.replace(STATE_PATH)
 
 
 def audit(rec: dict) -> None:
@@ -358,10 +364,58 @@ def api_cost(model: str | None, usage: dict) -> float:
     ) / 1_000_000
 
 
-def aggregate_audit() -> dict:
-    """Roll up audit.jsonl by device/model/account, with a last-hour window and alerts."""
+# Incremental tail of audit.jsonl: every stat aggregate_audit() serves is a
+# rolling 24h window, so only that window is kept parsed in memory and each
+# call reads just the bytes appended since the previous one — instead of
+# re-parsing the whole (unbounded, append-only) file per panel view.
+_AUDIT_CACHE: dict = {"offset": 0, "records": deque(), "sig": b""}
+
+
+def _tail_audit() -> None:
     import datetime as dt
 
+    cache = _AUDIT_CACHE
+    if not AUDIT_PATH.exists():
+        cache["offset"] = 0
+        cache["sig"] = b""
+        cache["records"].clear()
+        return
+    day_ago = time.time() - 86400
+    with AUDIT_PATH.open("rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        head = f.read(64)
+        # A shrunken file, or changed leading bytes, means audit.jsonl was
+        # rotated or rewritten out from under us — the cached window no
+        # longer describes this file, so rebuild from the top. (Size alone
+        # can't catch truncate-and-rewrite-bigger; the head fingerprint can.)
+        if size < cache["offset"] or not head.startswith(cache["sig"]):
+            cache["offset"] = 0
+            cache["records"].clear()
+        cache["sig"] = head
+        if size == cache["offset"]:
+            return
+        f.seek(cache["offset"])
+        chunk = f.read()
+    # Consume complete lines only; a trailing partial line (an append in
+    # flight from a writer outside this process) is left for the next call.
+    end = chunk.rfind(b"\n") + 1
+    cache["offset"] += end
+    for line in chunk[:end].splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            rec["_ts"] = dt.datetime.strptime(
+                rec.get("ts", ""), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+        except ValueError:
+            continue
+        if rec["_ts"] >= day_ago:
+            _AUDIT_CACHE["records"].append(rec)
+
+
+def aggregate_audit() -> dict:
+    """Roll up the last 24h of audit.jsonl by device/model/account, with alerts."""
     now = time.time()
     hour_ago = now - 3600
     day_ago = now - 86400
@@ -383,39 +437,32 @@ def aggregate_audit() -> dict:
         b["cache_write"] += usage.get("cache_creation_input_tokens", 0)
         b["cost_usd"] += cost
 
-    if AUDIT_PATH.exists():
-        with AUDIT_PATH.open() as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                usage = rec.get("usage") or {}
-                try:
-                    ts = dt.datetime.strptime(rec.get("ts", ""), "%Y-%m-%dT%H:%M:%S%z").timestamp()
-                except ValueError:
-                    ts = 0
-                if ts < day_ago:
-                    continue
-                cost = api_cost(rec.get("model"), usage)
-                dev = rec.get("device", "?")
-                meta = device_meta.setdefault(dev, {})
-                if ts >= meta.get("last_ts", 0):
-                    meta.update({"last_ts": ts, "last_model": rec.get("model"),
-                                 "last_account": rec.get("account")})
-                bump(by_device, rec.get("device", "?"), usage, cost)
-                bump(by_model, rec.get("model") or "?", usage, cost)
-                bump(by_account, rec.get("account", "?"), usage, cost)
-                if ts >= hour_ago:
-                    total = sum(usage.get(k, 0) for k in (
-                        "input_tokens", "output_tokens", "cache_creation_input_tokens"))
-                    device_hour_tokens[rec.get("device", "?")] = (
-                        device_hour_tokens.get(rec.get("device", "?"), 0) + total)
-                    device_hour_reqs[dev] = device_hour_reqs.get(dev, 0) + 1
-                    model = rec.get("model") or ""
-                    if any(p in model for p in ALERT_CFG["expensive_model_patterns"]):
-                        key = f'{rec.get("device", "?")} / {model}'
-                        expensive_hour[key] = expensive_hour.get(key, 0) + 1
+    _tail_audit()
+    records = _AUDIT_CACHE["records"]
+    while records and records[0]["_ts"] < day_ago:
+        records.popleft()
+    for rec in records:
+        usage = rec.get("usage") or {}
+        ts = rec["_ts"]
+        cost = api_cost(rec.get("model"), usage)
+        dev = rec.get("device", "?")
+        meta = device_meta.setdefault(dev, {})
+        if ts >= meta.get("last_ts", 0):
+            meta.update({"last_ts": ts, "last_model": rec.get("model"),
+                         "last_account": rec.get("account")})
+        bump(by_device, rec.get("device", "?"), usage, cost)
+        bump(by_model, rec.get("model") or "?", usage, cost)
+        bump(by_account, rec.get("account", "?"), usage, cost)
+        if ts >= hour_ago:
+            total = sum(usage.get(k, 0) for k in (
+                "input_tokens", "output_tokens", "cache_creation_input_tokens"))
+            device_hour_tokens[rec.get("device", "?")] = (
+                device_hour_tokens.get(rec.get("device", "?"), 0) + total)
+            device_hour_reqs[dev] = device_hour_reqs.get(dev, 0) + 1
+            model = rec.get("model") or ""
+            if any(p in model for p in ALERT_CFG["expensive_model_patterns"]):
+                key = f'{rec.get("device", "?")} / {model}'
+                expensive_hour[key] = expensive_hour.get(key, 0) + 1
 
     alerts = []
     for dev, toks in device_hour_tokens.items():
