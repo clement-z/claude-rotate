@@ -1,8 +1,39 @@
 # Service operations — Debian 12
 
-Manage the installed service over SSH using systemd. The web dashboard is
-read-only; account and device administration uses the configuration files below.
-For installation or migration, see [the deployment guide](deploy/README.md).
+Manage the installed service over SSH. Accounts, device keys and the active
+upstream account are administered with `claude-rotate-admin`, installed by
+`install.sh`; the web dashboard is read-only. For installation, upgrades and
+removal, see [the deployment guide](deploy/README.md).
+
+## Install, upgrade, remove
+
+Run from a checkout of this repository, as root. The commands are repeatable.
+
+```sh
+sudo ./install.sh                      # install or upgrade; leaves the service stopped until configured
+sudo claude-rotate-admin add-token acct-1      # paste the output of: claude setup-token
+sudo claude-rotate-admin add-user alice-laptop # prints the two export lines for that device
+sudo claude-rotate-admin status
+```
+
+`install.sh` builds a root-owned release under `/opt/claude-rotate/releases/`,
+installs the unit and `/usr/local/sbin/claude-rotate-admin`, and keeps an
+existing `/etc/claude-rotate` as it is. A fresh install has no accounts or
+devices, so the unit stays disabled and stopped and the script prints
+`installed: setup needed`. The first `add-user` after the first `add-token`
+enables and starts the service. Running `install.sh` again from a newer
+checkout builds a new release, switches `current` and restarts the service.
+
+```sh
+sudo ./uninstall.sh                  # removes service, code and admin command; keeps config, tokens, state, logs, identity
+sudo ./uninstall.sh --purge          # also deletes /etc/claude-rotate, /var/lib/claude-rotate, /var/log/claude-rotate and the service user
+sudo ./uninstall-legacy.sh           # same as uninstall.sh, plus the manual releases 89ec74a and 89ec74a-recovery.*
+```
+
+Both uninstall scripts stop the service first and refuse to run when the unit,
+the admin wrapper or the `current` link is not the one this project installs.
+Home checkouts, staging directories, Tailscale Serve routes and other services
+are never touched. See [Removal](deploy/README.md#removal) for details.
 
 ## Everyday commands
 
@@ -24,6 +55,9 @@ The unit retries failures after 10 seconds and has a 45-second event-loop
 watchdog. An explicit stop stays stopped until started again, or until reboot
 if the service is enabled. Stops/restarts allow a bounded drain but can interrupt
 requests. Invalid configuration can cause repeated startup failures; check logs.
+`claude-rotate-admin` stops and disables the service when the configuration has
+no enabled account token or no device key, so an unconfigured install does not
+restart in a loop.
 
 ## Health and limits
 
@@ -56,43 +90,71 @@ upstream token validity; also test a small Claude request through the proxy.
 | Active release symlink | `/opt/claude-rotate/current` |
 | Versioned code and virtual environments | `/opt/claude-rotate/releases/` |
 | Installed systemd unit | `/etc/systemd/system/claude-rotate.service` |
+| Admin command | `/usr/local/sbin/claude-rotate-admin` |
+| Lock shared by install, uninstall and admin | `/run/claude-rotate.lock` |
 
-Config and token files should be `0640 root:claude-rotate`; their directories
-are `0750 root:claude-rotate`. State/log directories are private to the service.
+Config and token files are `0640 root:claude-rotate`; their directories are
+`0750 root:claude-rotate`. State/log directories are private to the service.
 Keep a protected backup of `/etc/claude-rotate`; it contains bearer credentials.
 For a consistent backup of mutable state/logs, stop the service before copying.
 
-## Configuration and credentials
+## Accounts and devices
 
-Back up the live config before editing. These commands check JSON syntax and
-restart only if editing and the syntax check succeed:
+`claude-rotate-admin` works from any directory and needs root. It validates the
+configuration, writes files atomically with the modes above, holds a lock so
+concurrent commands cannot lose each other's changes, and then restarts the
+service so the change is live. It prints `is live` only after systemd reports
+the service active; otherwise it says `NOT live` and exits 2.
 
-```sh
-sudoedit /etc/claude-rotate/config.json &&
-sudo python3 -m json.tool /etc/claude-rotate/config.json >/dev/null &&
-sudo systemctl restart claude-rotate
-```
+| Action | Command |
+| --- | --- |
+| Show service, accounts, devices, active account | `sudo claude-rotate-admin status` (`--json` for scripts) |
+| Add an account, or replace an existing account's token | `sudo claude-rotate-admin add-token NAME` |
+| Add a device and print its two `export` lines | `sudo claude-rotate-admin add-user NAME` |
+| Revoke a device | `sudo claude-rotate-admin remove-user NAME` |
+| Remove an account and delete its token file | `sudo claude-rotate-admin remove-token NAME` |
+| Set the URL printed for new devices | `sudo claude-rotate-admin set-url https://HOST` |
+| Switch to the next eligible account, or to ACCOUNT | `sudo claude-rotate-admin rotate [ACCOUNT]` |
+| Validate config.json after a manual edit and restart | `sudo claude-rotate-admin activate` |
 
-Check status/logs afterward. JSON syntax validation does not validate account
-tokens. Config and token changes require a restart; there is no hot reload.
+`add-account`, `add-device`, `remove-account` and `remove-device` are aliases.
+Names are 1-64 ASCII letters, digits, `_` or `-`, starting with a letter or
+digit. `add-token` asks for the token with a hidden prompt; in a script, pipe it
+on stdin or pass `--token-file PATH`. Tokens never appear on the command line or
+in the output. Adding a device whose name exists is refused; use `remove-user`
+then `add-user` to issue a new key. `--no-restart` stores a change without
+touching the service.
 
-- Revoke a device: remove its entry from `devices`, then restart.
-- Disable an account: set `"disabled": true` on that account, then restart.
-- Prefer an account: assign a lower numeric `priority` than other accounts.
-- Renew an account token: generate it with `claude setup-token`, install it at
-  the configured token path with the ownership/mode above, then restart.
-- Add accounts/devices: work from a private staging copy of the **current live
-  config**, use `setup.sh add-account` / `add-device` there, explicitly install
-  the updated config/token files into `/etc/claude-rotate`, then restart.
+Manual edits remain possible with `sudoedit /etc/claude-rotate/config.json`
+followed by `sudo claude-rotate-admin activate`, which checks the JSON and the
+readiness rules before restarting. Supported manual settings include
+`"disabled": true` and `"priority"` on an account and the rotation policy keys.
+Config and token changes always require a restart; there is no hot reload.
 
-`setup.sh` edits files beside itself. Running it in an old checkout or staging
-directory does **not** update the installed service. Reinstalling an outdated
-staging config can undo later additions or revocations. Keep secrets out of Git.
+## Switching the upstream account
 
-For systemd resource overrides, use `sudo systemctl edit claude-rotate`, then
-`sudo systemctl daemon-reload` and `sudo systemctl restart claude-rotate`.
-Application JSON edits alone do not need `daemon-reload`. See the deployment
-guide before changing resource or writable-directory limits.
+`rotate` makes another account active. Without an argument it picks the next
+account in configuration order that exists, is not disabled, has a non-empty
+token file and is under both utilization thresholds according to the saved
+state; with an argument it checks the same rules for that account and refuses
+otherwise. Nothing is written when a request is refused.
+
+The command stops the service, re-reads the state the service saved while
+draining, re-checks the target, writes the new active account with a `manual`
+switch event, and starts the service again. In-flight requests get the normal
+drain period. If the service is not running, the file is updated and the switch
+applies at the next start.
+
+The manual choice is protected by the normal switch cooldown
+(`switch_cooldown_s`, 300 s by default). After that the configured policy
+applies again: `consume-first`, `priority` and the thresholds can move traffic
+to another account, and a quota exhaustion or a disabled account moves it
+immediately. To prefer one account durably, give it a lower `priority` in the
+configuration. `status` shows the active account from the saved state and,
+while the service runs, from the live `/rotate/status` response together with
+`storage_errors`, per-account last-seen times and upstream status. A present
+token file says nothing about whether the token is still valid; only real
+upstream traffic does.
 
 ## Tailscale and dashboard
 
@@ -118,14 +180,14 @@ which avoids putting the key in a URL.
 
 ## Updates and rollback
 
-Build a new release and virtual environment in a new final directory, install
-from its `requirements.lock`, and validate it before promotion. Do not run
-`git pull` or `pip install` inside the active release. Stop the service, switch
-`current` to the new release, and start it. Keep the previous release and unit
-for rollback; restore compatible config/unit files if needed. Check real client
-traffic after switching. Dependency upgrades, especially uvicorn, require the
-runner tests and service acceptance checks.
+Run `sudo ./install.sh` from the reviewed newer checkout. It builds a new
+release and virtual environment at a new final directory from
+`requirements.lock`, switches `current` atomically and restarts the service.
+Previous releases are kept for rollback; nothing is installed into the active
+release. Check real client traffic after switching. Dependency upgrades,
+especially uvicorn, require the runner tests and service acceptance checks.
 
-Follow the [upgrade and rollback procedure](deploy/README.md#immutable-upgrades-and-rollback).
+To roll back, follow the [manual rollback procedure](deploy/README.md#immutable-upgrades-and-rollback)
+with a previous release directory.
 The [Debian systemctl reference](https://manpages.debian.org/bookworm/systemd/systemctl.1.en.html)
 documents service-control commands.

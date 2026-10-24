@@ -111,6 +111,22 @@ pip install -r requirements.txt
 python3 rotator.py
 ```
 
+That is the standalone, run-it-yourself layout. On a Debian 12 server, install
+it as a hardened systemd service instead and administer it from any directory:
+
+```bash
+git clone <this repo> && cd claude-rotate
+sudo ./install.sh                               # leaves the service stopped until configured
+sudo claude-rotate-admin add-token acct-1       # paste token from: claude setup-token
+sudo claude-rotate-admin add-user my-laptop     # prints the env vars for that device; starts the service
+sudo claude-rotate-admin status
+```
+
+`sudo ./uninstall.sh` removes the service again and keeps your config and tokens
+(`--purge` deletes them). See [OPERATIONS.md](OPERATIONS.md) for the admin
+commands, including `rotate`, and [deploy/README.md](deploy/README.md) for what
+the installer does.
+
 ## Generating account tokens (`claude setup-token`)
 
 Each subscription account contributes one long-lived OAuth token. Facts below
@@ -127,8 +143,10 @@ claude setup-token
   local callback (headless server, SSH session), it falls back to a paste-a-code
   flow — so you can mint tokens on the proxy server itself.
 - Prints a token starting `sk-ant-oat01-…` to the terminal and does **not**
-  save it anywhere — copy it straight into `./setup.sh add-account <name>`,
-  which stores it under `tokens/` (chmod 600, gitignored).
+  save it anywhere — copy it straight into `./setup.sh add-account <name>`
+  (standalone: stores it under `tokens/`, chmod 600, gitignored) or into
+  `sudo claude-rotate-admin add-token <name>` (Debian service: stores it under
+  `/etc/claude-rotate/tokens/`, readable by root and the service only).
 - Valid for **about one year**. Requires a Claude subscription (Pro, Max,
   Team, or Enterprise).
 
@@ -437,11 +455,12 @@ For routine Debian service management, see the [operations quick guide](OPERATIO
 
 - **macOS**: `deploy/com.example.claude-rotate.plist` (read its comments —
   launchd needs the full python3 path and a local-disk install).
-- **Debian 12 / Linux**: follow [the hardened systemd deployment guide](deploy/README.md).
-  The supplied unit uses a dedicated account, root-owned releases, separate private
+- **Debian 12 / Linux**: `sudo ./install.sh`, then `sudo claude-rotate-admin
+  add-token` / `add-user`; see [the deployment guide](deploy/README.md). The
+  supplied unit uses a dedicated account, root-owned releases, separate private
   state/log directories, watchdog recovery, and conservative limits for a small
-  VPS. Provision those paths before enabling it; this replaces the old home-directory
-  unit template. Migration and rollback instructions are included.
+  VPS. `sudo ./uninstall.sh` removes it and keeps the configuration. Migration
+  and rollback instructions are included.
 
 ## Troubleshooting
 
@@ -449,13 +468,15 @@ For routine Debian service management, see the [operations quick guide](OPERATIO
 rejecting the *device* (the error body names claude-rotate, so it's not
 Anthropic). The device's `CLAUDE_CODE_OAUTH_TOKEN` doesn't match any entry in
 `config.json` `devices{}` — re-check the key, or re-run
-`./setup.sh add-device` and restart.
+`./setup.sh add-device` (standalone) / `sudo claude-rotate-admin add-user`
+(Debian service) and restart.
 
 **Client gets a 401 whose error body comes from Anthropic.** The *account
 token* the proxy swapped in was rejected upstream — on a previously working
 account this almost always means the setup token died (revoked, or hit its
-~1-year expiry). Re-mint with `claude setup-token`, replace
-`tokens/<name>.token`, restart.
+~1-year expiry). Re-mint with `claude setup-token`, then replace
+`tokens/<name>.token` and restart, or on the Debian service run
+`sudo claude-rotate-admin add-token <name>` for the existing account.
 
 **A request seems to hang.** If every account is spent and `hold_max_s` is
 set, that's hold-until-reset doing its job — the request is parked until the
@@ -465,13 +486,15 @@ soonest 5h window reset. Check `recent_events` in `/rotate/status` for a
 **"Why did it switch accounts?"** Every switch is an event in
 `/rotate/status` → `recent_events` (and the panel's *Recent switches*), with a
 reason: `quota_exhausted`, `utilization>=<threshold>`, `consume_first`,
-`priority_recovery`, or `account_disabled`. If you saw a 429 upstream but *no*
+`priority_recovery`, `account_disabled`, or `manual` (an operator ran
+`claude-rotate-admin rotate`). If you saw a 429 upstream but *no*
 switch, it was a per-minute burst — the proxy paced the same account on
 purpose (see [Rotation policy](#rotation-policy)).
 
 **Config edits don't take effect.** Config is read once at startup. Restart:
 `launchctl kickstart -k gui/$(id -u)/<label>` (macOS) or
-`systemctl restart claude-rotate` (Linux). Hot reload is on the roadmap.
+`sudo claude-rotate-admin activate` (Debian service; validates the config, then
+restarts). Hot reload is on the roadmap.
 
 **Does the VS Code extension work?** Yes — it honours the same
 `ANTHROPIC_BASE_URL` / `CLAUDE_CODE_OAUTH_TOKEN` environment variables. Launch
@@ -523,14 +546,18 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
   include non-message upstream responses too. Storage-write failures are reported
   in the journal and `/rotate/status` `storage_errors`; requests continue, so
   audit/state persistence can be lost until storage is repaired.
-- **What to back up.** `tokens/` and `config.json` — that's the whole
-  identity of the install. `state.json` is disposable (quota state is
-  re-learned from the first responses; you only lose the events history), and
-  `logs/` is disposable analytics.
-- **Upgrades.** For the Debian service, build/test a new immutable release and
-  use the [promotion/rollback procedure](deploy/README.md#immutable-upgrades-and-rollback).
+- **What to back up.** `tokens/` and `config.json` (`/etc/claude-rotate/` on
+  the Debian service) — that's the whole identity of the install. `state.json`
+  is disposable (quota state is re-learned from the first responses; you only
+  lose the events history), and `logs/` is disposable analytics.
+- **Upgrades.** For the Debian service, run `sudo ./install.sh` from the newer
+  reviewed checkout; it builds a new immutable release and switches to it. Roll
+  back with the [manual procedure](deploy/README.md#immutable-upgrades-and-rollback).
   Other installations should also test with dummy credentials before restarting.
   Check the active account, gauges, and an actual streamed request afterwards.
+- **Manual account switch.** `sudo claude-rotate-admin rotate [ACCOUNT]` makes
+  another usable account active, with a brief restart. The configured policy
+  resumes after the switch cooldown; see [OPERATIONS.md](OPERATIONS.md#switching-the-upstream-account).
 - **Health check.** Monitor `/rotate/status` using an `Authorization: Bearer`
   header, then separately monitor real provider success. Local readiness/watchdog
   checks cannot detect an expired provider token or an upstream outage. Keep

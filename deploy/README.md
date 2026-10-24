@@ -5,90 +5,113 @@ asyncio/h11 uvicorn worker. Keep the proxy on `127.0.0.1:8484`; publish it to
 trusted devices through Tailscale Serve. No public listener or IP allowlist is
 needed. DNS, certificate verification, and outbound HTTPS remain available.
 
-The following commands are operator instructions, not an automated installer.
-Run them on the destination only after reviewing paths and configuration. Never
-copy a running developer checkout, its writable virtualenv, or its secrets into
-`/opt` wholesale.
+## Installer
 
-## Fresh installation
-
-As root, install Debian prerequisites and create the non-login service identity:
+`install.sh` performs the installation below from a reviewed checkout, as root,
+and is safe to rerun:
 
 ```sh
-apt-get update
-apt-get install --no-install-recommends python3 python3-venv ca-certificates openssl adduser
-adduser --system --group --no-create-home --home /nonexistent claude-rotate
-install -d -o root -g root -m 0755 /opt/claude-rotate/releases
-install -d -o root -g claude-rotate -m 0750 /etc/claude-rotate
-install -d -o root -g claude-rotate -m 0750 /etc/claude-rotate/tokens
+sudo ./install.sh
+sudo claude-rotate-admin add-token acct-1       # paste the output of: claude setup-token
+sudo claude-rotate-admin add-user alice-laptop  # prints the device's two export lines
+sudo claude-rotate-admin status
 ```
 
-Obtain a reviewed source revision in a private operator workspace. Build a new,
-uniquely named release (replace `RELEASE` below with that revision or a unique
-build ID). Copy only these application files from that reviewed checkout:
+What it does, in order: installs missing Debian prerequisites (`python3`,
+`python3-venv`, `openssl`, `adduser`, `ca-certificates`; `--no-apt` fails
+instead), reuses or creates the `claude-rotate` system user, builds a root-owned
+release at `/opt/claude-rotate/releases/<id>` (`<id>` is derived from the source
+files, so identical source reuses its complete release and an interrupted build
+is rebuilt), creates `/etc/claude-rotate/config.json` with no accounts or devices
+or adopts an existing one (ownership and modes normalized, JSON validated),
+installs the unit and `/usr/local/sbin/claude-rotate-admin`, switches `current`
+atomically, verifies the unit, and finally runs `claude-rotate-admin activate`.
+When no enabled account token and device key exist yet, the unit is left
+disabled and stopped and the script prints `installed: setup needed`; otherwise
+the service is enabled and started, or restarted into the new release.
+
+The release marker `.claude-rotate-release` identifies directories the installer
+built; `.claude-rotate-building` marks a build in progress. The active release is
+never modified or deleted. Install, uninstall and the admin command share the
+lock `/run/claude-rotate.lock`. The installer refuses to proceed when
+`claude-rotate.service`, the admin wrapper or `current` exist but were not
+created by this project, or when any managed path is a symbolic link.
+
+`claude-rotate-admin` is a standard-library Python program shipped inside every
+release (`deploy/claude_rotate_admin.py`) and run through the wrapper with the
+release's own interpreter. Its commands are documented in
+[OPERATIONS.md](../OPERATIONS.md#accounts-and-devices). Exit codes: 0 done,
+1 refused with nothing changed, 2 stored but the service failed to (re)start,
+3 stored but the configuration is still incomplete (service left disabled).
+
+## Removal
 
 ```sh
-release=/opt/claude-rotate/releases/RELEASE
-install -d -o root -g root -m 0755 "$release/deploy"
-install -o root -g root -m 0644 rotator.py oai_compat.py requirements.txt requirements.lock "$release/"
-install -o root -g root -m 0644 deploy/systemd_runner.py "$release/deploy/"
-python3 -m venv "$release/.venv"
-"$release/.venv/bin/python" -m pip install -r "$release/requirements.lock"
-"$release/.venv/bin/python" -m pip freeze > "$release/installed-requirements.txt"
-chown -R root:root "$release"
-chmod -R u=rwX,go=rX "$release"
+sudo ./uninstall.sh                     # keep /etc/claude-rotate, state, logs and the service identity
+sudo ./uninstall.sh --purge [--yes]     # also delete them and the claude-rotate user/group
+sudo ./uninstall-legacy.sh [--purge]    # also remove the manual releases 89ec74a and 89ec74a-recovery.*
 ```
+
+Before changing anything, the script takes the shared lock and checks every
+target: the unit must contain this project's `ExecStart` line, the wrapper its
+marker line, `current` must be a symlink to a direct child of `releases/`, and no
+managed directory or ancestor may be a symlink. Any failure aborts with nothing
+removed. It then runs `systemctl disable --now` and deletes files only after
+`systemctl is-active` reports `inactive` or `failed`. Removed: the unit, the
+wrapper, the `current`/`current.next` links and release directories carrying an
+installer marker. Kept and reported: unknown directories under `releases/`,
+drop-ins, and by default `/etc/claude-rotate`, `/var/lib/claude-rotate`,
+`/var/log/claude-rotate` and the identity, so a later `install.sh` adopts them.
+
+`--legacy` additionally removes release directories named exactly `89ec74a`,
+`89ec74a7c7e22501df50f417a3d23da8d27ae428` or either with a
+`-recovery.<suffix>` part, and only when their contents are the expected runtime
+files (an interrupted virtualenv counts). Hash-looking names or a stray
+`rotator.py` are not enough. `--purge` asks for confirmation unless `--yes` is
+given, refuses symlinked data roots, and deletes the identity only when it is a
+system account with home `/nonexistent`, a nologin shell, primary group
+`claude-rotate` and no running process. Home checkouts, staging directories such
+as `~/claude-rotate-install.*`, Tailscale Serve routes and other services are
+never touched. Repeated runs exit 0.
+
+## Layout and permissions
+
+`install.sh` is the only supported provisioning path; there is no separate manual
+recipe, because the admin command it installs is part of the layout. What it
+produces, and what any hand-built release must match:
+
+| Path | Owner / mode | Notes |
+| --- | --- | --- |
+| `/opt/claude-rotate/releases/<id>/` | root, dirs `0755`, files `0644` | `rotator.py`, `oai_compat.py`, `requirements*.txt/.lock`, `config.example.json`, `deploy/systemd_runner.py`, `deploy/claude_rotate_admin.py`, `.venv/`, `installed-requirements.txt`, `.claude-rotate-release` |
+| `/opt/claude-rotate/current` | root symlink | switched atomically to a complete release only |
+| `/usr/local/sbin/claude-rotate-admin` | root `0755` | wrapper; runs the admin module from `current` with the release interpreter |
+| `/etc/systemd/system/claude-rotate.service` | root `0644` | copy of `deploy/claude-rotate.service` |
+| `/etc/claude-rotate/`, `tokens/` | `root:claude-rotate 0750` | `config.json` and `tokens/*.token` are `0640 root:claude-rotate` |
+| `/var/lib/claude-rotate`, `/var/log/claude-rotate` | `claude-rotate 0700` | created by systemd (`StateDirectory`/`LogsDirectory`); files `0600` |
+| `claude-rotate` user/group | system account, home `/nonexistent`, no login | created once; an existing account is reused |
+
+Never copy a running developer checkout, its writable virtualenv, or its secrets
+into `/opt` wholesale. The service account must have read/execute access, and no
+write access, to the entire code/venv tree; it reads config and tokens through
+the group and writes only its state and log directories.
 
 `requirements.lock` pins the complete tested Debian 12 / Python 3.11 package
 versions. It is a version snapshot, not an artifact-hash or supply-chain attestation.
 The general `requirements.txt` retains minimum versions for development. Update
 the deployment snapshot deliberately in a fresh environment, scan dependencies,
-and rerun the tests before promotion. Build each venv at its final release path;
-moving it later can break executable shebangs. The service account must have
-read/execute access, and no write access, to the entire code/venv tree.
+and rerun the tests before promotion. The installer builds each venv at its final
+release path; moving a venv later can break executable shebangs.
 
-Create credentials as the operator in a private staging directory using the
-existing setup script. This script writes beside itself, regardless of the
-current shell directory. Keep it out of the installed release and `/etc`:
-
-```sh
-umask 077
-stage=$(mktemp -d)
-install -m 0700 setup.sh "$stage/setup.sh"
-install -m 0600 config.example.json "$stage/config.example.json"
-"$stage/setup.sh" init
-"$stage/setup.sh" add-account acct-1
-"$stage/setup.sh" add-device my-laptop
-```
-
-`add-account` asks for a real token obtained with `claude setup-token` in an
-account's authenticated session. Keep the device key it prints private. Do not
-use `onboard` for staging: it can restart an existing service. Edit the staged
-`config.json` to remove unused example accounts, confirm real device keys, set
-`bind` to `127.0.0.1`, and review the rotation policy. Relative token paths such
-as `tokens/acct-1.token` resolve against `/etc/claude-rotate`, the directory of
-the selected config, not the code directory.
-
-Explicitly install only the intended config and token files as root. Repeat the
-token command for each configured account; do not install placeholders:
-
-```sh
-install -o root -g claude-rotate -m 0640 "$stage/config.json" /etc/claude-rotate/config.json
-install -o root -g claude-rotate -m 0640 "$stage/tokens/acct-1.token" /etc/claude-rotate/tokens/acct-1.token
-ln -s "$release" /opt/claude-rotate/current
-install -o root -g root -m 0644 deploy/claude-rotate.service /etc/systemd/system/claude-rotate.service
-systemd-analyze verify /etc/systemd/system/claude-rotate.service
-systemctl daemon-reload
-systemctl enable --now claude-rotate.service
-systemctl status claude-rotate.service
-```
-
-The fresh-install `ln -s` assumes `current` does not exist; use the upgrade
-procedure when it does. Keep a protected backup of config/tokens, then remove
-the private staging copy when no longer needed. Neither secrets nor state
-belong in the release tree or source control. No service-side token renewal is
-provided; replace expired/revoked tokens through the same staging/install flow
-and restart.
+Credentials are created in place with `claude-rotate-admin`, which writes
+`/etc/claude-rotate/config.json` and `tokens/NAME.token` with the ownership and
+modes above and restarts the service. Do not run `setup.sh` inside
+`/etc/claude-rotate`: its `0600`/`0700` modes make the files unreadable to the
+service account. Relative token paths such as `tokens/acct-1.token` resolve
+against `/etc/claude-rotate`, the directory of the selected config, not the code
+directory. Keep a protected backup of `/etc/claude-rotate`. Neither secrets nor
+state belong in the release tree or source control. Renew an expired or revoked
+token with `claude-rotate-admin add-token NAME` for the existing account; it
+replaces the token file and restarts the service.
 
 ## Runtime and operations
 
@@ -210,49 +233,81 @@ See the [Tailscale Serve command reference](https://tailscale.com/docs/reference
 for background serving and route management.
 
 Use the HTTPS URL reported by Serve as clients' `ANTHROPIC_BASE_URL` and keep the
-proxy's device authentication enabled. Set `public_url` in the staged config to
-that URL before installing it if setup's printed instructions should use it.
+proxy's device authentication enabled. Run
+`sudo claude-rotate-admin set-url https://<your-tailnet-host>` so the admin's
+client instructions use that URL.
 Review tailnet access policy and existing Serve routes before changing them.
 Do not enable Funnel for this service. Serve must pass SSE without buffering;
 verify a streamed request over the actual tailnet path. Starting Serve is a
 separate operator action; it is not performed by this unit.
 
-## Migration from a home-directory service
+## Migration from a manual or home-directory service
+
+### Manual installation in this layout
+
+A manual installation that already uses this layout (`/opt/claude-rotate/releases/*`,
+`current`, `/etc/claude-rotate`, the unit from this repository, including the
+`89ec74a` and `89ec74a-recovery.*` releases) is migrated in this order:
+
+```sh
+sudo ./uninstall-legacy.sh      # stops the manual service; removes its unit, current link and releases; keeps /etc, state, logs, identity
+sudo ./install.sh               # adopts /etc/claude-rotate and starts the service when accounts and devices exist
+sudo claude-rotate-admin status
+```
+
+The uninstall step keeps `/etc/claude-rotate`, `/var/lib/claude-rotate`,
+`/var/log/claude-rotate` and the service account, so the reinstall needs no
+reconfiguration. Expect a short outage between the two commands.
+
+Running `install.sh` directly also works: it adopts the configuration, builds a
+new release, switches `current` and restarts into it. The old manual release
+directories then stay under `/opt/claude-rotate/releases/` unused. Do **not**
+run `uninstall-legacy.sh` or `uninstall.sh` after that to tidy them: both
+scripts remove the whole installation (unit, admin command, `current` and the
+new releases too), not only the old directories. To remove the old
+directories after a direct install, confirm `readlink /opt/claude-rotate/current`
+points elsewhere and delete them by hand.
+
+### Home-directory service (outside the automated path)
+
+A service that runs from a home checkout with its own `claude-rotate.service`
+has a unit `install.sh` does not recognize, and the installer refuses to
+overwrite it. The installer does not migrate this layout automatically; do the
+following by hand, planning a short outage:
 
 1. Inventory the old unit/drop-ins (`systemctl cat claude-rotate.service`) and
    back up its config, tokens, state, and audit logs privately. Do not run setup
-   against live files. Build a fresh root-owned release/venv as above.
-2. Copy the old config/tokens into private staging, normalize relative token
-   paths to `tokens/NAME.token` (or install referenced absolute paths explicitly),
-   confirm the loopback bind and remove placeholders. Install to `/etc` with the
-   ownership/modes above. A previous token mode of `0600` owned by the operator
-   must become `0640 root:claude-rotate` for this account to read it.
-3. Plan a short outage. Stop the old service before copying mutable state/logs
-   or starting the replacement on the same port. Preserve the old install for
-   rollback. Do not leave an old launch mechanism running in parallel.
-4. Before starting the new unit, provision private state/log directories with
-   `install -d -o claude-rotate -g claude-rotate -m 0700 /var/lib/claude-rotate /var/log/claude-rotate`.
-   Optionally install the stopped old `state.json` to
-   `/var/lib/claude-rotate/state.json` and `logs/audit.jsonl` to
-   `/var/log/claude-rotate/audit.jsonl`, both `0600 claude-rotate:claude-rotate`.
-   State and analytics may also be discarded deliberately; config/tokens may not.
-   Archive oversized historical audit logs privately instead of importing all
-   history into the active file. Preserve any existing rotated backups separately.
-5. Install/verify the new unit, inspect old drop-ins for conflicting `ExecStart`,
-   user, environment, and directory settings, then daemon-reload and start.
-   Confirm status, journal, private file permissions, authenticated status, and
+   against live files.
+2. Stop and disable the old service, then move its unit and drop-ins aside and
+   reload systemd, for example:
+   `systemctl disable --now claude-rotate.service`,
+   `mv /etc/systemd/system/claude-rotate.service /root/claude-rotate.service.old`,
+   `systemctl daemon-reload`. Keep the old checkout for rollback; do not leave an
+   old launch mechanism running in parallel.
+3. Copy the old `config.json` and token files into `/etc/claude-rotate` and
+   `/etc/claude-rotate/tokens` as root, normalize relative token paths to
+   `tokens/NAME.token`, confirm the loopback bind and remove placeholder
+   devices. `install.sh` normalizes ownership and modes to
+   `0640`/`0750 root:claude-rotate`; a previous operator-owned `0600` token is
+   unreadable to the service account until then.
+4. Run `sudo ./install.sh`. It adopts the copied configuration and starts the
+   service when an enabled account token and a device key exist. Confirm
+   `claude-rotate-admin status`, the journal, an authenticated status request and
    a streamed request through the intended client path. Update backup/monitoring
-   paths and retire only the old launcher after verification.
+   paths and retire the old checkout only after verification.
 
 ## Immutable upgrades and rollback
 
-Build each new release and venv at a new final path, record resolved dependency
-versions, and test it before switching. Never `git pull` or `pip install` into
-the active release. Update config separately with a protected backup; restart
-is required for configuration/token changes.
+`sudo ./install.sh` from a newer reviewed checkout is the upgrade: it builds the
+new release and venv at a new final path, records resolved dependency versions
+in `installed-requirements.txt`, switches `current` atomically and restarts the
+service. Never `git pull` or `pip install` into the active release. Update
+config separately with the admin command; restart is required for
+configuration/token changes.
 
-For a reviewed upgrade, as root, stop the service, then replace the root-owned
-`current` symlink atomically on the same filesystem:
+For a manual promotion or a rollback to a kept release, as root, stop the
+service, then replace the root-owned `current` symlink atomically on the same
+filesystem:
 
 ```sh
 systemctl stop claude-rotate.service

@@ -28,21 +28,26 @@ Rules of the road:
 
 ## For the admin
 
-On the server:
+On the Debian service (installed with `install.sh`), from any directory:
 
 ```bash
-cd /opt/claude-rotate            # or wherever it lives
-./setup.sh onboard maria laptop
+sudo claude-rotate-admin add-user maria-laptop
 ```
 
-This mints the key `maria-laptop`, restarts the service so it's live, and
-prints a paste-ready welcome block (it uses `public_url` from `config.json`
-for the exact env values). Paste the block back to the requester over a
-reasonably private channel — the key is a bearer credential.
+This mints the key `maria-laptop`, restarts the service so it is live, and
+prints the two `export` lines plus the dashboard link for the requester (the
+URL comes from `public_url`; set it once with
+`sudo claude-rotate-admin set-url https://YOUR-TAILSCALE-HOST`). The command
+prints `is live` only after systemd reports the service active. Paste the block
+back over a reasonably private channel — the key is a bearer credential.
 
-**Revoke**: delete the device's entry from `config.json` `devices{}` and
-`systemctl restart claude-rotate`. The panel's device roster shows every key
-(suffix only) with last-seen times, so stale devices are easy to spot.
+**Revoke**: `sudo claude-rotate-admin remove-user maria-laptop`. It restarts the
+service, so revocation is immediate and affects only that device. The panel's
+device roster shows every key (suffix only) with last-seen times, so stale
+devices are easy to spot. `sudo claude-rotate-admin status` lists them too.
+
+On a standalone checkout (no installer), the equivalent is
+`./setup.sh onboard maria laptop` next to `config.json`.
 
 **Naming convention** `<username>-<device>` is what makes the analytics
 readable: the panel's per-device tables become per-person tables for free.
