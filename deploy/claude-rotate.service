@@ -1,18 +1,74 @@
-# systemd unit for Linux hosts. Install:
-#   sudo cp deploy/claude-rotate.service /etc/systemd/system/
-#   sudo systemctl enable --now claude-rotate
+# Debian 12; see deploy/README.md for provisioning and migration.
 [Unit]
 Description=claude-rotate — Claude subscription rotating proxy
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
-User=YOU
-WorkingDirectory=/home/YOU/claude-rotate
-ExecStart=/usr/bin/python3 /home/YOU/claude-rotate/rotator.py
+Type=notify
+NotifyAccess=main
+User=claude-rotate
+Group=claude-rotate
+WorkingDirectory=/opt/claude-rotate/current
+ExecStart=/opt/claude-rotate/current/.venv/bin/python /opt/claude-rotate/current/deploy/systemd_runner.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=CLAUDE_ROTATE_CONFIG=/etc/claude-rotate/config.json
+Environment=CLAUDE_ROTATE_STATE=/var/lib/claude-rotate/state.json
+Environment=CLAUDE_ROTATE_AUDIT=/var/log/claude-rotate/audit.jsonl
+Environment=CLAUDE_ROTATE_MAX_REQUEST_BYTES=4194304
+Environment=CLAUDE_ROTATE_MAX_RESPONSE_BYTES=8388608
+Environment=CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=8
+Environment=CLAUDE_ROTATE_AUDIT_CACHE_RECORDS=10000
+Environment=CLAUDE_ROTATE_AUDIT_CACHE_BYTES=8388608
+Environment=CLAUDE_ROTATE_AUDIT_MAX_BYTES=8388608
+Environment=CLAUDE_ROTATE_AUDIT_BACKUPS=4
+StateDirectory=claude-rotate
+StateDirectoryMode=0700
+LogsDirectory=claude-rotate
+LogsDirectoryMode=0700
+UMask=0077
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# AF_UNIX for notify/local resolvers; IPv4/IPv6 for DNS and upstream TLS.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=128M
+TasksMax=64
+LimitNOFILE=4096
+# Credentials live in memory; do not write them to crash/core files.
+LimitCORE=0
+OOMPolicy=kill
 Restart=always
-RestartSec=3
+RestartSec=10s
+WatchdogSec=45s
+WatchdogSignal=SIGKILL
+TimeoutStartSec=60s
+# uvicorn gets 30s to drain; systemd kills remaining processes by 40s.
+TimeoutStopSec=40s
+KillSignal=SIGTERM
+KillMode=control-group
+SendSIGKILL=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-rotate
 
 [Install]
 WantedBy=multi-user.target

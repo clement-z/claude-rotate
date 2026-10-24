@@ -26,6 +26,11 @@ and 0700 for the token directory. A token file or configuration manually edited
 outside setup must receive equivalent protection. Do not use `phase0_proxy.py`
 as a shared service: it is an unauthenticated, loopback-only diagnostic harness.
 
+For Debian 12, use [the hardened systemd unit and installation guide](deploy/README.md).
+Its config/tokens are `0640 root:claude-rotate` inside private `0750` directories,
+readable only by root and the dedicated service group. The service can write its
+private state/log directories, but cannot modify installed code or credentials.
+
 ## Credentials and requests
 
 - Use the `Authorization: Bearer ...` header for API calls. Query-string keys
@@ -47,6 +52,12 @@ as a shared service: it is an unauthenticated, loopback-only diagnostic harness.
 - `max_request_bytes` defaults to 33554432 (32 MiB). Both API front doors enforce
   the actual streamed byte count and return 413 above the limit, including for
   chunked requests. Set a positive integer in `config.json` to change it.
+- Buffered upstream responses also have a byte limit (`max_response_bytes`,
+  default 32 MiB); larger responses return 502 and close the upstream response.
+  SSE is relayed incrementally. The Debian unit overrides request/response limits
+  to 4/8 MiB and permits eight concurrent proxy requests, including their streams
+  and quota waits. Overload returns 503 with `Retry-After`; this is a global
+  admission limit, not per-device fairness or a durable queue.
 - Quota holds and burst pacing poll for client disconnects at one-second intervals
   while waiting, and before retrying. A network operation already in progress
   can continue until its own completion or timeout.
@@ -54,12 +65,16 @@ as a shared service: it is an unauthenticated, loopback-only diagnostic harness.
 ## Remaining limits
 
 This is intended for a trusted private deployment. It does not provide tenant
-isolation, per-device rate/concurrency quotas, a disk quota, or automatic audit
-log rotation. Rotate `logs/audit.jsonl` and monitor disk/memory use. A compromised
-authorized client can still consume shared capacity. The response and SSE paths
-trust the upstream provider. Keep dependencies updated in an isolated environment
-and scan the versions actually installed; `requirements.txt` has minimum versions
-and does not lock the entire dependency graph.
+isolation, per-device rate/concurrency quotas, or a filesystem quota. Audit files
+now rotate automatically and analytics retention is bounded, with explicit partial
+history warnings. Rotated files, journals and unrelated data still need disk
+monitoring. State/audit writes are best effort if storage fails: errors appear in
+stderr and authenticated status, while requests continue with in-memory state.
+A compromised authorized client can still consume all admitted capacity.
+SSE content and provider response metadata still trust Anthropic. Keep dependencies updated in an isolated environment
+and scan the versions actually installed. `requirements.lock` pins the tested
+Debian 12/Python 3.11 deployment graph; `requirements.txt` retains minimum versions
+for other development environments. Version pins are not package-integrity proofs.
 
 The 2026-10-24 source audit found no explicit malicious payload, hidden downloader,
 or unexpected runtime upstream in baseline `19529c6`. It did find and remediate

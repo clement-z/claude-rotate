@@ -40,9 +40,9 @@ from starlette.datastructures import MutableHeaders
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
 ROOT = Path(__file__).parent
-CONFIG_PATH = ROOT / "config.json"
-STATE_PATH = ROOT / "state.json"
-AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
+CONFIG_PATH = Path(os.environ.get("CLAUDE_ROTATE_CONFIG", ROOT / "config.json"))
+STATE_PATH = Path(os.environ.get("CLAUDE_ROTATE_STATE", ROOT / "state.json"))
+AUDIT_PATH = Path(os.environ.get("CLAUDE_ROTATE_AUDIT", ROOT / "logs" / "audit.jsonl"))
 
 UPSTREAM = "https://api.anthropic.com"
 HOP = {
@@ -75,14 +75,11 @@ class PrivateResponseHeaders:
         await self.app(scope, receive, send_private if scope["type"] == "http" else send)
 
 
-app.add_middleware(PrivateResponseHeaders)
-
-
 def load_config() -> dict:
     cfg = json.loads(CONFIG_PATH.read_text())
     loaded = []
     for acct in cfg["accounts"]:
-        path = ROOT / acct["token_file"]
+        path = CONFIG_PATH.parent / acct["token_file"]
         if path.exists():
             acct["token"] = path.read_text().strip()
             loaded.append(acct)
@@ -112,9 +109,57 @@ def load_config() -> dict:
 
 
 CFG = load_config()
-MAX_REQUEST_BYTES = CFG.get("max_request_bytes", 32 * 1024 * 1024)
-if type(MAX_REQUEST_BYTES) is not int or MAX_REQUEST_BYTES <= 0:
-    raise SystemExit("max_request_bytes must be a positive integer")
+
+
+def resource_limit(name: str, default: int, *, allow_zero=False, minimum=1) -> int:
+    """Deployment overrides are non-secret; invalid limits fail at startup."""
+    value = CFG.get(name, default)
+    override = os.environ.get("CLAUDE_ROTATE_" + name.upper())
+    if override is not None:
+        try:
+            value = int(override)
+        except ValueError:
+            raise SystemExit(f"{name} must be an integer")
+    lower = 0 if allow_zero else minimum
+    if type(value) is not int or value < lower:
+        raise SystemExit(f"{name} must be an integer >= {lower}")
+    return value
+
+
+MAX_REQUEST_BYTES = resource_limit("max_request_bytes", 32 * 1024 * 1024)
+MAX_RESPONSE_BYTES = resource_limit("max_response_bytes", 32 * 1024 * 1024)
+MAX_CONCURRENT_REQUESTS = resource_limit("max_concurrent_requests", 0, allow_zero=True)
+AUDIT_CACHE_RECORDS = resource_limit("audit_cache_records", 100_000)
+AUDIT_CACHE_BYTES = resource_limit("audit_cache_bytes", 32 * 1024 * 1024)
+AUDIT_MAX_BYTES = resource_limit("audit_max_bytes", 16 * 1024 * 1024, minimum=4096)
+AUDIT_BACKUPS = resource_limit("audit_backups", 4)
+
+
+class RequestAdmission:
+    """Reject overload before body buffering; retain slots through SSE/holds."""
+
+    def __init__(self, app, limit: int):
+        self.app, self.limit, self.active = app, limit, 0
+
+    async def __call__(self, scope, receive, send):
+        admin = scope.get("method") == "GET" and scope.get("path") in {
+            "/rotate/status", "/rotate/stats", "/rotate/panel"}
+        if scope["type"] != "http" or not self.limit or admin:
+            return await self.app(scope, receive, send)
+        # One event loop, with no await between the check and increment.
+        if self.active >= self.limit:
+            response = JSONResponse({"error": "proxy at capacity; retry later"},
+                                    status_code=503, headers={"Retry-After": "5"})
+            return await response(scope, receive, send)
+        self.active += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.active -= 1
+
+
+app.add_middleware(RequestAdmission, limit=MAX_CONCURRENT_REQUESTS)
+app.add_middleware(PrivateResponseHeaders)
 DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
@@ -124,6 +169,19 @@ COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
+STORAGE_ERRORS: dict = {}
+
+
+def storage_error(operation: str, error: Exception) -> None:
+    """Keep serving after a full/unavailable data disk, without silent loss."""
+    now = time.time()
+    prior = STORAGE_ERRORS.get(operation, {})
+    if now - prior.get("last_warning", 0) >= 60:
+        print(f"warning: {operation} failed ({type(error).__name__}, errno {getattr(error, 'errno', None)}); "
+              "continuing with in-memory state; check data storage", file=sys.stderr)
+        prior["last_warning"] = now
+    prior.update(count=prior.get("count", 0) + 1, last_failure=now)
+    STORAGE_ERRORS[operation] = prior
 
 
 def load_state() -> dict:
@@ -143,14 +201,39 @@ def save_state() -> None:
     # Write-then-rename so a crash mid-write can never leave a truncated
     # state.json (which would refuse to parse on the next start).
     tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(STATE, indent=2))
-    tmp.replace(STATE_PATH)
+    try:
+        tmp.write_text(json.dumps(STATE, indent=2))
+        tmp.replace(STATE_PATH)
+    except OSError as exc:
+        storage_error("state_write", exc)
 
 
 def audit(rec: dict) -> None:
+    try:
+        _write_audit(rec)
+    except (OSError, ValueError) as exc:
+        storage_error("audit_write", exc)
+
+
+def _write_audit(rec: dict) -> None:
     rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    with AUDIT_PATH.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+    # A single process writes synchronously, so rollover cannot interleave with
+    # another request. Each append reopens the path; external rename also works.
+    line = (json.dumps(rec) + "\n").encode("utf-8")
+    if len(line) > AUDIT_MAX_BYTES:
+        # A client-controlled model/path must not defeat the disk bound.
+        rec = dict(rec, model=str(rec.get("model", ""))[:256],
+                   path=str(rec.get("path", ""))[:1024], metadata_truncated=True)
+        line = (json.dumps(rec) + "\n").encode("utf-8")
+    if len(line) > AUDIT_MAX_BYTES:
+        raise ValueError("audit_max_bytes is too small for one audit record")
+    if AUDIT_PATH.exists() and AUDIT_PATH.stat().st_size + len(line) > AUDIT_MAX_BYTES:
+        for n in range(AUDIT_BACKUPS, 0, -1):
+            source = AUDIT_PATH if n == 1 else Path(f"{AUDIT_PATH}.{n - 1}")
+            if source.exists():
+                source.replace(Path(f"{AUDIT_PATH}.{n}"))
+    with AUDIT_PATH.open("ab") as f:
+        f.write(line)
 
 
 def utilization(name: str) -> float:
@@ -354,6 +437,7 @@ async def rotate_status(request: Request):
         "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
         "recent_events": STATE["events"][-10:],
+        "storage_errors": STORAGE_ERRORS,
     }
 
 
@@ -374,6 +458,19 @@ async def bounded_body(request: Request) -> bytes:
         if len(body) + len(chunk) > MAX_REQUEST_BYTES:
             raise HTTPException(status_code=413, detail="request body too large")
         body.extend(chunk)
+    return bytes(body)
+
+
+async def bounded_response(upstream: httpx.Response) -> bytes:
+    """Limit buffered upstream responses; streaming responses stay streaming."""
+    body = bytearray()
+    try:
+        async for chunk in upstream.aiter_bytes(chunk_size=65536):
+            if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise HTTPException(status_code=502, detail="upstream response too large")
+            body.extend(chunk)
+    finally:
+        await upstream.aclose()
     return bytes(body)
 
 
@@ -413,10 +510,8 @@ def api_cost(model: str | None, usage: dict) -> float:
     ) / 1_000_000
 
 
-# Incremental tail of audit.jsonl: every stat aggregate_audit() serves is a
-# rolling 24h window, so only that window is kept parsed in memory and each
-# call reads just the bytes appended since the previous one — instead of
-# re-parsing the whole (unbounded, append-only) file per panel view.
+# Incremental, bounded tail of the current audit file. Counts become partial
+# after rotation or either retention limit; the API/panel explicitly says so.
 _AUDIT_CACHE: dict = {"offset": 0, "records": deque(), "sig": b""}
 
 
@@ -424,27 +519,64 @@ def _tail_audit() -> None:
     import datetime as dt
 
     cache = _AUDIT_CACHE
+    cache.setdefault("bytes", 0)
+    cache.setdefault("limited_until", 0)
+    now = time.time()
     if not AUDIT_PATH.exists():
+        if cache["offset"]:
+            cache["limited_until"] = now + 86400
         cache["offset"] = 0
         cache["sig"] = b""
+        cache["bytes"] = 0
+        cache["identity"] = None
         cache["records"].clear()
         return
-    day_ago = time.time() - 86400
+    day_ago = now - 86400
     with AUDIT_PATH.open("rb") as f:
-        size = os.fstat(f.fileno()).st_size
+        stat = os.fstat(f.fileno())
+        size = stat.st_size
+        identity = (stat.st_dev, stat.st_ino)
         head = f.read(64)
         # A shrunken file, or changed leading bytes, means audit.jsonl was
         # rotated or rewritten out from under us — the cached window no
         # longer describes this file, so rebuild from the top. (Size alone
         # can't catch truncate-and-rewrite-bigger; the head fingerprint can.)
-        if size < cache["offset"] or not head.startswith(cache["sig"]):
+        if (cache.get("identity", identity) != identity
+                or size < cache["offset"] or not head.startswith(cache["sig"])):
+            cache["limited_until"] = now + 86400
             cache["offset"] = 0
+            cache["bytes"] = 0
             cache["records"].clear()
+        cache["identity"] = identity
         cache["sig"] = head
+        # After restart, recent rotated files mean the current log is not the
+        # whole 24h history. Retained archives remain available for offline use.
+        previous = Path(f"{AUDIT_PATH}.1")
+        if previous.exists():
+            cache["limited_until"] = max(cache["limited_until"],
+                                         previous.stat().st_mtime + 86400)
         if size == cache["offset"]:
             return
+        if size - cache["offset"] > AUDIT_CACHE_BYTES:
+            cache["offset"] = size - AUDIT_CACHE_BYTES
+            cache["limited_until"] = now + 86400
+            cache["bytes"] = 0
+            cache["records"].clear()
+            f.seek(cache["offset"] - 1)
+            # Skip a first fragment without reading an unbounded long line.
+            begins_mid_line = f.read(1) != b"\n"
+        else:
+            begins_mid_line = False
         f.seek(cache["offset"])
-        chunk = f.read()
+        chunk = f.read(min(AUDIT_CACHE_BYTES, size - cache["offset"]))
+    if begins_mid_line:
+        start = chunk.find(b"\n") + 1
+        if not start:
+            # The tail is one oversized fragment; consume it without caching.
+            cache["offset"] += len(chunk)
+            return
+        cache["offset"] += start
+        chunk = chunk[start:]
     # Consume complete lines only; a trailing partial line (an append in
     # flight from a writer outside this process) is left for the next call.
     end = chunk.rfind(b"\n") + 1
@@ -452,15 +584,28 @@ def _tail_audit() -> None:
     for line in chunk[:end].splitlines():
         try:
             rec = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            cache["limited_until"] = now + 86400
+            continue
+        if not isinstance(rec, dict):
+            cache["limited_until"] = now + 86400
             continue
         try:
             rec["_ts"] = dt.datetime.strptime(
                 rec.get("ts", ""), "%Y-%m-%dT%H:%M:%S%z").timestamp()
-        except ValueError:
+        except (ValueError, TypeError):
+            cache["limited_until"] = now + 86400
             continue
         if rec["_ts"] >= day_ago:
-            _AUDIT_CACHE["records"].append(rec)
+            rec["_bytes"] = len(line) + 1
+            cache["records"].append(rec)
+            cache["bytes"] += rec["_bytes"]
+            while (len(cache["records"]) > AUDIT_CACHE_RECORDS
+                   or cache["bytes"] > AUDIT_CACHE_BYTES):
+                removed = cache["records"].popleft()
+                cache["bytes"] -= removed["_bytes"]
+                cache["limited_until"] = max(cache["limited_until"],
+                                             removed["_ts"] + 86400)
 
 
 def aggregate_audit() -> dict:
@@ -489,7 +634,7 @@ def aggregate_audit() -> dict:
     _tail_audit()
     records = _AUDIT_CACHE["records"]
     while records and records[0]["_ts"] < day_ago:
-        records.popleft()
+        _AUDIT_CACHE["bytes"] -= records.popleft().get("_bytes", 0)
     for rec in records:
         # Old logs may contain arbitrary JSON values supplied as `model`.
         model = rec.get("model")
@@ -515,7 +660,9 @@ def aggregate_audit() -> dict:
                 key = f'{rec.get("device", "?")} / {model}'
                 expensive_hour[key] = expensive_hour.get(key, 0) + 1
 
-    alerts = []
+    limited = now < _AUDIT_CACHE.get("limited_until", 0)
+    alerts = ([{"level": "warn", "text": "Statistics are partial: older history was "
+                "rotated, skipped or dropped to stay within resource limits."}] if limited else [])
     for dev, toks in device_hour_tokens.items():
         if toks > ALERT_CFG["device_tokens_per_hour"]:
             alerts.append({"level": "warn",
@@ -543,7 +690,9 @@ def aggregate_audit() -> dict:
             "tokens_1h": device_hour_tokens.get(name, 0),
         }
 
-    return {"window": "last 24h", "devices": devices, "by_device": by_device,
+    return {"window": "last 24h (partial)" if limited else "last 24h",
+            "history_limited": limited, "retained_records": len(records),
+            "devices": devices, "by_device": by_device,
             "by_model": by_model, "by_account": by_account, "alerts": alerts}
 
 
@@ -687,8 +836,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes,
         if not retry:
             noted = True
             return upstream, account, retries, noted, verdict
-        await upstream.aread()
-        await upstream.aclose()
+        await bounded_response(upstream)
         retries += 1
         if wait > 0:
             async with state_lock:
@@ -728,7 +876,7 @@ async def openai_chat(request: Request):
     upstream, account, retries, noted, verdict = await send_upstream(
         "POST", "/v1/messages", fwd, json.dumps(abody).encode(), request)
 
-    rec = {"device": device, "account": account, "path": "/v1/chat/completions",
+    rec = {"device": device, "account": account, "path": "/v1/chat/completions", "method": "POST",
            "model": abody.get("model"), "status": upstream.status_code}
     if retries:
         rec["retries"] = retries
@@ -741,8 +889,7 @@ async def openai_chat(request: Request):
             resp_headers[h] = upstream.headers[h]
 
     if upstream.status_code == 429 and verdict == "exhausted":
-        await upstream.aread()
-        await upstream.aclose()
+        await bounded_response(upstream)
         retry_after = max(1, round(earliest_relief() - time.time()))
         rec["status"] = 503
         audit(rec)
@@ -774,8 +921,7 @@ async def openai_chat(request: Request):
         return StreamingResponse(relay(), status_code=200, headers=resp_headers,
                                  media_type="text/event-stream")
 
-    content = await upstream.aread()
-    await upstream.aclose()
+    content = await bounded_response(upstream)
     if not noted:
         await note_response(account, upstream.headers, upstream.status_code)
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
@@ -831,7 +977,7 @@ async def proxy(request: Request, path: str):
     upstream, account, retries, noted, _verdict = await send_upstream(
         request.method, url, fwd_headers, body, request)
 
-    rec = {"device": device, "account": account, "path": "/" + path,
+    rec = {"device": device, "account": account, "path": "/" + path, "method": request.method,
            "model": model, "status": upstream.status_code}
     if retries:
         rec["retries"] = retries
@@ -858,15 +1004,13 @@ async def proxy(request: Request, path: str):
                                  headers=resp_headers,
                                  media_type=upstream.headers.get("content-type"))
 
-    content = await upstream.aread()
-    await upstream.aclose()
+    content = await bounded_response(upstream)
     try:
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
         pass
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
-    if rec["path"].startswith("/v1/messages") or rec.get("usage"):
-        audit(rec)
+    audit(rec)
     if not noted:
         await note_response(account, upstream.headers, upstream.status_code)
     return Response(content=content, status_code=upstream.status_code, headers=resp_headers)

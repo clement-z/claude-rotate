@@ -435,7 +435,11 @@ config objects, not as a DSL.
 
 - **macOS**: `deploy/com.example.claude-rotate.plist` (read its comments —
   launchd needs the full python3 path and a local-disk install).
-- **Linux**: `deploy/claude-rotate.service` (systemd).
+- **Debian 12 / Linux**: follow [the hardened systemd deployment guide](deploy/README.md).
+  The supplied unit uses a dedicated account, root-owned releases, separate private
+  state/log directories, watchdog recovery, and conservative limits for a small
+  VPS. Provision those paths before enabling it; this replaces the old home-directory
+  unit template. Migration and rollback instructions are included.
 
 ## Troubleshooting
 
@@ -507,29 +511,33 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
 
 ## Operations
 
-- **Audit log growth.** `logs/audit.jsonl` grows without bound (one JSON line
-  per request) and the stats endpoint re-reads it fully on every refresh, so
-  after months it slows the panel. The panel only uses the last 24h — rotate
-  the file whenever you like:
-
-  ```bash
-  # e.g. monthly via cron/launchd; the proxy recreates the file on the next request
-  mv logs/audit.jsonl "logs/audit-$(date +%Y%m).jsonl"
-  ```
-
-  No restart needed (the file is opened per write). In-process rotation is on
-  the roadmap.
+- **Bounded audit history.** The current audit file rotates at 16 MiB with four
+  backups by default. Analytics incrementally read only the current file, retain
+  at most 100,000 records / 32 MiB of encoded records, and report partial totals
+  after rotation, truncation, or a retention limit. Python memory exceeds the encoded
+  byte count. The Debian unit lowers these limits to 8 MiB per file and 10,000
+  records / 8 MiB of analytics history. Archives remain available for offline
+  accounting; the dashboard is not a complete long-term ledger. Audit records
+  include non-message upstream responses too. Storage-write failures are reported
+  in the journal and `/rotate/status` `storage_errors`; requests continue, so
+  audit/state persistence can be lost until storage is repaired.
 - **What to back up.** `tokens/` and `config.json` — that's the whole
   identity of the install. `state.json` is disposable (quota state is
   re-learned from the first responses; you only lose the events history), and
   `logs/` is disposable analytics.
-- **Upgrades.** `git pull`, run `python3 tests/run_all.py`, restart the
-  service, then eyeball `/rotate/panel` — active account, gauges, and a
-  request flowing end-to-end.
-- **Health check.** `curl -fs http://<server>:8484/rotate/status?key=<device key>`
-  exits non-zero when the proxy is down — wire it into uptime monitoring if
-  the fleet depends on it. The launchd/systemd units in `deploy/` already
-  restart the process if it dies.
+- **Upgrades.** For the Debian service, build/test a new immutable release and
+  use the [promotion/rollback procedure](deploy/README.md#immutable-upgrades-and-rollback).
+  Other installations should also test with dummy credentials before restarting.
+  Check the active account, gauges, and an actual streamed request afterwards.
+- **Health check.** Monitor `/rotate/status` using an `Authorization: Bearer`
+  header, then separately monitor real provider success. Local readiness/watchdog
+  checks cannot detect an expired provider token or an upstream outage. Keep
+  credentials out of shared command histories and URL logs.
+- **Compatibility.** OpenAI `max_tokens` / `max_completion_tokens` must be positive
+  JSON integers; numeric strings and floats are no longer coerced. The Debian
+  profile rejects bodies above 4 MiB (413), buffered upstream responses above
+  8 MiB (502), and excess active proxy requests (503 with `Retry-After`). Streams
+  remain streaming and consume a request slot until they finish or disconnect.
 
 ## Comparison with similar projects
 
