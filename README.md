@@ -433,6 +433,8 @@ config objects, not as a DSL.
 
 ## Run as a service
 
+For routine Debian service management, see the [operations quick guide](OPERATIONS.md).
+
 - **macOS**: `deploy/com.example.claude-rotate.plist` (read its comments —
   launchd needs the full python3 path and a local-disk install).
 - **Debian 12 / Linux**: follow [the hardened systemd deployment guide](deploy/README.md).
