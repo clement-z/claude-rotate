@@ -10,6 +10,11 @@ Send the admin two things:
 2. **a device name** for the machine you'll use (e.g. `laptop`, `desktop`,
    `gpu-box` — one request per machine)
 
+Names must start with an ASCII letter or digit and contain only ASCII letters,
+digits, underscores, or hyphens. Each name, and the combined
+`<username>-<device>` label, must be at most 64 characters. The same rule applies
+to names passed to `add-device` and `add-account`.
+
 You'll get back two `export` lines. Put them in your shell profile
 (`~/.zshrc` / `~/.bashrc`), open a new terminal, run `claude` — no Anthropic
 login needed. Your usage dashboard link comes with the reply.

@@ -29,11 +29,13 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from urllib.parse import unquote_plus
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import MutableHeaders
 
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
@@ -47,10 +49,33 @@ HOP = {
     "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
 }
+# These belong to the local browser or reverse-proxy trust boundary.
+PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
 
 app = FastAPI()
 client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, connect=15.0))
 state_lock = asyncio.Lock()
+
+
+class PrivateResponseHeaders:
+    """Wrap only send, preserving receive/disconnect signals for held requests."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def send_private(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Cache-Control"] = "no-store"
+                headers["Referrer-Policy"] = "no-referrer"
+                headers["X-Content-Type-Options"] = "nosniff"
+            await send(message)
+
+        await self.app(scope, receive, send_private if scope["type"] == "http" else send)
+
+
+app.add_middleware(PrivateResponseHeaders)
 
 
 def load_config() -> dict:
@@ -71,7 +96,13 @@ def load_config() -> dict:
     # the repo). It must never be accepted as a live credential: refuse to start
     # while one remains, so add-account-without-add-device can't open the proxy
     # to anyone who read the example (GitHub issue #2).
-    bad = [d for d, k in (cfg.get("devices") or {}).items() if "REPLACE-WITH" in k]
+    devices = cfg.get("devices")
+    if not isinstance(devices, dict) or any(
+            not isinstance(k, str) or not k.strip() for k in devices.values()):
+        raise SystemExit("devices must map names to nonempty device keys")
+    if len(set(devices.values())) != len(devices):
+        raise SystemExit("device keys must be unique")
+    bad = [d for d, k in devices.items() if "REPLACE-WITH" in k]
     if bad:
         raise SystemExit(
             f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
@@ -81,6 +112,9 @@ def load_config() -> dict:
 
 
 CFG = load_config()
+MAX_REQUEST_BYTES = CFG.get("max_request_bytes", 32 * 1024 * 1024)
+if type(MAX_REQUEST_BYTES) is not int or MAX_REQUEST_BYTES <= 0:
+    raise SystemExit("max_request_bytes must be a positive integer")
 DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
@@ -161,7 +195,7 @@ def earliest_relief() -> float:
     return min(resets) if resets else now + 300
 
 
-def pick_account() -> str:
+def pick_account() -> str | None:
     """Usable = not disabled, both windows under their thresholds (a passed
     reset counts as 0). Priority tiers come first: a lower `priority` account
     always beats a higher one, and the strategy orders accounts *within* a tier.
@@ -176,7 +210,9 @@ def pick_account() -> str:
         if STRATEGY == "consume-first":
             return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
-    pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
+    pool = [n for n in ACCOUNTS if not disabled(n)]
+    if not pool:
+        return None
     return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
 
 
@@ -230,7 +266,7 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
             nxt = pick_account()
             reason = None
-            if nxt != account:
+            if nxt is not None and nxt != account:
                 if quota_hit:
                     reason = "quota_exhausted"  # hard stop: no cooldown, no margin
                 elif disabled(account):
@@ -326,7 +362,19 @@ def device_from_request(request: Request) -> str | None:
     key = auth[7:] if auth.lower().startswith("bearer ") else request.headers.get("x-api-key", "")
     if not key:
         key = request.query_params.get("key", "")
+    if not key:
+        return None
     return DEVICE_BY_KEY.get(key)
+
+
+async def bounded_body(request: Request) -> bytes:
+    """Bound actual bytes, including bodies without a Content-Length header."""
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="request body too large")
+        body.extend(chunk)
+    return bytes(body)
 
 
 # API list prices per MTok (input, output), matched by substring of the model id.
@@ -347,6 +395,7 @@ ALERT_CFG = CFG.get("alerts", {
 
 
 def price_for(model: str | None) -> list[float]:
+    model = model if isinstance(model, str) else None
     for pat, p in PRICES.items():
         if model and pat in model:
             return p
@@ -442,16 +491,19 @@ def aggregate_audit() -> dict:
     while records and records[0]["_ts"] < day_ago:
         records.popleft()
     for rec in records:
+        # Old logs may contain arbitrary JSON values supplied as `model`.
+        model = rec.get("model")
+        model = model if isinstance(model, str) else None
         usage = rec.get("usage") or {}
         ts = rec["_ts"]
-        cost = api_cost(rec.get("model"), usage)
+        cost = api_cost(model, usage)
         dev = rec.get("device", "?")
         meta = device_meta.setdefault(dev, {})
         if ts >= meta.get("last_ts", 0):
-            meta.update({"last_ts": ts, "last_model": rec.get("model"),
+            meta.update({"last_ts": ts, "last_model": model,
                          "last_account": rec.get("account")})
         bump(by_device, rec.get("device", "?"), usage, cost)
-        bump(by_model, rec.get("model") or "?", usage, cost)
+        bump(by_model, model or "?", usage, cost)
         bump(by_account, rec.get("account", "?"), usage, cost)
         if ts >= hour_ago:
             total = sum(usage.get(k, 0) for k in (
@@ -459,8 +511,7 @@ def aggregate_audit() -> dict:
             device_hour_tokens[rec.get("device", "?")] = (
                 device_hour_tokens.get(rec.get("device", "?"), 0) + total)
             device_hour_reqs[dev] = device_hour_reqs.get(dev, 0) + 1
-            model = rec.get("model") or ""
-            if any(p in model for p in ALERT_CFG["expensive_model_patterns"]):
+            if any(p in (model or "") for p in ALERT_CFG["expensive_model_patterns"]):
                 key = f'{rec.get("device", "?")} / {model}'
                 expensive_hour[key] = expensive_hour.get(key, 0) + 1
 
@@ -527,23 +578,27 @@ PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <p class="muted">Cost = API-equivalent dollars at list prices (incl. cache read 0.1x / write 1.25x) — actual spend is covered by the Max subscriptions.</p>
 <script>
 const KEY = new URLSearchParams(location.search).get('key');
+const cleanURL = new URL(location.href);
+cleanURL.searchParams.delete('key');
+history.replaceState(null, '', cleanURL.pathname + cleanURL.search + cleanURL.hash);
+function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(n){return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n}
 function table(el, data){
   let h='<tr><th></th><th>req</th><th>in</th><th>out</th><th>cache r</th><th>cache w</th><th>$ equiv</th></tr>';
   for(const [k,v] of Object.entries(data))
-    h+=`<tr><td>${k}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
+    h+=`<tr><td>${esc(k)}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
   el.innerHTML=h;
 }
 async function refresh(){
   const [st, stats] = await Promise.all([
-    fetch('/rotate/status?key='+KEY).then(r=>r.json()),
-    fetch('/rotate/stats?key='+KEY).then(r=>r.json())]);
+    fetch('/rotate/status',{headers:{Authorization:'Bearer '+KEY},cache:'no-store'}).then(r=>r.json()),
+    fetch('/rotate/stats',{headers:{Authorization:'Bearer '+KEY},cache:'no-store'}).then(r=>r.json())]);
   let rh='<tr><th>device</th><th>status</th><th>last seen</th><th>last model</th><th>via account</th><th>req 1h</th><th>tokens 1h</th><th>key</th></tr>';
   for(const [name,d] of Object.entries(stats.devices||{})){
     const status = d.online ? '<span class="active">● online</span>' : '<span class="muted">○ idle</span>';
     const seen = d.last_seen_min==null ? 'never' : d.last_seen_min<1 ? 'just now'
       : d.last_seen_min<60 ? d.last_seen_min+' min ago' : (d.last_seen_min/60).toFixed(1)+' h ago';
-    rh+=`<tr><td>${name}</td><td>${status}</td><td>${seen}</td><td>${d.last_model||'—'}</td><td>${d.last_account||'—'}</td><td>${d.req_1h}</td><td>${fmt(d.tokens_1h)}</td><td class="muted">${d.key_suffix}</td></tr>`;
+    rh+=`<tr><td>${esc(name)}</td><td>${status}</td><td>${seen}</td><td>${esc(d.last_model||'—')}</td><td>${esc(d.last_account||'—')}</td><td>${d.req_1h}</td><td>${fmt(d.tokens_1h)}</td><td class="muted">${esc(d.key_suffix)}</td></tr>`;
   }
   document.getElementById('t-roster').innerHTML=rh;
   let h='';
@@ -551,20 +606,20 @@ async function refresh(){
     const u=a.effective_util_5h||0, w=a.util_7d||0;
     const act=name===st.active_account?' <span class="active">● active</span>':'';
     const tags=(a.disabled?' <span class="alert-warn">(disabled)</span>':'')
-      +(a.priority!==100?` <span class="muted">prio ${a.priority}</span>`:'');
-    h+=`<p><b>${name}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
+      +(a.priority!==100?` <span class="muted">prio ${esc(a.priority)}</span>`:'');
+    h+=`<p><b>${esc(name)}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
       +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
       +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
       +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
   }
   document.getElementById('accounts').innerHTML=h;
   document.getElementById('alerts').innerHTML = stats.alerts.length
-    ? stats.alerts.map(a=>`<div class="alert-${a.level}">⚠ ${a.text}</div>`).join('') : 'none';
+    ? stats.alerts.map(a=>`<div class="alert-${esc(a.level)}">⚠ ${esc(a.text)}</div>`).join('') : 'none';
   table(document.getElementById('t-device'), stats.by_device);
   table(document.getElementById('t-model'), stats.by_model);
   table(document.getElementById('t-account'), stats.by_account);
   document.getElementById('events').innerHTML = st.recent_events.length
-    ? st.recent_events.map(e=>`<div>${e.ts} — ${e.from} → ${e.to} (${e.reason})</div>`).join('') : 'none';
+    ? st.recent_events.map(e=>`<div>${esc(e.ts)} — ${esc(e.from)} → ${esc(e.to)} (${esc(e.reason)})</div>`).join('') : 'none';
   document.getElementById('upd').textContent='updated '+new Date().toLocaleTimeString();
 }
 refresh(); setInterval(refresh, 10000);
@@ -579,7 +634,20 @@ async def rotate_panel(request: Request):
     return Response(content=PANEL_HTML, media_type="text/html")
 
 
-async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
+async def retry_wait(seconds: float, request: Request | None) -> None:
+    """Release held request bodies promptly when their caller has left."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if request is not None and await request.is_disconnected():
+            raise HTTPException(status_code=499, detail="client disconnected")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 1.0) if request is not None else remaining)
+
+
+async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes,
+                        request: Request | None = None):
     """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
     pick the active account, pace bursts, retry through switches, optionally hold
     until the soonest window reset. Returns (upstream, account, retries, noted,
@@ -591,11 +659,18 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     noted = False
     verdict = None
     while True:
-        account = STATE["active_account"]
+        await retry_wait(0, request)
+        account = STATE.get("active_account")
+        if account not in ACCOUNTS or disabled(account):
+            account = pick_account()
+            if account is None:
+                raise HTTPException(status_code=503, detail="no enabled accounts")
+            STATE["active_account"] = account
+            save_state()
         fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
         pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
         if pace > 0:
-            await asyncio.sleep(min(pace, 60))
+            await retry_wait(min(pace, 60), request)
         upstream = await client.send(
             client.build_request(method, url, headers=fwd_headers, content=body),
             stream=True)
@@ -623,7 +698,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
                     "reason": f"all accounts spent; holding {round(wait)}s"})
                 STATE["events"] = STATE["events"][-200:]
                 save_state()
-            await asyncio.sleep(wait)
+            await retry_wait(wait, request)
 
 
 @app.post("/v1/chat/completions")
@@ -640,8 +715,8 @@ async def openai_chat(request: Request):
         return JSONResponse({"error": {"message": "claude-rotate: unknown device key",
                                        "type": "authentication_error"}}, status_code=401)
     try:
-        oai = json.loads(await request.body())
-    except json.JSONDecodeError:
+        oai = json.loads(await bounded_body(request))
+    except (ValueError, RecursionError):
         return JSONResponse({"error": {"message": "body is not valid JSON",
                                        "type": "invalid_request_error"}}, status_code=400)
     abody, err = oai_to_anthropic(oai)
@@ -651,7 +726,7 @@ async def openai_chat(request: Request):
     fwd = {"content-type": "application/json", "accept-encoding": "identity",
            "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
     upstream, account, retries, noted, verdict = await send_upstream(
-        "POST", "/v1/messages", fwd, json.dumps(abody).encode())
+        "POST", "/v1/messages", fwd, json.dumps(abody).encode(), request)
 
     rec = {"device": device, "account": account, "path": "/v1/chat/completions",
            "model": abody.get("model"), "status": upstream.status_code}
@@ -729,8 +804,10 @@ async def proxy(request: Request, path: str):
                                         "message": "claude-rotate: unknown device key"}},
             status_code=401)
 
-    body = await request.body()
-    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
+    body = await bounded_body(request)
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in HOP | PRIVATE_HEADERS
+                   and not k.lower().startswith(("tailscale-", "x-forwarded-", "sec-fetch-"))}
     fwd_headers["accept-encoding"] = "identity"
     fwd_headers.pop("x-api-key", None)
 
@@ -738,12 +815,21 @@ async def proxy(request: Request, path: str):
     if body and request.method == "POST":
         try:
             model = json.loads(body).get("model")
-        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            if not isinstance(model, str):
+                model = None
+        except (ValueError, RecursionError, AttributeError):
             pass
 
-    url = "/" + path + ("?" + str(request.url.query) if request.url.query else "")
+    # Preserve raw upstream query spelling/order while removing local credentials.
+    try:
+        query = request.scope["query_string"].decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="query string must use percent-encoding")
+    query = "&".join(part for part in query.split("&")
+                     if unquote_plus(part.partition("=")[0]) != "key")
+    url = "/" + path + ("?" + query if query else "")
     upstream, account, retries, noted, _verdict = await send_upstream(
-        request.method, url, fwd_headers, body)
+        request.method, url, fwd_headers, body, request)
 
     rec = {"device": device, "account": account, "path": "/" + path,
            "model": model, "status": upstream.status_code}

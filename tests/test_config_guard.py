@@ -48,6 +48,16 @@ def test_missing_token_file_is_skipped_not_fatal():
     assert [a["name"] for a in cfg["accounts"]] == ["a"]
 
 
+def test_empty_and_duplicate_device_keys_refuse_startup():
+    for devices in ({"device": ""}, {"device": "   "}, {"device": None},
+                    {"one": "same", "two": "same"}, None):
+        try:
+            _load_with({"accounts": ACCT, "devices": devices})
+            raise AssertionError("invalid device keys must refuse startup")
+        except SystemExit as error:
+            assert "device" in str(error)
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

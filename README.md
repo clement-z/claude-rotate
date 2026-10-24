@@ -15,6 +15,9 @@ One process, one config file, no database. Built for individual developers who
 own more than one subscription and are tired of "You've hit your session
 limit".
 
+Before deployment, read [Security and Tailscale setup](SECURITY.md) for credential
+handling, private access, request limits, and the shared-device trust model.
+
 **Herd-safe, by test — not by vibes:** when your whole fleet slams into a rate
 limit at the same instant, exactly *one* rotation decision happens — 100
 in-flight requests, 1 switch, and every request recovers with a single retry
@@ -413,7 +416,8 @@ which is why Level 0 works unchanged.
 **Level 2 — bench an account.** `"disabled": true` takes an account out of
 rotation entirely (a work account you don't want touched, one you're resting)
 while keeping it visible in the panel. If the *active* account is disabled in
-config, the proxy abandons it on the next response, cooldown or not. Re-enable
+config, the proxy selects an enabled account before sending the next request.
+If every account is disabled, it returns 503 without contacting upstream. Re-enable
 by deleting the flag; both changes need a restart (hot reload is on the roadmap).
 
 Combine with `strategy` for the remaining temperament choice: `consume-first`

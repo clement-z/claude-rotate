@@ -30,32 +30,48 @@ def oai_to_anthropic(oai: dict) -> tuple[dict | None, str | None]:
     """OpenAI body -> Anthropic body, or (None, error). System/developer messages
     become the `system` param; consecutive same-role messages are merged because
     Anthropic requires alternation."""
+    if not isinstance(oai, dict):
+        return None, "body must be a JSON object"
     if oai.get("tools") or oai.get("functions") or oai.get("tool_choice"):
         return None, "tool use is not supported by this endpoint yet"
+    messages = oai.get("messages")
+    if not isinstance(messages, list):
+        return None, "messages must be an array"
+    max_tokens = oai.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = oai.get("max_completion_tokens")
+    if max_tokens is None:
+        max_tokens = 4096
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+        return None, "max_tokens/max_completion_tokens must be a positive integer"
     system_parts: list[str] = []
     msgs: list[dict] = []
-    for m in oai.get("messages") or []:
+    for m in messages:
+        if not isinstance(m, dict):
+            return None, "each messages[] entry must be an object"
         role, content = m.get("role"), m.get("content")
         if isinstance(content, list):        # OpenAI content-part arrays
-            content = "".join(p.get("text", "") for p in content
-                              if isinstance(p, dict) and p.get("type") == "text")
+            text_parts = [p.get("text", "") for p in content
+                          if isinstance(p, dict) and p.get("type") == "text"]
+            if any(not isinstance(text, str) for text in text_parts):
+                return None, "text content parts must contain strings"
+            content = "".join(text_parts)
         content = "" if content is None else str(content)
         if role in ("system", "developer"):
             system_parts.append(content)
         elif role in ("user", "assistant"):
             if msgs and msgs[-1]["role"] == role:
-                msgs[-1]["content"] += "\n\n" + content
+                msgs[-1]["content"].append(content)
             else:
-                msgs.append({"role": role, "content": content})
+                msgs.append({"role": role, "content": [content]})
         else:
             return None, f"unsupported message role: {role!r}"
     if not msgs:
         return None, "messages[] must contain at least one user/assistant message"
     out: dict = {
         "model": oai.get("model"),
-        "max_tokens": int(oai.get("max_tokens")
-                          or oai.get("max_completion_tokens") or 4096),
-        "messages": msgs,
+        "max_tokens": max_tokens,
+        "messages": [{"role": m["role"], "content": "\n\n".join(m["content"])} for m in msgs],
         "stream": bool(oai.get("stream")),
     }
     if system_parts:
@@ -65,7 +81,12 @@ def oai_to_anthropic(oai: dict) -> tuple[dict | None, str | None]:
     if (p := oai.get("top_p")) is not None:
         out["top_p"] = p
     if stop := oai.get("stop"):
-        out["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
+        if isinstance(stop, str):
+            out["stop_sequences"] = [stop]
+        elif isinstance(stop, list) and all(isinstance(s, str) for s in stop):
+            out["stop_sequences"] = stop
+        else:
+            return None, "stop must be a string or an array of strings"
     return out, None
 
 
