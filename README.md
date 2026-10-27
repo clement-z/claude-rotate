@@ -379,6 +379,7 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
 | `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
 | `refresh_idle_s` | send an account with no traffic for this long a 1-token `claude-haiku-4-5` request (~9 tokens of its quota) to read its current usage, so quota spent outside the proxy is seen before a switch (default 1800; 0 = off). Usage is otherwise only learned from traffic. |
+| `panel_tailnet` | `true` lets tailnet users open the panel without a device key, trusting the `Tailscale-User-Login` header from Tailscale Serve; requires a loopback `bind` (default false). See [SECURITY.md](SECURITY.md). |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
 | `alerts` | `device_tokens_per_hour`, `expensive_model_patterns`, `util_warn` |
 

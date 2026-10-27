@@ -271,4 +271,20 @@ asyncio.run(R.refresh_idle_accounts())
 check("headerless 429 (retired model) neither paces nor gets retried before the interval",
       "pace_until" not in R.STATE["accounts"].get("b", {}) and len(probes) == 1)
 
+# --- 10. panel_tailnet: Tailscale Serve identity opens the panel, not the proxy
+ts = {"tailscale-user-login": "alice@example.com"}
+R.PANEL_TAILNET = False
+check("Tailscale header alone is refused while panel_tailnet is off",
+      call(path="/rotate/status", key=None, method="GET", headers=ts).status_code == 401)
+R.PANEL_TAILNET = True
+for p in ("/rotate/status", "/rotate/stats", "/rotate/panel"):
+    check(f"panel_tailnet: keyless {p} with the Tailscale header → 200",
+          call(path=p, key=None, method="GET", headers=ts).status_code == 200)
+check("panel_tailnet: keyless without the header → 401",
+      call(path="/rotate/stats", key=None, method="GET").status_code == 401)
+use_upstream(lambda req: httpx.Response(200))
+check("panel_tailnet: the header never opens the proxy itself",
+      call(key=None, headers=ts).status_code == 401)
+R.PANEL_TAILNET = False
+
 print(f"\nall {PASS} checks passed")

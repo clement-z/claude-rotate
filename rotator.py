@@ -181,6 +181,12 @@ SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
 REFRESH_IDLE_S = resource_limit("refresh_idle_s", 1800, allow_zero=True)  # 0 = off
+PANEL_TAILNET = CFG.get("panel_tailnet", False)
+if type(PANEL_TAILNET) is not bool:
+    raise SystemExit("panel_tailnet must be true or false")
+if PANEL_TAILNET and CFG.get("bind", "127.0.0.1") not in ("127.0.0.1", "::1", "localhost"):
+    raise SystemExit("panel_tailnet needs bind 127.0.0.1 behind Tailscale Serve: on any other "
+                     "address a client could send Tailscale-User-Login itself and skip the key")
 STORAGE_ERRORS: dict = {}
 
 
@@ -467,7 +473,7 @@ def summarize_usage(usage: dict | None) -> dict | None:
 
 @app.get("/rotate/status")
 async def rotate_status(request: Request):
-    if device_from_request(request) is None:
+    if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
     now = time.time()
     accounts = {}
@@ -492,6 +498,13 @@ async def rotate_status(request: Request):
         "recent_events": STATE["events"][-10:],
         "storage_errors": STORAGE_ERRORS,
     }
+
+
+def panel_allowed(request: Request) -> bool:
+    # Tailscale Serve sets Tailscale-User-Login for tailnet users and strips client
+    # copies; startup enforces a loopback bind, so only Serve (or a local process) can add it.
+    return ((PANEL_TAILNET and bool(request.headers.get("tailscale-user-login")))
+            or device_from_request(request) is not None)
 
 
 def device_from_request(request: Request) -> str | None:
@@ -751,7 +764,7 @@ def aggregate_audit() -> dict:
 
 @app.get("/rotate/stats")
 async def rotate_stats(request: Request):
-    if device_from_request(request) is None:
+    if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
     return aggregate_audit()
 
@@ -830,7 +843,7 @@ refresh(); setInterval(refresh, 10000);
 
 @app.get("/rotate/panel")
 async def rotate_panel(request: Request):
-    if device_from_request(request) is None:
+    if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key — open /rotate/panel?key=<device key>"},
                             status_code=401)
     return Response(content=PANEL_HTML, media_type="text/html")

@@ -9,6 +9,7 @@
   "consume_first_margin_s": 3600,
   "hold_max_s": 0,
   "refresh_idle_s": 1800,
+  "panel_tailnet": false,
   "accounts": [
     {
       "name": "acct-1",

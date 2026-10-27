@@ -4,6 +4,8 @@
   python3 tests/test_config_guard.py
 """
 import json
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -56,6 +58,28 @@ def test_empty_and_duplicate_device_keys_refuse_startup():
             raise AssertionError("invalid device keys must refuse startup")
         except SystemExit as error:
             assert "device" in str(error)
+
+
+def _import_with(cfg: dict):
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "tokens").mkdir()
+    (tmp / "tokens" / "a.token").write_text("sk-ant-oat01-test")
+    (tmp / "config.json").write_text(json.dumps(
+        {"accounts": ACCT, "devices": {"laptop": "dev-laptop-a1b2c3"}, **cfg}))
+    return subprocess.run([sys.executable, "-c", "import rotator"], cwd=Path(R.__file__).parent,
+                          text=True, capture_output=True,
+                          env={**os.environ, "CLAUDE_ROTATE_CONFIG": str(tmp / "config.json")})
+
+
+def test_panel_tailnet_needs_loopback_bind_and_a_bool():
+    # Off loopback, any client could send Tailscale-User-Login itself.
+    for cfg in ({"panel_tailnet": True, "bind": "0.0.0.0"},
+                {"panel_tailnet": True, "bind": "100.101.102.103"},
+                {"panel_tailnet": "false"}):
+        child = _import_with(cfg)
+        assert child.returncode != 0 and "panel_tailnet" in child.stderr, (cfg, child.stderr)
+    child = _import_with({"panel_tailnet": True, "bind": "127.0.0.1"})
+    assert child.returncode == 0, child.stderr
 
 
 if __name__ == "__main__":

@@ -20,6 +20,14 @@ See the [official Serve documentation](https://tailscale.com/docs/features/tails
 Binding directly to the server's Tailscale IP is also supported. Avoid `0.0.0.0`
 unless a separately configured firewall restricts every other interface.
 
+`panel_tailnet: true` opens the read-only dashboard and its JSON endpoints to any
+request carrying `Tailscale-User-Login`. Serve sets that header for tailnet users
+(not tagged devices, not Funnel) and strips client-supplied copies, so with the
+required loopback bind only Serve can add it — or any process on the server
+itself, which can then read the dashboard without a key. The dashboard shows
+account and device names, the last 4 characters of device keys and per-device
+usage; never tokens or message content. Proxy endpoints still require a device key.
+
 Run the service as a dedicated unprivileged user. Keep the installation directory
 and backups private. `setup.sh` enforces mode 0600 for configuration and tokens,
 and 0700 for the token directory. A token file or configuration manually edited

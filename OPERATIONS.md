@@ -178,6 +178,13 @@ view the dashboard; there is no separate administrator role. JSON endpoints
 `/rotate/status` and `/rotate/stats` also accept `Authorization: Bearer KEY`,
 which avoids putting the key in a URL.
 
+To open the dashboard without a key from any tailnet user's device, set
+`"panel_tailnet": true` in the config and restart the service; then
+`https://YOUR-TAILSCALE-HOST/rotate/panel` works on its own. It relies on the
+`Tailscale-User-Login` header that Serve adds, so tagged devices and Funnel
+traffic still need a key, and the service refuses to start with it unless
+`bind` is loopback. The API itself always requires a device key.
+
 ## Updates and rollback
 
 Run `sudo ./install.sh` from the reviewed newer checkout. It builds a new
