@@ -378,6 +378,7 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
 | `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
+| `refresh_idle_s` | send an account with no traffic for this long a 1-token `claude-haiku-4-5` request (~9 tokens of its quota) to read its current usage, so quota spent outside the proxy is seen before a switch (default 1800; 0 = off). Usage is otherwise only learned from traffic. |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
 | `alerts` | `device_tokens_per_hour`, `expensive_model_patterns`, `util_warn` |
 
@@ -677,7 +678,7 @@ Roadmap, in intended order:
       through the real ASGI app against a mocked upstream (auth, header
       rewriting incl. the encoding trick, SSE relay, transparent quota-429
       rotate+retry, burst pacing, 429 passthrough vs hold-until-reset, admin
-      endpoints); `test_stress.py` high-traffic behavior (300-request
+      endpoints, idle-account usage refresh); `test_stress.py` high-traffic behavior (300-request
       fan-out with throughput floor, exactly-one-switch race check with 100
       in-flight requests during a quota hit, burst storm without rotation,
       20 concurrent held requests, 50 parallel SSE streams, events-list

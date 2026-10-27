@@ -17,7 +17,9 @@ Per request, the proxy:
   6. tells spent quota apart from per-minute burst 429s — a burst paces the
      same account (keeps the warm prompt cache) instead of rotating,
   7. optionally holds a request open until the soonest window reset when every
-     account is spent (hold_max_s), so unattended runs finish on their own.
+     account is spent (hold_max_s), so unattended runs finish on their own,
+  8. refreshes the usage of idle accounts with a 1-token request every
+     refresh_idle_s, so quota spent outside the proxy is seen before a switch.
 
 GET /rotate/status (device-key auth) returns live state for the admin page.
 """
@@ -28,6 +30,7 @@ import os
 import sys
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import unquote_plus
 
@@ -52,8 +55,16 @@ HOP = {
 # These belong to the local browser or reverse-proxy trust boundary.
 PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
 
-app = FastAPI()
-client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, connect=15.0))
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(refresh_loop()) if REFRESH_IDLE_S else None
+    yield
+    if task:
+        task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+client =httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, connect=15.0))
 state_lock = asyncio.Lock()
 
 
@@ -169,6 +180,7 @@ COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
+REFRESH_IDLE_S = resource_limit("refresh_idle_s", 1800, allow_zero=True)  # 0 = off
 STORAGE_ERRORS: dict = {}
 
 
@@ -388,6 +400,47 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                 verdict = "exhausted"
         save_state()
         return verdict
+
+
+# Cheapest call that returns the unified headers on a setup-token: /api/oauth/usage
+# needs the user:profile scope and count_tokens omits them. A model the plan
+# can't use answers 429 with no headers, so replace this one when it retires.
+REFRESH_BODY = json.dumps({"model": "claude-haiku-4-5", "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "."}]}).encode()
+_REFRESH_TRIED: dict = {}
+
+
+async def refresh_idle_accounts() -> None:
+    """Usage headers only arrive with traffic, so an idle account's numbers go
+    stale and quota spent outside the proxy (claude.ai, a direct Claude Code
+    login) stays invisible until a switch lands on it. Send each account not
+    seen or tried for REFRESH_IDLE_S a 1-token request and record its headers."""
+    now = time.time()
+    for name in ACCOUNTS:
+        last = max(STATE["accounts"].get(name, {}).get("last_seen", 0), _REFRESH_TRIED.get(name, 0))
+        if disabled(name) or now - last < REFRESH_IDLE_S:
+            continue
+        _REFRESH_TRIED[name] = now
+        try:
+            r = await client.post("/v1/messages", content=REFRESH_BODY, headers={
+                "authorization": f"Bearer {ACCOUNTS[name]['token']}",
+                "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20",
+                "content-type": "application/json"})
+        except httpx.HTTPError as exc:
+            print(f"warning: usage refresh of {name} failed ({type(exc).__name__})", file=sys.stderr)
+            continue
+        if "anthropic-ratelimit-unified-status" in r.headers:
+            await note_response(name, r.headers, r.status_code)
+        else:
+            # note_response would read a headerless 429 as a burst and pace the account.
+            print(f"warning: usage refresh of {name}: HTTP {r.status_code} without usage headers",
+                  file=sys.stderr)
+
+
+async def refresh_loop() -> None:
+    while True:
+        await refresh_idle_accounts()
+        await asyncio.sleep(60)
 
 
 def usage_from_sse(text: str, sink: dict) -> None:

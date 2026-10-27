@@ -240,4 +240,35 @@ check("stats returns rollups", r.status_code == 200 and "by_device" in r.json())
 r = call(path="/rotate/panel?key=devkey-1", key=None, method="GET")
 check("panel serves html", r.status_code == 200 and "text/html" in r.headers["content-type"])
 
+# --- 9. idle-account usage refresh -------------------------------------------
+fresh_state(active="a", accounts={"a": {"last_seen": time.time()},
+                                  "b": {"last_seen": time.time() - 7200, "util_7d": 0.01}})
+R.REFRESH_IDLE_S = 1800
+R._REFRESH_TRIED.clear()
+probes = []
+
+
+def probe_handler(req):
+    probes.append((req.url.path, req.headers["authorization"], json.loads(req.content)["max_tokens"]))
+    return httpx.Response(200, headers=unified(u5="0.14", u7="0.69"))
+
+
+use_upstream(probe_handler)
+asyncio.run(R.refresh_idle_accounts())
+check("refresh sends one 1-token request, to the idle account only",
+      probes == [("/v1/messages", "Bearer tok-b", 1)])
+check("refresh records the idle account's real usage", R.STATE["accounts"]["b"]["util_7d"] == 0.69)
+check("refresh never changes the active account", R.STATE["active_account"] == "a")
+asyncio.run(R.refresh_idle_accounts())
+check("a just-refreshed account is not probed again", len(probes) == 1)
+
+fresh_state(active="a", accounts={"a": {"last_seen": time.time()}, "b": {}})
+R._REFRESH_TRIED.clear()
+probes.clear()
+use_upstream(lambda req: probes.append(1) or httpx.Response(429, json={"type": "error"}))
+asyncio.run(R.refresh_idle_accounts())
+asyncio.run(R.refresh_idle_accounts())
+check("headerless 429 (retired model) neither paces nor gets retried before the interval",
+      "pace_until" not in R.STATE["accounts"].get("b", {}) and len(probes) == 1)
+
 print(f"\nall {PASS} checks passed")

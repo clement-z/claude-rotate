@@ -8,6 +8,7 @@
   "switch_margin": 0.05,
   "consume_first_margin_s": 3600,
   "hold_max_s": 0,
+  "refresh_idle_s": 1800,
   "accounts": [
     {
       "name": "acct-1",
