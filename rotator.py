@@ -912,7 +912,7 @@ PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
  .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
  .muted{color:#8a919c;font-size:.85rem}
  svg text{fill:#8a919c;font-size:11px} .grid{stroke:#2a2f38} .now{stroke:#8a919c;stroke-dasharray:2 3}
- .used,.limit{fill:none;stroke-width:2} .used{stroke:#4caf7d} .limit{stroke:#e0664d} .proj{stroke-dasharray:5 4;opacity:.7}
+ .hit{fill:#e0664d;opacity:.15} .used,.limit{fill:none;stroke-width:2} .used{stroke:#4caf7d} .limit{stroke:#e0664d} .proj{stroke-dasharray:5 4;opacity:.7}
 </style></head><body>
 <h1>claude-rotate <span class="muted" id="upd"></span></h1>
 <h2>Devices</h2><table id="t-roster"></table>
@@ -944,7 +944,14 @@ function weekly(p){
   const all=p.series.concat(p.projection), top=Math.max(100,...all.map(q=>q[2]))*1.05;
   const X=t=>(L+(Math.max(t,x0)-x0)/(x1-x0)*(W-L-R)).toFixed(1), Y=v=>(T+(1-v/top)*(H-T-B)).toFixed(1);
   const line=(pts,i,cls)=>`<polyline class="${cls}" points="${pts.map(q=>X(q[0])+','+Y(q[i])).join(' ')}"/>`;
-  let s=`<svg width="${W}" height="${H}">`;
+  let s=`<svg width="${W}" height="${H}">`, from=null;
+  const band=(a,b)=>`<rect class="hit" x="${X(a)}" y="${T}" width="${(X(b)-X(a)).toFixed(1)}" height="${H-T-B}"/>`;
+  for(const q of all){  // every account at its weekly limit: usage has met the limit line
+    const hit=q[2]-q[1]<=0.1;
+    if(hit&&from==null) from=q[0];
+    else if(!hit&&from!=null){s+=band(from,q[0]);from=null}
+  }
+  if(from!=null) s+=band(from,all[all.length-1][0]);
   for(let v=0;v<top;v+=100) s+=`<line class="grid" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L-4}" y="${+Y(v)+4}" text-anchor="end">${v}%</text>`;
   for(const [t,label,a] of [[x0,'-14 d','start'],[now-7*86400,'-7 d','middle'],[now,'now','middle'],[x1,'+7 d','end']]) s+=`<text x="${X(t)}" y="${H-6}" text-anchor="${a}">${label}</text>`;
   s+=`<line class="now" x1="${X(now)}" x2="${X(now)}" y1="${T}" y2="${H-B}"/>`
@@ -958,9 +965,9 @@ function weekly(p){
     s+=`<text x="${X(q[0])}" y="${+Y(q[2])+4}" text-anchor="middle" fill="#e0664d">✕</text>`});
   s+='</svg><br>';
   const rate=p.rate_per_day==null?'':`At the current rate (${p.rate_per_day}% of a weekly quota per day), `;
-  if(p.eta) s+=`${rate}every account reaches 100% at <b>${esc(when(p.eta))}</b>; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.`;
+  if(p.eta) s+=`${rate}every account ${p.eta<=now+60?'is at 100% now':`reaches 100% at <b>${esc(when(p.eta))}</b>`}; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.`;
   else s+=p.note?esc(p.note):`${rate}no shortfall in the next 7 days.`;
-  return s+'<br>Green: weekly usage summed over accounts. Red: usage plus what is left; it steps up at each weekly reset by what that account used. Dashed: projection.';
+  return s+'<br>Green: weekly usage summed over accounts. Red: usage plus what is left; it steps up at each weekly reset by what that account used. Dashed: projection. Shaded: every account at its weekly limit.';
 }
 async function refresh(){
   const [st, stats] = await Promise.all([

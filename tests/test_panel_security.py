@@ -30,6 +30,7 @@ const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fak
   await vm.runInContext('refresh()',context,{timeout:1000});
   assert(replaced.every(url=>!url.includes('key=')));
   assert(urls.every(({url,opts})=>!url.includes('key=')&&opts.headers.Authorization==='Bearer fake-viewer-key'));
+  assert(elements.weekly.innerHTML.includes('class="hit"'),'shortfall band not drawn');
   for(const id of ['t-roster','accounts','weekly','alerts','t-device','t-model','t-account','events']){
     assert(!elements[id].innerHTML.includes('<mark'),id+' contains raw markup');
     assert(elements[id].innerHTML.includes('&lt;mark'),id+' lost escaped text');

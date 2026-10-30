@@ -341,7 +341,8 @@ rate-limit headers:
   used — the rest expired). A 7-day projection spends the last 24 h rate
   consume-first, pauses usage while every account is spent, and steps the
   limit up at each projected reset; it states when every account first
-  reaches 100% and when the next reset brings quota back. History is sampled every 30 min into
+  reaches 100% and when the next reset brings quota back. Periods when every
+  account was or will be at its limit are shaded. History is sampled every 30 min into
   `usage_history.json` next to `state.json`, so the chart fills over the first
   two weeks. Accounts on different plans need `accounts[].weight`.
 - **Alerts** — device over N tokens/hour, expensive-model usage (Opus/Fable),
