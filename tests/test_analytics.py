@@ -157,6 +157,14 @@ R.ACCOUNTS["b"] = {"name": "b", "disabled": True}
 check("disabled accounts leave the chart", R.weekly_series(now)[-1][1:] == [120, 190])
 R.ACCOUNTS["b"] = {"name": "b"}
 
+R.HISTORY = [{"ts": now - 20 * H, "accounts": {"a": [0.50, now + 5 * H], "b": [0.50, rb]}},
+             {"ts": now - 10 * H, "accounts": {"a": [1.00, now + 5 * H], "b": [1.00, rb]}}]
+R.STATE = {"active_account": "a", "events": [], "accounts": {
+    "a": {"util_7d": 1.0, "reset_7d": now + 5 * H}, "b": {"util_7d": 1.0, "reset_7d": rb}}}
+out = R.weekly_outlook(now)
+check("rate ignores time at the limit: 100 points in the 10 h with quota left",
+      out["rate_per_day"] == 240.0 and abs(out["eta"] - now) <= 1 and out["back_account"] == "a")
+
 R.HISTORY = []
 check("no rate without an hour of history", R.weekly_outlook(now)["eta"] is None
       and "not enough history" in R.weekly_outlook(now)["note"])

@@ -531,11 +531,14 @@ def weekly_outlook(now: float) -> dict:
     points = weekly_series(now)
     out = {"series": points, "projection": [], "rate_per_day": None,
            "eta": None, "back": None, "back_account": None}
-    since = next(p for p in points if p[0] >= now - 86400)
-    if now - since[0] < 3600:
-        out["note"] = "not enough history yet to measure a rate"
+    day = [p for p in points if p[0] >= now - 86400]
+    # Usage cannot rise while every account is spent, so time at the limit would
+    # understate demand: count only the stretches with quota left (as the panel shades).
+    span = sum(b[0] - a[0] for a, b in zip(day, day[1:]) if a[2] - a[1] > 0.1)
+    if span < 3600:
+        out["note"] = "not enough history with quota left yet to measure a rate"
         return out
-    rate = (points[-1][1] - since[1]) / (now - since[0])  # % of one weekly quota per second
+    rate = (day[-1][1] - day[0][1]) / span  # % of one weekly quota per second
     out["rate_per_day"] = round(rate * 86400, 1)
     accts = {n: [u * 100, reset] for n, (u, reset) in weekly_snapshot().items()}
     if rate <= 0 or not accts:
