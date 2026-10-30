@@ -460,7 +460,7 @@ async def refresh_loop() -> None:
 
 
 HISTORY_PATH = STATE_PATH.with_name("usage_history.json")
-HISTORY_DAYS, SAMPLE_S, PROJECT_DAYS = 14, 1800, 3
+HISTORY_DAYS, SAMPLE_S, PROJECT_DAYS = 14, 1800, 7
 
 
 def load_history() -> list:
@@ -525,8 +525,9 @@ def weekly_series(now: float) -> list:
 
 
 def weekly_outlook(now: float) -> dict:
-    """The chart's series plus a projection: spend the last 24 h rate consume-first
-    (soonest weekly reset first) until every enabled account is at 100%."""
+    """The chart's series plus a PROJECT_DAYS projection: spend the last 24 h rate
+    consume-first (soonest weekly reset first); while every enabled account is at
+    100% usage pauses until the next reset. `eta` is the first such moment."""
     points = weekly_series(now)
     out = {"series": points, "projection": [], "rate_per_day": None,
            "eta": None, "back": None, "back_account": None}
@@ -549,27 +550,29 @@ def weekly_outlook(now: float) -> dict:
 
     t, used, horizon = now, points[-1][1], now + PROJECT_DAYS * 86400
     proj = [[round(t), used, round(used + left(), 1)]]
-    while True:
+    while t < horizon:
         nxt = min(accts, key=lambda n: accts[n][1])
         reset = accts[nxt][1]
-        empty = t + left() / rate
-        if empty <= min(reset, horizon):
-            used += left()
-            proj.append([round(empty), round(used, 1), round(used, 1)])
-            out.update(eta=round(empty), back=round(reset), back_account=nxt)
-            break
         end = min(reset, horizon)
-        spend = rate * (end - t)
-        used += spend
-        for n in sorted(accts, key=lambda n: accts[n][1]):
-            take = min(spend, weight(n) * (100 - accts[n][0]))
-            accts[n][0] += take / weight(n)
-            spend -= take
+        empty = t + left() / rate
+        if empty < end:  # everything spent before the next reset: flat until it
+            used += left()
+            for a in accts.values():
+                a[0] = 100.0
+            proj.append([round(empty), round(used, 1), round(used, 1)])
+            if out["eta"] is None:
+                out.update(eta=round(empty), back=round(reset), back_account=nxt)
+        else:
+            spend = rate * (end - t)
+            used += spend
+            for n in sorted(accts, key=lambda n: accts[n][1]):
+                take = min(spend, weight(n) * (100 - accts[n][0]))
+                accts[n][0] += take / weight(n)
+                spend -= take
         proj.append([round(end), round(used, 1), round(used + left(), 1)])
-        if end == horizon:
-            break
-        accts[nxt] = [0.0, reset + 7 * 86400]
-        proj.append([round(end), round(used, 1), round(used + left(), 1)])
+        if end == reset:
+            accts[nxt] = [0.0, reset + 7 * 86400]
+            proj.append([round(end), round(used, 1), round(used + left(), 1)])
         t = end
     out["projection"] = proj
     return out
@@ -914,7 +917,7 @@ PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <h1>claude-rotate <span class="muted" id="upd"></span></h1>
 <h2>Devices</h2><table id="t-roster"></table>
 <div id="accounts"></div>
-<h2>Weekly quota, all accounts (14 days + 3-day projection)</h2><div id="weekly" class="muted">collecting data</div>
+<h2>Weekly quota, all accounts (14 days + 7-day projection)</h2><div id="weekly" class="muted">collecting data</div>
 <h2>Alerts</h2><div id="alerts" class="muted">none</div>
 <h2>Consumption by device (24h)</h2><table id="t-device"></table>
 <h2>Consumption by model (24h)</h2><table id="t-model"></table>
@@ -937,24 +940,26 @@ function table(el, data){
 function when(ts){return new Date(ts*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'})}
 function weekly(p){
   if(!p||!p.series.length) return 'collecting data';
-  const W=760,H=220,L=44,R=8,T=10,B=22, now=p.series[p.series.length-1][0], x0=now-14*86400, x1=now+3*86400;
+  const W=760,H=220,L=44,R=8,T=10,B=22, now=p.series[p.series.length-1][0], x0=now-14*86400, x1=now+7*86400;
   const all=p.series.concat(p.projection), top=Math.max(100,...all.map(q=>q[2]))*1.05;
   const X=t=>(L+(Math.max(t,x0)-x0)/(x1-x0)*(W-L-R)).toFixed(1), Y=v=>(T+(1-v/top)*(H-T-B)).toFixed(1);
   const line=(pts,i,cls)=>`<polyline class="${cls}" points="${pts.map(q=>X(q[0])+','+Y(q[i])).join(' ')}"/>`;
   let s=`<svg width="${W}" height="${H}">`;
   for(let v=0;v<top;v+=100) s+=`<line class="grid" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L-4}" y="${+Y(v)+4}" text-anchor="end">${v}%</text>`;
-  for(const [t,label,a] of [[x0,'-14 d','start'],[now-7*86400,'-7 d','middle'],[now,'now','middle'],[x1,'+3 d','end']]) s+=`<text x="${X(t)}" y="${H-6}" text-anchor="${a}">${label}</text>`;
+  for(const [t,label,a] of [[x0,'-14 d','start'],[now-7*86400,'-7 d','middle'],[now,'now','middle'],[x1,'+7 d','end']]) s+=`<text x="${X(t)}" y="${H-6}" text-anchor="${a}">${label}</text>`;
   s+=`<line class="now" x1="${X(now)}" x2="${X(now)}" y1="${T}" y2="${H-B}"/>`
     +line(p.series,2,'limit')+line(p.series,1,'used')+line(p.projection,2,'limit proj')+line(p.projection,1,'used proj');
   const last=p.series[p.series.length-1];
-  for(const [i,c] of [[1,'#4caf7d'],[2,'#e0664d']]) s+=`<circle cx="${X(now)}" cy="${Y(last[i])}" r="3.5" fill="${c}"/><text x="${+X(now)-6}" y="${+Y(last[i])-6}" text-anchor="end">${Math.round(last[i])}%</text>`;
+  for(const [i,c,dy] of [[1,'#4caf7d',14],[2,'#e0664d',-6]])  // usage label below its dot, limit above
+    s+=`<circle cx="${X(now)}" cy="${Y(last[i])}" r="3.5" fill="${c}"/><text x="${+X(now)-6}" y="${+Y(last[i])+dy}" text-anchor="end">${Math.round(last[i])}%</text>`;
   for(let i=1;i<all.length;i++) if(all[i][2]-all[i-1][2]>=1)  // a weekly reset gave quota back
     s+=`<text x="${X(all[i][0])}" y="${+Y(all[i][2])-4}" text-anchor="middle">+${Math.round(all[i][2]-all[i-1][2])}</text>`;
-  if(p.eta) s+=`<text x="${X(p.eta)}" y="${+Y(all[all.length-1][2])+4}" text-anchor="middle" fill="#e0664d">✕</text>`;
+  p.projection.forEach((q,i)=>{if(i&&q[1]>=q[2]&&p.projection[i-1][1]<p.projection[i-1][2])  // a shortfall starts
+    s+=`<text x="${X(q[0])}" y="${+Y(q[2])+4}" text-anchor="middle" fill="#e0664d">✕</text>`});
   s+='</svg><br>';
   const rate=p.rate_per_day==null?'':`At the current rate (${p.rate_per_day}% of a weekly quota per day), `;
   if(p.eta) s+=`${rate}every account reaches 100% at <b>${esc(when(p.eta))}</b>; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.`;
-  else s+=p.note?esc(p.note):`${rate}no shortfall in the next 3 days.`;
+  else s+=p.note?esc(p.note):`${rate}no shortfall in the next 7 days.`;
   return s+'<br>Green: weekly usage summed over accounts. Red: usage plus what is left; it steps up at each weekly reset by what that account used. Dashed: projection.';
 }
 async function refresh(){
