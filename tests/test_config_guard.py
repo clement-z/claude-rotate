@@ -60,6 +60,17 @@ def test_empty_and_duplicate_device_keys_refuse_startup():
             assert "device" in str(error)
 
 
+def test_account_weight_must_be_a_positive_number():
+    devices = {"laptop": "dev-laptop-a1b2c3"}
+    for w in (0, -1, "1", True):
+        try:
+            _load_with({"accounts": [dict(ACCT[0], weight=w)], "devices": devices})
+            raise AssertionError(f"weight {w!r} must refuse startup")
+        except SystemExit as error:
+            assert "weight" in str(error)
+    _load_with({"accounts": [dict(ACCT[0], weight=0.25)], "devices": devices})
+
+
 def _import_with(cfg: dict):
     tmp = Path(tempfile.mkdtemp())
     (tmp / "tokens").mkdir()

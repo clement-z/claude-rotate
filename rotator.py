@@ -19,7 +19,8 @@ Per request, the proxy:
   7. optionally holds a request open until the soonest window reset when every
      account is spent (hold_max_s), so unattended runs finish on their own,
   8. refreshes the usage of idle accounts with a 1-token request every
-     refresh_idle_s, so quota spent outside the proxy is seen before a switch.
+     refresh_idle_s, so quota spent outside the proxy is seen before a switch,
+  9. keeps 14 days of weekly usage for the panel's chart and run-out estimate.
 
 GET /rotate/status (device-key auth) returns live state for the admin page.
 """
@@ -57,10 +58,9 @@ PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
 
 @asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(refresh_loop()) if REFRESH_IDLE_S else None
+    task = asyncio.create_task(refresh_loop())
     yield
-    if task:
-        task.cancel()
+    task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -90,6 +90,9 @@ def load_config() -> dict:
     cfg = json.loads(CONFIG_PATH.read_text())
     loaded = []
     for acct in cfg["accounts"]:
+        w = acct.get("weight", 1)
+        if type(w) not in (int, float) or not w > 0:
+            raise SystemExit(f"account '{acct['name']}': weight must be a number > 0")
         path = CONFIG_PATH.parent / acct["token_file"]
         if path.exists():
             acct["token"] = path.read_text().strip()
@@ -275,6 +278,11 @@ def priority(name: str) -> int:
     return ACCOUNTS[name].get("priority", 100)
 
 
+def weight(name: str) -> float:
+    """Weekly capacity relative to the other accounts (a Max 20x is 4 of a Max 5x)."""
+    return ACCOUNTS[name].get("weight", 1)
+
+
 def disabled(name: str) -> bool:
     return bool(ACCOUNTS[name].get("disabled"))
 
@@ -445,8 +453,124 @@ async def refresh_idle_accounts() -> None:
 
 async def refresh_loop() -> None:
     while True:
-        await refresh_idle_accounts()
+        if REFRESH_IDLE_S:
+            await refresh_idle_accounts()
+        record_history(time.time())
         await asyncio.sleep(60)
+
+
+HISTORY_PATH = STATE_PATH.with_name("usage_history.json")
+HISTORY_DAYS, SAMPLE_S, PROJECT_DAYS = 14, 1800, 3
+
+
+def load_history() -> list:
+    try:
+        history = json.loads(HISTORY_PATH.read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        # The chart is disposable; a damaged file must not stop the proxy.
+        print(f"warning: ignoring {HISTORY_PATH} ({type(exc).__name__})", file=sys.stderr)
+        return []
+    return history if isinstance(history, list) else []
+
+
+HISTORY = load_history()
+
+
+def weekly_snapshot() -> dict:
+    return {n: [round(util_7d(n), 4), STATE["accounts"][n]["reset_7d"]] for n in ACCOUNTS
+            if not disabled(n) and STATE["accounts"].get(n, {}).get("reset_7d")}
+
+
+def record_history(now: float) -> None:
+    """One weekly-usage snapshot of every enabled account per SAMPLE_S, kept HISTORY_DAYS."""
+    if HISTORY and now - HISTORY[-1]["ts"] < SAMPLE_S:
+        return
+    snapshot = weekly_snapshot()
+    if not snapshot:
+        return
+    HISTORY.append({"ts": round(now), "accounts": snapshot})
+    while HISTORY[0]["ts"] < now - HISTORY_DAYS * 86400:
+        HISTORY.pop(0)
+    tmp = HISTORY_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(HISTORY))
+        tmp.replace(HISTORY_PATH)
+    except OSError as exc:
+        storage_error("history_write", exc)
+
+
+def weekly_series(now: float) -> list:
+    """[ts, used, limit] in % of one weekly quota. `used` sums each enabled account's
+    weekly rises (weighted); `limit` = used + what every account has left, so it steps
+    up at a reset by what that account used in the closing window — the rest expired."""
+    points, used, seen = [], 0.0, {}
+    for sample in HISTORY + [{"ts": now, "accounts": weekly_snapshot()}]:
+        left = 0.0
+        for name, (u, reset) in sample["accounts"].items():
+            if name not in ACCOUNTS or disabled(name):
+                continue
+            last_reset, top = seen.get(name, (reset, u))
+            if reset > last_reset + 3600:  # a new weekly window: all of it is new usage
+                used, top = used + weight(name) * u, u
+            elif u > top:
+                used, top = used + weight(name) * (u - top), u
+            seen[name] = (max(reset, last_reset), top)
+            left += weight(name) * (1 - u)
+        points.append([round(sample["ts"]), round(used * 100, 1), round((used + left) * 100, 1)])
+    return points
+
+
+def weekly_outlook(now: float) -> dict:
+    """The chart's series plus a projection: spend the last 24 h rate consume-first
+    (soonest weekly reset first) until every enabled account is at 100%."""
+    points = weekly_series(now)
+    out = {"series": points, "projection": [], "rate_per_day": None,
+           "eta": None, "back": None, "back_account": None}
+    since = next(p for p in points if p[0] >= now - 86400)
+    if now - since[0] < 3600:
+        out["note"] = "not enough history yet to measure a rate"
+        return out
+    rate = (points[-1][1] - since[1]) / (now - since[0])  # % of one weekly quota per second
+    out["rate_per_day"] = round(rate * 86400, 1)
+    accts = {n: [u * 100, reset] for n, (u, reset) in weekly_snapshot().items()}
+    if rate <= 0 or not accts:
+        out["note"] = "weekly usage did not rise over the last 24 h"
+        return out
+    for a in accts.values():
+        while a[1] <= now:  # reset passed with no reading since: assume the next week follows
+            a[1] += 7 * 86400
+
+    def left():
+        return sum(weight(n) * (100 - u) for n, (u, _) in accts.items())
+
+    t, used, horizon = now, points[-1][1], now + PROJECT_DAYS * 86400
+    proj = [[round(t), used, round(used + left(), 1)]]
+    while True:
+        nxt = min(accts, key=lambda n: accts[n][1])
+        reset = accts[nxt][1]
+        empty = t + left() / rate
+        if empty <= min(reset, horizon):
+            used += left()
+            proj.append([round(empty), round(used, 1), round(used, 1)])
+            out.update(eta=round(empty), back=round(reset), back_account=nxt)
+            break
+        end = min(reset, horizon)
+        spend = rate * (end - t)
+        used += spend
+        for n in sorted(accts, key=lambda n: accts[n][1]):
+            take = min(spend, weight(n) * (100 - accts[n][0]))
+            accts[n][0] += take / weight(n)
+            spend -= take
+        proj.append([round(end), round(used, 1), round(used + left(), 1)])
+        if end == horizon:
+            break
+        accts[nxt] = [0.0, reset + 7 * 86400]
+        proj.append([round(end), round(used, 1), round(used + left(), 1)])
+        t = end
+    out["projection"] = proj
+    return out
 
 
 def usage_from_sse(text: str, sink: dict) -> None:
@@ -497,6 +621,7 @@ async def rotate_status(request: Request):
         "accounts": accounts,
         "recent_events": STATE["events"][-10:],
         "storage_errors": STORAGE_ERRORS,
+        "weekly": weekly_outlook(now),
     }
 
 
@@ -781,10 +906,13 @@ PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
  .gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
  .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
  .muted{color:#8a919c;font-size:.85rem}
+ svg text{fill:#8a919c;font-size:11px} .grid{stroke:#2a2f38} .now{stroke:#8a919c;stroke-dasharray:2 3}
+ .used,.limit{fill:none;stroke-width:2} .used{stroke:#4caf7d} .limit{stroke:#e0664d} .proj{stroke-dasharray:5 4;opacity:.7}
 </style></head><body>
 <h1>claude-rotate <span class="muted" id="upd"></span></h1>
 <h2>Devices</h2><table id="t-roster"></table>
 <div id="accounts"></div>
+<h2>Weekly quota, all accounts (14 days + 3-day projection)</h2><div id="weekly" class="muted">collecting data</div>
 <h2>Alerts</h2><div id="alerts" class="muted">none</div>
 <h2>Consumption by device (24h)</h2><table id="t-device"></table>
 <h2>Consumption by model (24h)</h2><table id="t-model"></table>
@@ -803,6 +931,27 @@ function table(el, data){
   for(const [k,v] of Object.entries(data))
     h+=`<tr><td>${esc(k)}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
   el.innerHTML=h;
+}
+function when(ts){return new Date(ts*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'})}
+function weekly(p){
+  if(!p||p.series.length<2) return 'collecting data';
+  const W=760,H=220,L=44,R=8,T=10,B=22, now=p.series[p.series.length-1][0], x0=now-14*86400, x1=now+3*86400;
+  const all=p.series.concat(p.projection), top=Math.max(100,...all.map(q=>q[2]))*1.05;
+  const X=t=>(L+(Math.max(t,x0)-x0)/(x1-x0)*(W-L-R)).toFixed(1), Y=v=>(T+(1-v/top)*(H-T-B)).toFixed(1);
+  const line=(pts,i,cls)=>`<polyline class="${cls}" points="${pts.map(q=>X(q[0])+','+Y(q[i])).join(' ')}"/>`;
+  let s=`<svg width="${W}" height="${H}">`;
+  for(let v=0;v<top;v+=100) s+=`<line class="grid" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L-4}" y="${+Y(v)+4}" text-anchor="end">${v}%</text>`;
+  for(const [t,label,a] of [[x0,'-14 d','start'],[now-7*86400,'-7 d','middle'],[now,'now','middle'],[x1,'+3 d','end']]) s+=`<text x="${X(t)}" y="${H-6}" text-anchor="${a}">${label}</text>`;
+  s+=`<line class="now" x1="${X(now)}" x2="${X(now)}" y1="${T}" y2="${H-B}"/>`
+    +line(p.series,2,'limit')+line(p.series,1,'used')+line(p.projection,2,'limit proj')+line(p.projection,1,'used proj');
+  for(let i=1;i<all.length;i++) if(all[i][2]-all[i-1][2]>=1)  // a weekly reset gave quota back
+    s+=`<text x="${X(all[i][0])}" y="${+Y(all[i][2])-4}" text-anchor="middle">+${Math.round(all[i][2]-all[i-1][2])}</text>`;
+  if(p.eta) s+=`<text x="${X(p.eta)}" y="${+Y(all[all.length-1][2])+4}" text-anchor="middle" fill="#e0664d">✕</text>`;
+  s+='</svg><br>';
+  const rate=p.rate_per_day==null?'':`At the current rate (${p.rate_per_day}% of a weekly quota per day), `;
+  if(p.eta) s+=`${rate}every account reaches 100% at <b>${esc(when(p.eta))}</b>; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.`;
+  else s+=p.note?esc(p.note):`${rate}no shortfall in the next 3 days.`;
+  return s+'<br>Green: weekly usage summed over accounts. Red: usage plus what is left; it steps up at each weekly reset by what that account used. Dashed: projection.';
 }
 async function refresh(){
   const [st, stats] = await Promise.all([
@@ -828,6 +977,7 @@ async function refresh(){
       +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
   }
   document.getElementById('accounts').innerHTML=h;
+  document.getElementById('weekly').innerHTML=weekly(st.weekly);
   document.getElementById('alerts').innerHTML = stats.alerts.length
     ? stats.alerts.map(a=>`<div class="alert-${esc(a.level)}">⚠ ${esc(a.text)}</div>`).join('') : 'none';
   table(document.getElementById('t-device'), stats.by_device);

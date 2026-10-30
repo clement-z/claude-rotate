@@ -110,4 +110,56 @@ check("roster shows key suffix", devs["laptop"]["key_suffix"] == "…abcd")
 check("roster last model/account", devs["laptop"]["last_model"] == "claude-opus-5"
       and devs["laptop"]["last_account"] == "a")
 
+# --- weekly chart: summed usage, limit steps at resets, weights, run-out projection ---
+H = 3600
+old_a, new_a, rb = now - 20 * H, now - 20 * H + 7 * 86400, now + 50 * H
+
+
+def weekly_state(ua, ub):
+    R.STATE = {"active_account": "a", "events": [], "accounts": {
+        "a": {"util_7d": ua, "reset_7d": new_a}, "b": {"util_7d": ub, "reset_7d": rb}}}
+
+
+R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}}
+R.HISTORY = [{"ts": now - 30 * H, "accounts": {"a": [0.90, old_a], "b": [0.20, rb]}},
+             {"ts": now - 20 * H, "accounts": {"a": [0.00, old_a], "b": [0.20, rb]}},  # a's week reset
+             {"ts": now - 10 * H, "accounts": {"a": [0.10, new_a], "b": [0.30, rb]}}]
+weekly_state(0.30, 0.30)
+s = R.weekly_series(now)
+check("weekly usage sums each account's rises", [p[1] for p in s] == [0, 0, 20, 40])
+check("limit steps up at a reset by what that week used",
+      [p[2] for p in s] == [90, 180, 180, 180])
+
+out = R.weekly_outlook(now)
+check("rate taken over the last 24 h", out["rate_per_day"] == 48.0)
+check("projection: b's reset gives back its full week, then no shortfall within 3 days",
+      out["eta"] is None and [p[2] for p in out["projection"]][1:3] == [180, 280])
+
+weekly_state(0.95, 0.95)
+out = R.weekly_outlook(now)
+check("run-out ETA when the remaining 10 points go at 8.5 points/h",
+      abs(out["eta"] - (now + 10 / 8.5 * H)) <= 1 and out["back"] == round(rb)
+      and out["back_account"] == "b")
+
+R.ACCOUNTS["b"]["weight"] = 0.25  # b becomes a quarter-size plan
+weekly_state(0.30, 0.30)
+check("weights scale an account's share", R.weekly_series(now)[-1][1:] == [32.5, 120])
+R.ACCOUNTS["b"] = {"name": "b", "disabled": True}
+check("disabled accounts leave the chart", R.weekly_series(now)[-1][1:] == [30, 100])
+R.ACCOUNTS["b"] = {"name": "b"}
+
+R.HISTORY = []
+check("no rate without an hour of history", R.weekly_outlook(now)["eta"] is None
+      and "not enough history" in R.weekly_outlook(now)["note"])
+
+R.HISTORY_PATH = tmp / "usage_history.json"
+R.HISTORY = [{"ts": now - 15 * 86400, "accounts": {"a": [0.1, old_a]}}]
+R.record_history(now)
+check("history sample saved, 15-day-old one dropped",
+      [h["ts"] for h in R.HISTORY] == [round(now)]
+      and json.loads(R.HISTORY_PATH.read_text()) == R.HISTORY)
+R.record_history(now + 600)
+R.record_history(now + 1801)  # stored ts is rounded
+check("one sample per 30 min", len(R.HISTORY) == 2)
+
 print(f"\nall {PASS} checks passed")

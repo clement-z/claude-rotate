@@ -335,6 +335,14 @@ rate-limit headers:
   which account its traffic rode, requests + tokens in the last hour.
 - **Accounts** — live 5-hour and weekly utilization gauges (from Anthropic's
   own headers), active account, reset countdowns.
+- **Weekly quota, all accounts** — 14 days of weekly usage summed over the
+  enabled accounts (green) against what they could have used (red: usage plus
+  what is left, stepping up at each account's weekly reset by what that week
+  used — the rest expired). A 3-day projection spends the last 24 h rate
+  consume-first and states when every account reaches 100% and when the next
+  reset brings quota back. History is sampled every 30 min into
+  `usage_history.json` next to `state.json`, so the chart fills over the first
+  two weeks. Accounts on different plans need `accounts[].weight`.
 - **Alerts** — device over N tokens/hour, expensive-model usage (Opus/Fable),
   account near the switch threshold. Thresholds in `config.json`.
 - **Consumption (24h)** — by device / model / account, with a *cost-equivalent*
@@ -371,6 +379,7 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
+| `accounts[].weight` | weekly capacity relative to the other accounts, for the panel's weekly chart and run-out estimate (default 1). Max 20x is 4 times Max 5x: give a 5x `0.25` next to 20x accounts. |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
 | `strategy` | `consume-first` (default) or `least-used` — see below |
@@ -551,7 +560,8 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
 - **What to back up.** `tokens/` and `config.json` (`/etc/claude-rotate/` on
   the Debian service) — that's the whole identity of the install. `state.json`
   is disposable (quota state is re-learned from the first responses; you only
-  lose the events history), and `logs/` is disposable analytics.
+  lose the events history), and `logs/` and `usage_history.json` are
+  disposable analytics.
 - **Upgrades.** For the Debian service, run `sudo ./install.sh` from the newer
   reviewed checkout; it builds a new immutable release and switches to it. Roll
   back with the [manual procedure](deploy/README.md#immutable-upgrades-and-rollback).

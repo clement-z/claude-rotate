@@ -23,14 +23,14 @@ const value = '<mark data-audit="marker">&\'"</mark>';
 const elements = {}, urls = [], replaced = [];
 const usage = {requests:1,input_tokens:1,output_tokens:1,cache_read:0,cache_write:0,cost_usd:0};
 const stats = {devices:{[value]:{last_model:value,last_account:value,key_suffix:value}},alerts:[{level:'warn',text:value}],by_device:{[value]:usage},by_model:{[value]:usage},by_account:{[value]:usage}};
-const status = {accounts:{[value]:{priority:100}},active_account:value,recent_events:[{ts:value,from:value,to:value,reason:value}]};
+const status = {accounts:{[value]:{priority:100}},active_account:value,recent_events:[{ts:value,from:value,to:value,reason:value}],weekly:{series:[[0,0,100],[3600,10,100]],projection:[[3600,10,100],[7200,100,100]],rate_per_day:5,eta:7200,back:9000,back_account:value}};
 const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fake-viewer-key',href:'http://proxy/rotate/panel?key=fake-viewer-key'},history:{replaceState:(_a,_b,url)=>replaced.push(url)},document:{getElementById:id=>elements[id]??=( {innerHTML:'',textContent:''} )},setInterval:()=>{},fetch:async(url,opts)=>{urls.push({url,opts});return {json:async()=>url.includes('/status')?status:stats}}});
 (async()=>{
   vm.runInContext(script,context,{timeout:1000});
   await vm.runInContext('refresh()',context,{timeout:1000});
   assert(replaced.every(url=>!url.includes('key=')));
   assert(urls.every(({url,opts})=>!url.includes('key=')&&opts.headers.Authorization==='Bearer fake-viewer-key'));
-  for(const id of ['t-roster','accounts','alerts','t-device','t-model','t-account','events']){
+  for(const id of ['t-roster','accounts','weekly','alerts','t-device','t-model','t-account','events']){
     assert(!elements[id].innerHTML.includes('<mark'),id+' contains raw markup');
     assert(elements[id].innerHTML.includes('&lt;mark'),id+' lost escaped text');
   }

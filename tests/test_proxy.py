@@ -232,7 +232,7 @@ fresh_state()
 check("status needs auth", call(path="/rotate/status", key="nope", method="GET").status_code == 401)
 r = call(path="/rotate/status", method="GET")
 check("status shape", r.status_code == 200 and r.json()["strategy"] == "consume-first"
-      and "accounts" in r.json())
+      and "accounts" in r.json() and "series" in r.json()["weekly"])
 check("status auth via ?key=", call(path="/rotate/status?key=devkey-1", key=None,
                                     method="GET").status_code == 200)
 r = call(path="/rotate/stats", method="GET")
