@@ -511,7 +511,9 @@ def weekly_series(now: float) -> list:
         for name, (u, reset) in sample["accounts"].items():
             if name not in ACCOUNTS or disabled(name):
                 continue
-            last_reset, top = seen.get(name, (reset, u))
+            # First sight counts as a new window, so the chart opens at the current
+            # week's usage against the full limit (the sum of the weights).
+            last_reset, top = seen.get(name, (float("-inf"), 0.0))
             if reset > last_reset + 3600:  # a new weekly window: all of it is new usage
                 used, top = used + weight(name) * u, u
             elif u > top:
@@ -934,7 +936,7 @@ function table(el, data){
 }
 function when(ts){return new Date(ts*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'})}
 function weekly(p){
-  if(!p||p.series.length<2) return 'collecting data';
+  if(!p||!p.series.length) return 'collecting data';
   const W=760,H=220,L=44,R=8,T=10,B=22, now=p.series[p.series.length-1][0], x0=now-14*86400, x1=now+3*86400;
   const all=p.series.concat(p.projection), top=Math.max(100,...all.map(q=>q[2]))*1.05;
   const X=t=>(L+(Math.max(t,x0)-x0)/(x1-x0)*(W-L-R)).toFixed(1), Y=v=>(T+(1-v/top)*(H-T-B)).toFixed(1);
@@ -944,6 +946,8 @@ function weekly(p){
   for(const [t,label,a] of [[x0,'-14 d','start'],[now-7*86400,'-7 d','middle'],[now,'now','middle'],[x1,'+3 d','end']]) s+=`<text x="${X(t)}" y="${H-6}" text-anchor="${a}">${label}</text>`;
   s+=`<line class="now" x1="${X(now)}" x2="${X(now)}" y1="${T}" y2="${H-B}"/>`
     +line(p.series,2,'limit')+line(p.series,1,'used')+line(p.projection,2,'limit proj')+line(p.projection,1,'used proj');
+  const last=p.series[p.series.length-1];
+  for(const [i,c] of [[1,'#4caf7d'],[2,'#e0664d']]) s+=`<circle cx="${X(now)}" cy="${Y(last[i])}" r="3.5" fill="${c}"/><text x="${+X(now)-6}" y="${+Y(last[i])-6}" text-anchor="end">${Math.round(last[i])}%</text>`;
   for(let i=1;i<all.length;i++) if(all[i][2]-all[i-1][2]>=1)  // a weekly reset gave quota back
     s+=`<text x="${X(all[i][0])}" y="${+Y(all[i][2])-4}" text-anchor="middle">+${Math.round(all[i][2]-all[i-1][2])}</text>`;
   if(p.eta) s+=`<text x="${X(p.eta)}" y="${+Y(all[all.length-1][2])+4}" text-anchor="middle" fill="#e0664d">✕</text>`;

@@ -126,14 +126,15 @@ R.HISTORY = [{"ts": now - 30 * H, "accounts": {"a": [0.90, old_a], "b": [0.20, r
              {"ts": now - 10 * H, "accounts": {"a": [0.10, new_a], "b": [0.30, rb]}}]
 weekly_state(0.30, 0.30)
 s = R.weekly_series(now)
-check("weekly usage sums each account's rises", [p[1] for p in s] == [0, 0, 20, 40])
+check("chart opens at this week's usage, then adds each account's rises",
+      [p[1] for p in s] == [110, 110, 130, 150])
 check("limit steps up at a reset by what that week used",
-      [p[2] for p in s] == [90, 180, 180, 180])
+      [p[2] for p in s] == [200, 290, 290, 290])  # opens at the full limit: 2 accounts
 
 out = R.weekly_outlook(now)
 check("rate taken over the last 24 h", out["rate_per_day"] == 48.0)
 check("projection: b's reset gives back its full week, then no shortfall within 3 days",
-      out["eta"] is None and [p[2] for p in out["projection"]][1:3] == [180, 280])
+      out["eta"] is None and [p[2] for p in out["projection"]][1:3] == [290, 390])
 
 weekly_state(0.95, 0.95)
 out = R.weekly_outlook(now)
@@ -143,9 +144,9 @@ check("run-out ETA when the remaining 10 points go at 8.5 points/h",
 
 R.ACCOUNTS["b"]["weight"] = 0.25  # b becomes a quarter-size plan
 weekly_state(0.30, 0.30)
-check("weights scale an account's share", R.weekly_series(now)[-1][1:] == [32.5, 120])
+check("weights scale an account's share", R.weekly_series(now)[-1][1:] == [127.5, 215])
 R.ACCOUNTS["b"] = {"name": "b", "disabled": True}
-check("disabled accounts leave the chart", R.weekly_series(now)[-1][1:] == [30, 100])
+check("disabled accounts leave the chart", R.weekly_series(now)[-1][1:] == [120, 190])
 R.ACCOUNTS["b"] = {"name": "b"}
 
 R.HISTORY = []
