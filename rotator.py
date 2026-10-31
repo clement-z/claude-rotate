@@ -1000,109 +1000,180 @@ async def rotate_stats(request: Request):
     return aggregate_audit() | {"periods": usage_periods()}
 
 
-PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
+PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>claude-rotate</title>
 <style>
- body{font-family:-apple-system,sans-serif;margin:2rem;background:#12151a;color:#e6e6e6}
- h1{font-size:1.3rem} h2{font-size:1rem;margin-top:1.6rem;color:#9ecbff}
- table{border-collapse:collapse;margin-top:.4rem;min-width:520px}
- td,th{padding:.3rem .8rem;border-bottom:1px solid #2a2f38;text-align:right;font-variant-numeric:tabular-nums}
- td:first-child,th:first-child{text-align:left}
- .gauge{display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
- .gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
- .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
- .muted{color:#8a919c;font-size:.85rem}
- svg text{fill:#8a919c;font-size:11px} .grid{stroke:#2a2f38} .now{stroke:#8a919c;stroke-dasharray:2 3}
- .hit{fill:#e0664d;opacity:.15} .used,.limit{fill:none;stroke-width:2} .used{stroke:#4caf7d} .limit{stroke:#e0664d} .proj{stroke-dasharray:5 4;opacity:.7}
-</style></head><body>
-<h1>claude-rotate <span class="muted" id="upd"></span></h1>
-<h2>Devices</h2><table id="t-roster"></table>
-<div id="accounts"></div>
-<h2>Weekly quota, all accounts (14 days + 7-day projection)</h2><div id="weekly" class="muted">collecting data</div>
-<h2>Alerts</h2><div id="alerts" class="muted">none</div>
-<h2>Consumption by device (24h)</h2><table id="t-device"></table>
-<h2>Consumption by model (24h)</h2><table id="t-model"></table>
-<h2>Consumption by account (24h)</h2><table id="t-account"></table>
-<h2>Recent switches</h2><div id="events" class="muted">none</div>
-<p class="muted">Cost = API-equivalent dollars at list prices (incl. cache read 0.1x / write 1.25x) — actual spend is covered by the Max subscriptions.</p>
+ :root{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;
+  --border:rgba(255,255,255,.10);--s1:#3987e5;--s2:#d95926;--track:#0d366b;--good:#0ca30c;--warn:#fab219;--crit:#d03b3b}
+ *{box-sizing:border-box} body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+ main{max-width:1180px;margin:0 auto;padding:20px 24px 40px;display:grid;gap:16px}
+ header{display:flex;align-items:center;gap:12px;flex-wrap:wrap} h1{font-size:18px;margin:0;font-weight:600}
+ .pill{border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:var(--ink2);font-size:13px}
+ .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
+ .spacer{flex:1} .muted{color:var(--muted)} .small{font-size:12px}
+ .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto}
+ .card h2{font-size:13px;font-weight:600;color:var(--ink2);margin:0 0 12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+ .banner{display:flex;gap:10px;padding:10px 14px;border-radius:10px;border:1px solid var(--border);color:var(--ink2);margin-bottom:8px}
+ .banner.warn{border-color:rgba(250,178,25,.35);background:rgba(250,178,25,.06)} .banner.warn b{color:var(--warn)}
+ .kpis{display:grid;grid-template-columns:1.6fr repeat(4,1fr);gap:16px}
+ .hero .v{font-size:48px;font-weight:600;line-height:1.1;margin:4px 0} .label{color:var(--ink2);font-size:13px}
+ .tile .v{font-size:26px;font-weight:600;margin:6px 0 2px}
+ .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px}
+ .acct-head{display:flex;align-items:baseline;gap:8px;margin-bottom:12px;flex-wrap:wrap} .acct-head b{font-size:16px}
+ .badge{font-size:12px;border-radius:999px;padding:1px 8px;border:1px solid var(--border);color:var(--ink2)}
+ .meter-row{display:grid;grid-template-columns:28px 1fr 250px;gap:10px;align-items:center;margin:8px 0}
+ .meter{position:relative;height:8px;border-radius:4px;background:var(--track)} .meter i{position:absolute;inset:0 auto 0 0;border-radius:4px}
+ .meter .tick{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink2);opacity:.6}
+ .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--ink2);font-weight:400;margin-left:auto}
+ .key{display:inline-block;width:16px;border-top:2px solid;vertical-align:4px;margin-right:6px}
+ .key.dash{border-top-style:dashed} .key.band{height:10px;border:0;vertical-align:-1px;background:rgba(208,59,59,.3)}
+ #weekly{position:relative} svg text{fill:var(--muted);font-size:11px;font-family:inherit}
+ .tip{position:absolute;pointer-events:none;background:#262624;border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;min-width:170px;display:none;top:20px}
+ .tip .row{display:flex;justify-content:space-between;gap:12px} .tip .v{color:var(--ink);font-weight:600}
+ .sentence{margin-top:8px;color:var(--ink2)}
+ table{border-collapse:collapse;width:100%} th,td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+ th{color:var(--muted);font-weight:500;font-size:12px} td:first-child,th:first-child,.l{text-align:left} tr:last-child td{border-bottom:0}
+ td .sub{display:block;color:var(--muted);font-size:11px} tr.removed td{color:var(--muted)}
+ .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-left:auto}
+ .seg button{background:none;border:0;color:var(--ink2);padding:4px 12px;font:inherit;font-size:12px;cursor:pointer} .seg button.on{background:var(--grid);color:var(--ink);font-weight:600}
+ .split{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
+ .timeline div{display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--grid);color:var(--ink2)} .timeline div:last-child{border-bottom:0}
+ .linkbtn{background:none;border:1px solid var(--border);border-radius:6px;color:var(--ink2);font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}
+ @media (max-width:900px){.kpis,.split{grid-template-columns:1fr}.meter-row{grid-template-columns:28px 1fr}}
+</style></head><body><main>
+<header><h1>claude-rotate</h1><span class="muted" id="host"></span><span id="pills"></span><span class="spacer"></span><span class="muted small" id="upd"></span></header>
+<div id="alerts"></div>
+<section class="kpis">
+ <div class="card hero"><div class="label">Every account spent in</div><div class="v" id="hero">–</div><div class="muted" id="hero-sub"></div></div>
+ <div class="card tile"><div class="label">Weekly quota left</div><div class="v" id="k-left">–</div><div class="muted small" id="k-left-sub"></div></div>
+ <div class="card tile"><div class="label">Burn rate</div><div class="v" id="k-rate">–</div><div class="muted small">of a weekly quota per day</div></div>
+ <div class="card tile"><div class="label">Requests, 24 h</div><div class="v" id="k-req">–</div><div class="muted small" id="k-req-sub"></div></div>
+ <div class="card tile"><div class="label">Cost-equivalent, 7 d</div><div class="v" id="k-cost">–</div><div class="muted small" id="k-cost-sub"></div></div>
+</section>
+<section class="accounts" id="accounts"></section>
+<section class="card"><h2>Weekly quota, all accounts <span class="muted" style="font-weight:400">14 days + 7-day projection</span>
+ <span class="legend"><span><span class="key" style="border-color:var(--s1)"></span>Usage</span><span><span class="key" style="border-color:var(--s2)"></span>Limit</span>
+ <span><span class="key dash" style="border-color:var(--muted)"></span>Projected</span><span><span class="key band"></span>&#9940; Every account at its limit</span></span>
+ <button class="linkbtn" id="tbl">Table</button></h2>
+ <div id="weekly" class="muted">collecting data</div><div class="tip" id="tip"></div></section>
+<section class="card"><h2>Devices</h2><table id="devices"></table></section>
+<section class="split">
+ <div class="card"><h2>By model <span class="seg" id="period"></span></h2><table id="models"></table></div>
+ <div class="card"><h2>By account, 24 h</h2><table id="by-account"></table><h2 style="margin-top:20px">Recent switches</h2><div class="timeline" id="events"></div></div>
+</section>
+<p class="muted small">Cost-equivalent = API list prices (cache read 0.1&times;, write 1.25&times;); actual spend is covered by the subscriptions.</p>
+</main>
 <script>
 const KEY = new URLSearchParams(location.search).get('key');
 const cleanURL = new URL(location.href);
 cleanURL.searchParams.delete('key');
 history.replaceState(null, '', cleanURL.pathname + cleanURL.search + cleanURL.hash);
+const $=id=>document.getElementById(id), H=3600, D=86400, PERIODS={'24 h':'24h','7 d':'7d','30 d':'30d','All time':'all'};
+let period='7 d', showTable=false, WK=null;
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function fmt(n){return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n}
-function table(el, data){
-  let h='<tr><th></th><th>req</th><th>in</th><th>out</th><th>cache r</th><th>cache w</th><th>$ equiv</th></tr>';
-  for(const [k,v] of Object.entries(data))
-    h+=`<tr><td>${esc(k)}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
-  el.innerHTML=h;
-}
+function fmt(n){n=n||0;return n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e4?0:1)+'k':''+Math.round(n)}
+function money(v){v=v||0;return '$'+(v>=100?Math.round(v).toLocaleString():v.toFixed(2))}
+function tok(b){return (b.input_tokens||0)+(b.output_tokens||0)+(b.cache_write||0)}
+function sum(o,f){return Object.values(o||{}).reduce((a,b)=>a+(f(b)||0),0)}
 function when(ts){return new Date(ts*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'})}
+function day(ts){return new Date(ts*1000).toLocaleDateString([],{month:'short',day:'numeric'})}
+function dur(s){return s<5400?Math.round(s/60)+' min':s<2*D?(s/H).toFixed(s<10*H?1:0)+' h':(s/D).toFixed(1)+' d'}
+function ago(min){return min==null?'never':min<1?'just now':min<60?min+' min ago':(min/60).toFixed(1)+' h ago'}
+function cell(b){return b?`<td>${money(b.cost_usd)}<span class="sub">${fmt(tok(b))} tok &middot; ${fmt(b.requests)} req</span></td>`:'<td class="muted">&ndash;</td>'}
+function meter(label,u,thr,reset){
+  const sev=u>=1?['var(--crit)',' &#10005; limit reached']:u>=thr?['var(--warn)',' &#9888; past switch point']:['var(--s1)',''];
+  return `<div class="meter-row"><span class="muted">${label}</span><div class="meter"><i style="width:${Math.min(100,u*100)}%;background:${sev[0]}"></i><span class="tick" style="left:${thr*100}%"></span></div>`
+    +`<span><b>${Math.round(u*100)}%</b> <span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
+function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
+  return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
 function weekly(p){
   if(!p||!p.series.length) return 'collecting data';
-  const W=760,H=220,L=44,R=8,T=10,B=22, now=p.series[p.series.length-1][0], x0=now-14*86400, x1=now+7*86400;
-  const all=p.series.concat(p.projection), top=Math.max(100,...all.map(q=>q[2]))*1.05;
-  const X=t=>(L+(Math.max(t,x0)-x0)/(x1-x0)*(W-L-R)).toFixed(1), Y=v=>(T+(1-v/top)*(H-T-B)).toFixed(1);
-  const line=(pts,i,cls)=>`<polyline class="${cls}" points="${pts.map(q=>X(q[0])+','+Y(q[i])).join(' ')}"/>`;
-  let s=`<svg width="${W}" height="${H}">`, from=null;
-  const band=(a,b)=>`<rect class="hit" x="${X(a)}" y="${T}" width="${(X(b)-X(a)).toFixed(1)}" height="${H-T-B}"/>`;
-  for(const q of all){  // every account at its weekly limit: usage has met the limit line
-    const hit=q[2]-q[1]<=0.1;
-    if(hit&&from==null) from=q[0];
-    else if(!hit&&from!=null){s+=band(from,q[0]);from=null}
-  }
+  const W=1100,Hh=270,L=48,R=12,T=14,B=26, now=p.series[p.series.length-1][0], x0=now-14*D, x1=now+7*D;
+  const all=p.series.concat(p.projection.slice(1)), last=p.series[p.series.length-1];
+  const ymax=Math.ceil(Math.max(100,...all.map(q=>q[2]))*1.08/100)*100;
+  const X=t=>L+(Math.max(t,x0)-x0)/(x1-x0)*(W-L-R), Y=v=>T+(1-v/ymax)*(Hh-T-B);
+  const path=(a,i)=>a.map((q,k)=>(k?'L':'M')+X(q[0]).toFixed(1)+','+Y(q[i]).toFixed(1)).join('');
+  WK={all,now,x0,x1,L,R,W};
+  if(showTable){let h='<table><tr><th>Time</th><th>Usage</th><th>Limit</th><th>Headroom</th></tr>';
+    for(const q of all.filter((q,i)=>i%48===0||i===all.length-1)) h+=`<tr><td>${esc(when(q[0]))}${q[0]>now?' (projected)':''}</td><td>${Math.round(q[1])}%</td><td>${Math.round(q[2])}%</td><td>${Math.round(q[2]-q[1])}%</td></tr>`;
+    return h+'</table>'+sentence(p,now)}
+  let s=`<svg viewBox="0 0 ${W} ${Hh}" width="100%"><rect x="${X(now)}" y="${T}" width="${X(x1)-X(now)}" height="${Hh-T-B}" fill="#fff" opacity=".025"/>`, from=null;
+  const band=(a,b)=>`<rect class="hit" x="${X(a)}" y="${T}" width="${(X(b)-X(a)).toFixed(1)}" height="${Hh-T-B}" fill="var(--crit)" opacity=".2"/>`;
+  for(const q of all){const hit=q[2]-q[1]<=0.1;  // every account at its weekly limit: usage has met the limit line
+    if(hit&&from==null) from=q[0]; else if(!hit&&from!=null){s+=band(from,q[0]);from=null}}
   if(from!=null) s+=band(from,all[all.length-1][0]);
-  for(let v=0;v<top;v+=100) s+=`<line class="grid" x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${L-4}" y="${+Y(v)+4}" text-anchor="end">${v}%</text>`;
-  for(const [t,label,a] of [[x0,'-14 d','start'],[now-7*86400,'-7 d','middle'],[now,'now','middle'],[x1,'+7 d','end']]) s+=`<text x="${X(t)}" y="${H-6}" text-anchor="${a}">${label}</text>`;
-  s+=`<line class="now" x1="${X(now)}" x2="${X(now)}" y1="${T}" y2="${H-B}"/>`
-    +line(p.series,2,'limit')+line(p.series,1,'used')+line(p.projection,2,'limit proj')+line(p.projection,1,'used proj');
-  const last=p.series[p.series.length-1];
-  for(const [i,c,dy] of [[1,'#4caf7d',14],[2,'#e0664d',-6]])  // usage label below its dot, limit above
-    s+=`<circle cx="${X(now)}" cy="${Y(last[i])}" r="3.5" fill="${c}"/><text x="${+X(now)-6}" y="${+Y(last[i])+dy}" text-anchor="end">${Math.round(last[i])}%</text>`;
-  for(let i=1;i<all.length;i++) if(all[i][2]-all[i-1][2]>=1)  // a weekly reset gave quota back
-    s+=`<text x="${X(all[i][0])}" y="${+Y(all[i][2])-4}" text-anchor="middle">+${Math.round(all[i][2]-all[i-1][2])}</text>`;
-  p.projection.forEach((q,i)=>{if(i&&q[1]>=q[2]&&p.projection[i-1][1]<p.projection[i-1][2])  // a shortfall starts
-    s+=`<text x="${X(q[0])}" y="${+Y(q[2])+4}" text-anchor="middle" fill="#e0664d">✕</text>`});
-  s+='</svg><br>';
+  for(let v=0;v<=ymax;v+=100) s+=`<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="${v?'var(--grid)':'var(--axis)'}"/><text x="${L-6}" y="${Y(v)+4}" text-anchor="end">${v}%</text>`;
+  for(let t=Math.ceil(x0/D/2)*2*D;t<x1;t+=2*D) s+=`<text x="${X(t)}" y="${Hh-8}" text-anchor="middle">${esc(day(t))}</text>`;
+  s+=`<line x1="${X(now)}" x2="${X(now)}" y1="${T}" y2="${Hh-B}" stroke="var(--ink2)" opacity=".5"/><text x="${X(now)+4}" y="${T+10}">now</text><text x="${X(x1)-4}" y="${T+10}" text-anchor="end">projected</text>`
+    +`<path d="${path(p.series,1)}L${X(now)},${Y(0)}L${X(p.series[0][0])},${Y(0)}Z" fill="var(--s1)" opacity=".1"/>`
+    +`<path d="${path(p.series,2)}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/><path d="${path(p.series,1)}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>`
+    +`<path d="${path(p.projection,2)}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-dasharray="6 5" opacity=".8"/><path d="${path(p.projection,1)}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-dasharray="6 5" opacity=".8"/>`;
+  for(let i=1;i<all.length;i++){const up=all[i][2]-all[i-1][2]; if(up>=1) s+=`<text x="${X(all[i][0])}" y="${Y(all[i][2])-6}" text-anchor="middle">+${Math.round(up)}</text>`}  // a weekly reset gave quota back
+  for(const [i,c,dy] of [[1,'var(--s1)',18],[2,'var(--s2)',-9]])  // usage label below its dot, limit above
+    s+=`<circle cx="${X(now)}" cy="${Y(last[i])}" r="4.5" fill="${c}" stroke="var(--surface)" stroke-width="2"/><text x="${X(now)-8}" y="${Y(last[i])+dy}" text-anchor="end" style="fill:var(--ink)">${Math.round(last[i])}%</text>`;
+  return s+`<line id="xh" x1="0" x2="0" y1="${T}" y2="${Hh-B}" stroke="var(--ink2)" opacity="0"/></svg>`+sentence(p,now)}
+function sentence(p,now){
   const rate=p.rate_per_day==null?'':`At the current rate (${p.rate_per_day}% of a weekly quota per day), `;
-  if(p.eta) s+=`${rate}every account ${p.eta<=now+60?'is at 100% now':`reaches 100% at <b>${esc(when(p.eta))}</b>`}; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.`;
-  else s+=p.note?esc(p.note):`${rate}no shortfall in the next 7 days.`;
-  return s+'<br>Green: weekly usage summed over accounts. Red: usage plus what is left; it steps up at each weekly reset by what that account used. Dashed: projection. Shaded: every account at its weekly limit.';
-}
+  if(p.eta) return `<div class="sentence">${rate}every account ${p.eta<=now+60?'is at 100% now':'is spent at <b>'+esc(when(p.eta))+'</b>'}; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.</div>`;
+  return `<div class="sentence">${p.note?esc(p.note):rate+'no shortfall in the next 7 days.'}</div>`}
+$('weekly').onpointermove=e=>{
+  const svg=e.currentTarget.querySelector('svg'); if(!svg||!WK) return;
+  const r=svg.getBoundingClientRect(), t=WK.x0+((e.clientX-r.left)/r.width*WK.W-WK.L)/(WK.W-WK.L-WK.R)*(WK.x1-WK.x0);
+  let q=WK.all[0]; for(const p of WK.all) if(Math.abs(p[0]-t)<Math.abs(q[0]-t)) q=p;
+  const xh=svg.querySelector('#xh'), x=WK.L+(Math.max(q[0],WK.x0)-WK.x0)/(WK.x1-WK.x0)*(WK.W-WK.L-WK.R);
+  xh.setAttribute('x1',x); xh.setAttribute('x2',x); xh.setAttribute('opacity','.6');
+  const tip=$('tip'); tip.replaceChildren();
+  const head=document.createElement('div'); head.className='muted'; head.textContent=when(q[0])+(q[0]>WK.now?' · projected':''); tip.append(head);
+  for(const [k,v,c] of [['Usage',q[1],'var(--s1)'],['Limit',q[2],'var(--s2)'],[q[2]-q[1]<=0.1?'Blocked':'Headroom',q[2]-q[1],'']]){
+    const row=document.createElement('div'), a=document.createElement('span'), b=document.createElement('span');
+    row.className='row'; b.className='v'; b.textContent=Math.round(v)+'%';
+    if(c){const key=document.createElement('span'); key.className='key'; key.style.borderColor=c; a.append(key)} a.append(k); row.append(a,b); tip.append(row)}
+  tip.style.display='block'; tip.style.left=Math.min(e.clientX-r.left+30,r.width-160)+'px'};
+$('weekly').onpointerleave=()=>{$('tip').style.display='none'; const xh=document.querySelector('#xh'); if(xh) xh.setAttribute('opacity','0')};
+$('tbl').onclick=()=>{showTable=!showTable; $('tbl').textContent=showTable?'Chart':'Table'; refresh()};
+$('period').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p; if(p){period=p; refresh()}};
 async function refresh(){
   const [st, stats] = await Promise.all([
-    fetch('/rotate/status',{headers:{Authorization:'Bearer '+KEY},cache:'no-store'}).then(r=>r.json()),
-    fetch('/rotate/stats',{headers:{Authorization:'Bearer '+KEY},cache:'no-store'}).then(r=>r.json())]);
-  let rh='<tr><th>device</th><th>status</th><th>last seen</th><th>last model</th><th>via account</th><th>req 1h</th><th>tokens 1h</th><th>key</th></tr>';
-  for(const [name,d] of Object.entries(stats.devices||{})){
-    const status = d.online ? '<span class="active">● online</span>' : '<span class="muted">○ idle</span>';
-    const seen = d.last_seen_min==null ? 'never' : d.last_seen_min<1 ? 'just now'
-      : d.last_seen_min<60 ? d.last_seen_min+' min ago' : (d.last_seen_min/60).toFixed(1)+' h ago';
-    rh+=`<tr><td>${esc(name)}</td><td>${status}</td><td>${seen}</td><td>${esc(d.last_model||'—')}</td><td>${esc(d.last_account||'—')}</td><td>${d.req_1h}</td><td>${fmt(d.tokens_1h)}</td><td class="muted">${esc(d.key_suffix)}</td></tr>`;
-  }
-  document.getElementById('t-roster').innerHTML=rh;
-  let h='';
-  for(const [name,a] of Object.entries(st.accounts)){
-    const u=a.effective_util_5h||0, w=a.util_7d||0;
-    const act=name===st.active_account?' <span class="active">● active</span>':'';
-    const tags=(a.disabled?' <span class="alert-warn">(disabled)</span>':'')
-      +(a.priority!==100?` <span class="muted">prio ${esc(a.priority)}</span>`:'');
-    h+=`<p><b>${esc(name)}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
-      +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
-      +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
-      +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
-  }
-  document.getElementById('accounts').innerHTML=h;
-  document.getElementById('weekly').innerHTML=weekly(st.weekly);
-  document.getElementById('alerts').innerHTML = stats.alerts.length
-    ? stats.alerts.map(a=>`<div class="alert-${esc(a.level)}">⚠ ${esc(a.text)}</div>`).join('') : 'none';
-  table(document.getElementById('t-device'), stats.by_device);
-  table(document.getElementById('t-model'), stats.by_model);
-  table(document.getElementById('t-account'), stats.by_account);
-  document.getElementById('events').innerHTML = st.recent_events.length
-    ? st.recent_events.map(e=>`<div>${esc(e.ts)} — ${esc(e.from)} → ${esc(e.to)} (${esc(e.reason)})</div>`).join('') : 'none';
-  document.getElementById('upd').textContent='updated '+new Date().toLocaleTimeString();
+    fetch('/rotate/status',{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'}).then(r=>r.json()),
+    fetch('/rotate/stats',{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'}).then(r=>r.json())]);
+  const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{});
+  $('host').textContent=location.host||'';
+  $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`;
+  $('alerts').innerHTML=(stats.alerts||[]).map(a=>`<div class="banner ${a.level==='warn'?'warn':''}">&#9888; <span><b>${a.level==='warn'?'Warning':'Note'}</b> ${esc(a.text)}</span></div>`).join('');
+  // headline figures
+  const last=(wk.series||[]).slice(-1)[0], now=last?last[0]:Date.now()/1000;
+  $('hero').textContent=wk.eta?(wk.eta<=now+60?'now':dur(wk.eta-now)):wk.rate_per_day!=null?'> 7 days':'–';
+  $('hero-sub').textContent=wk.eta?`${when(wk.eta)} · quota returns ${when(wk.back)} when ${wk.back_account} resets`:(wk.note||'no shortfall projected');
+  $('k-left').textContent=last?Math.round(last[2]-last[1])+'%':'–'; $('k-left-sub').textContent=`of ${wk.capacity||0}% · ${accts.length} accounts`;
+  $('k-rate').textContent=wk.rate_per_day!=null?wk.rate_per_day+'%':'–';
+  $('k-req').textContent=fmt(sum(stats.by_device,b=>b.requests)); $('k-req-sub').textContent=fmt(sum(stats.by_device,tok))+' tokens';
+  $('k-cost').textContent=money(sum((per['7d']||{}).model,b=>b.cost_usd)); $('k-cost-sub').textContent=money(sum(stats.by_model,b=>b.cost_usd))+' in the last 24 h';
+  // accounts
+  $('accounts').innerHTML=accts.map(([name,a])=>{const u5=a.effective_util_5h||0, u7=a.effective_util_7d||0;
+    const seen=a.last_seen?ago(Math.round((Date.now()/1000-a.last_seen)/60)):'never';
+    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${name===st.active_account?'<span class="badge"><span class="dot" style="background:var(--good)"></span>active</span>':''}`
+      +(a.disabled?'<span class="badge">disabled</span>':'')+(a.priority!==100?`<span class="badge">prio ${esc(a.priority)}</span>`:'')
+      +`<span class="muted small" style="margin-left:auto">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span></div>`
+      +meter('5h',u5,st.switch_threshold,a.reset_5h_in_min>0?'resets in '+dur(a.reset_5h_in_min*60):'window idle')
+      +meter('7d',u7,st.switch_threshold_7d,a.reset_7d_in_h>0?'resets in '+dur(a.reset_7d_in_h*H):'window idle')+'</div>'}).join('');
+  $('weekly').innerHTML=weekly(wk);
+  // devices: configured ones, then removed ones that still have history
+  const roster=stats.devices||{}, gone=Object.keys((per.all||{}).device||{}).filter(n=>!(n in roster)&&n!=='?');
+  let dh=`<tr><th>Device</th><th class="l">Status</th><th class="l">Last model</th><th>24 h</th><th>7 d</th><th>30 d</th><th>All time${per.since?' <span class="muted">since '+esc(per.since)+'</span>':''}</th><th>30-day trend</th></tr>`;
+  for(const name of Object.keys(roster).concat(gone)){const d=roster[name], removed=!d;
+    const status=removed?'removed':d.online?'<span class="dot" style="background:var(--good)"></span>online':'<span class="dot" style="background:var(--muted)"></span>idle';
+    dh+=`<tr class="${removed?'removed':''}"><td><b>${esc(name)}</b>${d?'<span class="sub">key '+esc(d.key_suffix)+'</span>':''}</td><td class="l">${status}${d?'<span class="sub">'+ago(d.last_seen_min)+'</span>':''}</td><td class="l">${esc(d&&d.last_model||'–')}</td>`
+      +cell((stats.by_device||{})[name])+cell(((per['7d']||{}).device||{})[name])+cell(((per['30d']||{}).device||{})[name])+cell(((per.all||{}).device||{})[name])+`<td>${spark((per.trend||{})[name])}</td></tr>`}
+  $('devices').innerHTML=dh;
+  // models over the chosen period; accounts over 24 h
+  $('period').innerHTML=Object.keys(PERIODS).map(p=>`<button data-p="${p}" class="${p===period?'on':''}">${p}</button>`).join('');
+  const rows=o=>Object.entries(o||{}).sort((a,b)=>(b[1].cost_usd||0)-(a[1].cost_usd||0)).map(([n,b])=>{const prompt=(b.input_tokens||0)+(b.cache_read||0)+(b.cache_write||0);
+    return `<tr><td>${esc(n)}</td><td>${fmt(b.requests)}</td><td>${fmt(tok(b))}</td><td>${prompt?Math.round((b.cache_read||0)/prompt*100):0}%</td><td>${money(b.cost_usd)}</td></tr>`}).join('');
+  const head='<tr><th>{}</th><th>Requests</th><th>Tokens</th><th>From cache</th><th>$ equiv</th></tr>';
+  $('models').innerHTML=head.replace('{}','Model')+rows(PERIODS[period]==='24h'?stats.by_model:(per[PERIODS[period]]||{}).model);
+  $('by-account').innerHTML=head.replace('{}','Account')+rows(stats.by_account);
+  $('events').innerHTML=(st.recent_events||[]).slice().reverse().map(e=>`<div><span class="muted">${esc(String(e.ts||'').slice(5,16).replace('T',' '))}</span><span>${esc(e.from)} &rarr; ${esc(e.to)}</span><span class="badge" style="margin-left:auto">${esc(e.reason)}</span></div>`).join('')||'<span class="muted">none</span>';
+  $('upd').textContent='updated '+new Date().toLocaleTimeString();
 }
 refresh(); setInterval(refresh, 10000);
 </script></body></html>"""

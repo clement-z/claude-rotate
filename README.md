@@ -331,25 +331,39 @@ rate-limit headers:
 
 ![account quota gauges with reset countdowns](screenshots/accounts.png)
 
-- **Devices** — every registered device: online status, last seen, last model,
-  which account its traffic rode, requests + tokens in the last hour.
-- **Accounts** — live 5-hour and weekly utilization gauges (from Anthropic's
-  own headers), active account, reset countdowns.
+- **Headline** — time until every account is spent, with when it happens and
+  which reset brings quota back; tiles for weekly quota left, burn rate,
+  requests in the last 24 h and the 7-day cost-equivalent. Alerts (device over
+  N tokens/hour, expensive-model usage, account near the switch threshold;
+  thresholds in `config.json`) sit in a banner above it.
+- **Accounts** — live 5-hour and weekly meters (from Anthropic's own headers)
+  with a tick at the switch threshold, reset countdowns, upstream status and
+  the active account.
 - **Weekly quota, all accounts** — 14 days of weekly usage summed over the
-  enabled accounts (green) against what they could have used (red: usage plus
-  what is left, stepping up at each account's weekly reset by what that week
-  used — the rest expired). A 7-day projection spends the last 24 h rate
+  enabled accounts (blue) against what they could have used (orange: usage
+  plus what is left, stepping up at each account's weekly reset by what that
+  week used — the rest expired). A 7-day projection spends the last 24 h rate
   consume-first, pauses usage while every account is spent, and steps the
   limit up at each projected reset; it states when every account first
   reaches 100% and when the next reset brings quota back. Periods when every
-  account was or will be at its limit are shaded. History is sampled every 30 min into
+  account was or will be at its limit are shaded. Hover for values; **Table**
+  shows the same data as a table. History is sampled every 30 min into
   `usage_history.json` next to `state.json`, so the chart fills over the first
   two weeks. Accounts on different plans need `accounts[].weight`.
-- **Alerts** — device over N tokens/hour, expensive-model usage (Opus/Fable),
-  account near the switch threshold. Thresholds in `config.json`.
-- **Consumption (24h)** — by device / model / account, with a *cost-equivalent*
-  column: what the usage would cost at API list prices (incl. cache read 0.1× /
-  write 1.25×) — i.e. what the subscriptions are saving you.
+- **Devices** — every registered device (online status, last seen, last model)
+  and every removed device that still has history, with usage over 24 h, 7 d,
+  30 d and all time plus a 30-day cost trend. 7 d and 30 d are calendar days,
+  today included.
+- **By model** (24 h / 7 d / 30 d / all time) and **by account** (24 h) —
+  requests, tokens, the share of prompt tokens served from cache, and a
+  *cost-equivalent* column: what the usage would cost at API list prices (incl.
+  cache read 0.1× / write 1.25×) — i.e. what the subscriptions are saving you.
+
+The 24 h figures come from the audit log. Longer periods come from
+`device_usage.json` next to `state.json`: daily totals per device and model for
+31 days plus all-time totals, updated with every request and saved every
+minute. On first start it is rebuilt once from `audit.jsonl` and its rotated
+copies, so all time reaches back as far as those logs do.
 
 JSON endpoints: `/rotate/status` (accounts + switch events) and
 `/rotate/stats` (rollups, alerts and the longer `periods`), same `?key=` or `Authorization: Bearer`
