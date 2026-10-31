@@ -9,3 +9,4 @@ __pycache__/
 .DS_Store
 .omc/
 usage_history.json
+device_usage.json

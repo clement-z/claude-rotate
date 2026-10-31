@@ -20,7 +20,8 @@ Per request, the proxy:
      account is spent (hold_max_s), so unattended runs finish on their own,
   8. refreshes the usage of idle accounts with a 1-token request every
      refresh_idle_s, so quota spent outside the proxy is seen before a switch,
-  9. keeps 14 days of weekly usage for the panel's chart and run-out estimate.
+  9. keeps 14 days of weekly usage for the panel's chart and run-out estimate,
+     and daily totals per device and model for its 7-day, 30-day and all-time views.
 
 GET /rotate/status (device-key auth) returns live state for the admin page.
 """
@@ -234,6 +235,7 @@ def audit(rec: dict) -> None:
         _write_audit(rec)
     except (OSError, ValueError) as exc:
         storage_error("audit_write", exc)
+    roll_up(rec, time.strftime("%Y-%m-%d"))
 
 
 def _write_audit(rec: dict) -> None:
@@ -456,6 +458,7 @@ async def refresh_loop() -> None:
         if REFRESH_IDLE_S:
             await refresh_idle_accounts()
         record_history(time.time())
+        save_rollup()
         await asyncio.sleep(60)
 
 
@@ -530,7 +533,8 @@ def weekly_outlook(now: float) -> dict:
     100% usage pauses until the next reset. `eta` is the first such moment."""
     points = weekly_series(now)
     out = {"series": points, "projection": [], "rate_per_day": None,
-           "eta": None, "back": None, "back_account": None}
+           "eta": None, "back": None, "back_account": None,
+           "capacity": round(sum(weight(n) for n in weekly_snapshot()) * 100)}
     day = [p for p in points if p[0] >= now - 86400]
     # Usage cannot rise while every account is spent, so time at the limit would
     # understate demand: count only the stretches with quota left (as the panel shades).
@@ -807,6 +811,17 @@ def _tail_audit() -> None:
                                              removed["_ts"] + 86400)
 
 
+def bump(bucket, key, usage, cost):
+    b = bucket.setdefault(key, {"requests": 0, "input_tokens": 0, "output_tokens": 0,
+                                "cache_read": 0, "cache_write": 0, "cost_usd": 0.0})
+    b["requests"] += 1
+    b["input_tokens"] += usage.get("input_tokens", 0)
+    b["output_tokens"] += usage.get("output_tokens", 0)
+    b["cache_read"] += usage.get("cache_read_input_tokens", 0)
+    b["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+    b["cost_usd"] += cost
+
+
 def aggregate_audit() -> dict:
     """Roll up the last 24h of audit.jsonl by device/model/account, with alerts."""
     now = time.time()
@@ -819,16 +834,6 @@ def aggregate_audit() -> dict:
     device_hour_reqs: dict = {}
     device_meta: dict = {}
     expensive_hour: dict = {}
-
-    def bump(bucket, key, usage, cost):
-        b = bucket.setdefault(key, {"requests": 0, "input_tokens": 0, "output_tokens": 0,
-                                    "cache_read": 0, "cache_write": 0, "cost_usd": 0.0})
-        b["requests"] += 1
-        b["input_tokens"] += usage.get("input_tokens", 0)
-        b["output_tokens"] += usage.get("output_tokens", 0)
-        b["cache_read"] += usage.get("cache_read_input_tokens", 0)
-        b["cache_write"] += usage.get("cache_creation_input_tokens", 0)
-        b["cost_usd"] += cost
 
     _tail_audit()
     records = _AUDIT_CACHE["records"]
@@ -895,11 +900,104 @@ def aggregate_audit() -> dict:
             "by_model": by_model, "by_account": by_account, "alerts": alerts}
 
 
+USAGE_PATH = STATE_PATH.with_name("device_usage.json")
+ROLLUP_DAYS = 31
+ROLLUP: dict = {"days": {}, "total": {"device": {}, "model": {}}, "since": None}
+ROLLUP_DIRTY = False
+
+
+def roll_up(rec: dict, day: str) -> None:
+    """Add one audit record to the per-day and all-time totals by device and model.
+    The audit log rotates and the stats cache holds 24 h; this keeps the longer view."""
+    global ROLLUP_DIRTY
+    model = rec.get("model")
+    model = model if isinstance(model, str) else None
+    usage = rec.get("usage") or {}
+    cost = api_cost(model, usage)
+    buckets = ROLLUP["days"].setdefault(day, {"device": {}, "model": {}})
+    for kind, key in (("device", str(rec.get("device", "?"))), ("model", model or "?")):
+        bump(buckets[kind], key, usage, cost)
+        bump(ROLLUP["total"][kind], key, usage, cost)
+    ROLLUP["since"] = min(ROLLUP["since"] or day, day)
+    ROLLUP_DIRTY = True
+
+
+def load_rollup() -> None:
+    """Load the totals; without a usable file, rebuild them once from the audit
+    log and its rotated copies, oldest first."""
+    global ROLLUP
+    try:
+        loaded = json.loads(USAGE_PATH.read_text())
+        if isinstance(loaded, dict) and {"days", "total", "since"} <= loaded.keys():
+            ROLLUP = loaded
+            return
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        print(f"warning: rebuilding {USAGE_PATH} from the audit log ({type(exc).__name__})",
+              file=sys.stderr)
+    for path in [Path(f"{AUDIT_PATH}.{n}") for n in range(AUDIT_BACKUPS, 0, -1)] + [AUDIT_PATH]:
+        try:
+            with path.open("rb") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and isinstance(rec.get("ts"), str):
+                        roll_up(rec, rec["ts"][:10])
+        except OSError:
+            continue
+
+
+load_rollup()
+
+
+def save_rollup() -> None:
+    global ROLLUP_DIRTY
+    if not ROLLUP_DIRTY:
+        return
+    import datetime as dt
+    cutoff = (dt.date.today() - dt.timedelta(days=ROLLUP_DAYS)).isoformat()
+    for day in [d for d in ROLLUP["days"] if d < cutoff]:
+        del ROLLUP["days"][day]
+    tmp = USAGE_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(ROLLUP))
+        tmp.replace(USAGE_PATH)
+        ROLLUP_DIRTY = False
+    except OSError as exc:
+        storage_error("usage_write", exc)
+
+
+def usage_periods() -> dict:
+    """7-day, 30-day and all-time totals by device and model, in calendar days with
+    today included, plus each device's daily cost-equivalent over the last 30 days."""
+    import datetime as dt
+    today = dt.date.today()
+    days = [(today - dt.timedelta(days=i)).isoformat() for i in range(29, -1, -1)]
+
+    def total(span):
+        out = {"device": {}, "model": {}}
+        for day in span:
+            for kind, buckets in ROLLUP["days"].get(day, {}).items():
+                for key, b in buckets.items():
+                    acc = out[kind].setdefault(key, dict.fromkeys(b, 0))
+                    for field, v in b.items():
+                        acc[field] += v
+        return out
+
+    trend = {dev: [round(ROLLUP["days"].get(d, {}).get("device", {}).get(dev, {}).get("cost_usd", 0), 2)
+                   for d in days] for dev in ROLLUP["total"]["device"]}
+    return {"since": ROLLUP["since"], "7d": total(days[-7:]), "30d": total(days),
+            "all": ROLLUP["total"], "trend": trend}
+
+
 @app.get("/rotate/stats")
 async def rotate_stats(request: Request):
     if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
-    return aggregate_audit()
+    return aggregate_audit() | {"periods": usage_periods()}
 
 
 PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">

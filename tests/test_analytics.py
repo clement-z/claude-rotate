@@ -132,7 +132,8 @@ check("limit steps up at a reset by what that week used",
       [p[2] for p in s] == [200, 290, 290, 290])  # opens at the full limit: 2 accounts
 
 out = R.weekly_outlook(now)
-check("rate taken over the last 24 h", out["rate_per_day"] == 48.0)
+check("rate taken over the last 24 h; capacity sums the weights",
+      out["rate_per_day"] == 48.0 and out["capacity"] == 200)
 proj = out["projection"]
 # b resets at +50 h with its week fully used (+100); everything is spent at +120 h and
 # usage pauses until a resets at +148 h (+100); then it resumes until the 7-day horizon.
@@ -178,5 +179,58 @@ check("history sample saved, 15-day-old one dropped",
 R.record_history(now + 600)
 R.record_history(now + 1801)  # stored ts is rounded
 check("one sample per 30 min", len(R.HISTORY) == 2)
+
+# --- device/model totals: 7 d, 30 d, all time, trend; backfill from the audit logs ---
+import datetime as dt
+today = dt.date.today()
+
+
+def iso(n):
+    return (today - dt.timedelta(days=n)).isoformat()
+
+
+def empty_rollup():
+    return {"days": {}, "total": {"device": {}, "model": {}}, "since": None}
+
+
+use = {"input_tokens": 1_000_000, "output_tokens": 10}
+R.ROLLUP = empty_rollup()
+R.roll_up({"device": "laptop", "model": "claude-opus-5", "usage": use}, iso(0))
+R.roll_up({"device": "laptop", "model": "claude-opus-5", "usage": use}, iso(0))
+R.roll_up({"device": "old-box", "model": {"bad": 1}, "usage": use}, iso(8))
+per = R.usage_periods()
+check("7 d covers today and the 6 days before",
+      per["7d"]["device"]["laptop"]["requests"] == 2 and "old-box" not in per["7d"]["device"])
+check("30 d and all time include older days",
+      per["30d"]["device"]["old-box"]["requests"] == 1 and per["all"]["device"]["old-box"]["requests"] == 1)
+check("non-string models fold into '?'", "?" in per["all"]["model"])
+check("trend is 30 daily costs ending today", len(per["trend"]["laptop"]) == 30
+      and per["trend"]["laptop"][-1] == 10.0 and per["trend"]["old-box"][-9] == 5.0)
+check("since is the oldest day seen", per["since"] == iso(8))
+
+R.AUDIT_PATH, R.USAGE_PATH = tmp / "backfill.jsonl", tmp / "device_usage.json"
+
+
+def line(day, dev):
+    return json.dumps({"ts": f"{day}T10:00:00+0000", "device": dev, "model": "claude-sonnet-5",
+                       "usage": use}) + "\n"
+
+
+Path(f"{R.AUDIT_PATH}.1").write_text(line(iso(40), "gone-box") + "not json\n")
+R.AUDIT_PATH.write_text(line(iso(0), "laptop"))
+R.ROLLUP = empty_rollup()
+R.load_rollup()
+check("first start rebuilds totals from the rotated copy and the current log",
+      R.ROLLUP["total"]["device"]["gone-box"]["requests"] == 1
+      and R.ROLLUP["total"]["device"]["laptop"]["requests"] == 1 and R.ROLLUP["since"] == iso(40))
+R.save_rollup()
+saved = json.loads(R.USAGE_PATH.read_text())
+check("saved totals keep all time but only 31 days of daily buckets",
+      iso(40) not in saved["days"] and saved["total"]["device"]["gone-box"]["requests"] == 1)
+R.ROLLUP = empty_rollup()
+R.load_rollup()
+check("an existing file is loaded, not rebuilt", R.ROLLUP == saved)
+R.audit({"device": "laptop", "model": "claude-sonnet-5", "usage": use})
+check("every audited request is added", R.ROLLUP["total"]["device"]["laptop"]["requests"] == 2)
 
 print(f"\nall {PASS} checks passed")

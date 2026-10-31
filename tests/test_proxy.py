@@ -236,7 +236,8 @@ check("status shape", r.status_code == 200 and r.json()["strategy"] == "consume-
 check("status auth via ?key=", call(path="/rotate/status?key=devkey-1", key=None,
                                     method="GET").status_code == 200)
 r = call(path="/rotate/stats", method="GET")
-check("stats returns rollups", r.status_code == 200 and "by_device" in r.json())
+check("stats returns rollups", r.status_code == 200 and "by_device" in r.json()
+      and set(r.json()["periods"]) == {"since", "7d", "30d", "all", "trend"})
 r = call(path="/rotate/panel?key=devkey-1", key=None, method="GET")
 check("panel serves html", r.status_code == 200 and "text/html" in r.headers["content-type"])
 

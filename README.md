@@ -352,7 +352,7 @@ rate-limit headers:
   write 1.25×) — i.e. what the subscriptions are saving you.
 
 JSON endpoints: `/rotate/status` (accounts + switch events) and
-`/rotate/stats` (rollups + alerts), same `?key=` or `Authorization: Bearer`
+`/rotate/stats` (rollups, alerts and the longer `periods`), same `?key=` or `Authorization: Bearer`
 auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 
 ## OpenAI-compatible endpoint
@@ -563,7 +563,8 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
   the Debian service) — that's the whole identity of the install. `state.json`
   is disposable (quota state is re-learned from the first responses; you only
   lose the events history), and `logs/` and `usage_history.json` are
-  disposable analytics.
+  disposable analytics. `device_usage.json` is rebuilt from `logs/` if lost,
+  but all-time totals older than the oldest kept log go with it.
 - **Upgrades.** For the Debian service, run `sudo ./install.sh` from the newer
   reviewed checkout; it builds a new immutable release and switches to it. Roll
   back with the [manual procedure](deploy/README.md#immutable-upgrades-and-rollback).
