@@ -341,7 +341,7 @@ rate-limit headers:
   the active account.
 - **Weekly quota, all accounts** — the enabled accounts' current weekly
   usage, summed (blue), against their combined capacity (orange: 100% per
-  account, scaled by `accounts[].weight`). Usage drops at each account's weekly
+  account, scaled by its plan's weight). Usage drops at each account's weekly
   reset by what that week used. A 7.5-day projection spends the last 24 h rate
   consume-first, pauses usage while every account is spent, and drops it at
   each projected reset; it states when every account first reaches 100% and
@@ -351,6 +351,20 @@ rate-limit headers:
   now (3.5 days on a phone) and scrolls back to the first sample. Hover or tap
   for values; **Table** shows the same data as a table. History is sampled
   every 30 min into `usage_history.json` next to `state.json` and kept 14 days.
+- **Subscriptions** — for each account with `billing` set: its plan, price and
+  renewal date, and one row per billing period (the last 13). A row shows the
+  plan (an upgrade inside the period prorates the price by days), how much of
+  its weekly quota the account used on average and in its busiest week, hours
+  at its weekly limit and hours with every account at its limit, and the
+  period's cost-equivalent against the price. The last column decides a plan
+  change: the most of the accounts' combined weekly quota used in any 7 days,
+  then the same with this account on the next plan down or up. Over 100% means
+  every account would have run out; well under it on the plan down means the
+  cheaper plan would have done. Rotation makes the accounts interchangeable,
+  which is why this column looks at all of them: consume-first runs each
+  account to its limit by design, so one account's hours at its limit say
+  little on their own. Use is recorded from the weekly samples, so a period
+  before the history starts shows how many of its days are covered.
 - **Devices** — every registered device (online status, last seen, last model)
   and every removed device that still has history, with usage over 24 h, 7 d,
   30 d and all time plus a 30-day cost trend. 7 d and 30 d are calendar days,
@@ -362,12 +376,14 @@ rate-limit headers:
 
 The 24 h figures come from the audit log. Longer periods come from
 `device_usage.json` next to `state.json`: daily totals per device and model for
-31 days plus all-time totals, updated with every request and saved every
-minute. On first start it is rebuilt once from `audit.jsonl` and its rotated
-copies, so all time reaches back as far as those logs do.
+31 days plus all-time totals, and per account for 400 days (requests, cost,
+weekly-quota use and time at the limit) for the billing periods. It is updated
+with every request and saved every minute. On first start it is rebuilt once
+from `audit.jsonl` and its rotated copies, and the weekly-quota part from
+`usage_history.json`, so all time reaches back as far as those files do.
 
 JSON endpoints: `/rotate/status` (accounts + switch events) and
-`/rotate/stats` (rollups, alerts and the longer `periods`), same `?key=` or `Authorization: Bearer`
+`/rotate/stats` (rollups, alerts, the longer `periods` and `billing`), same `?key=` or `Authorization: Bearer`
 auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 
 ## OpenAI-compatible endpoint
@@ -396,7 +412,9 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
-| `accounts[].weight` | weekly capacity relative to the other accounts, for the panel's weekly chart and run-out estimate (default 1). Max 20x is 4 times Max 5x: give a 5x `0.25` next to 20x accounts. |
+| `accounts[].billing` | the account's plans over time, for the panel's Subscriptions card and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra"}]`. The first date sets the monthly renewal day; a later entry changes plan from its date and keeps the renewal day (Anthropic prorates upgrades). Add `"renews": true` to an entry that restarts the billing cycle, such as Pro to Max. Record a downgrade with the renewal date it takes effect on. A broken entry is ignored and shown as a panel alert. |
+| `plans{}` | extra or corrected plans: `name → {"price": USD a month, "weight": weekly quota relative to Max}`. Built in: `pro` (20, 0.2), `max` (100, 1), `ultra` (200, 2); Anthropic states Max as 5 times Pro every week and Ultra as 10 times. |
+| `accounts[].weight` | weekly capacity relative to a Max account, for accounts without `billing` (default 1): an Ultra is `2`, a Pro `0.2`. With `billing`, the plan sets it. |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
 | `strategy` | `consume-first` (default) or `least-used` — see below |
@@ -579,7 +597,9 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
   is disposable (quota state is re-learned from the first responses; you only
   lose the events history), and `logs/` and `usage_history.json` are
   disposable analytics. `device_usage.json` is rebuilt from `logs/` if lost,
-  but all-time totals older than the oldest kept log go with it.
+  but all-time totals and billing-period use older than the oldest kept log
+  (and the 14 days of `usage_history.json`) go with it. The plan history
+  lives in `config.json`.
 - **Upgrades.** For the Debian service, run `sudo ./install.sh` from the newer
   reviewed checkout; it builds a new immutable release and switches to it. Roll
   back with the [manual procedure](deploy/README.md#immutable-upgrades-and-rollback).

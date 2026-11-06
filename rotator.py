@@ -21,7 +21,8 @@ Per request, the proxy:
   8. refreshes the usage of idle accounts with a 1-token request every
      refresh_idle_s, so quota spent outside the proxy is seen before a switch,
   9. keeps 14 days of weekly usage for the panel's chart and run-out estimate,
-     and daily totals per device and model for its 7-day, 30-day and all-time views.
+     daily totals per device and model for its 7-day, 30-day and all-time views,
+     and per-account daily totals for each subscription's billing periods.
 
 GET /rotate/status (device-key auth) returns live state for the admin page.
 """
@@ -280,9 +281,61 @@ def priority(name: str) -> int:
     return ACCOUNTS[name].get("priority", 100)
 
 
-def weight(name: str) -> float:
-    """Weekly capacity relative to the other accounts (a Max 20x is 4 of a Max 5x)."""
-    return ACCOUNTS[name].get("weight", 1)
+PLANS = {"pro": {"price": 20, "weight": 0.2}, "max": {"price": 100, "weight": 1},
+         "ultra": {"price": 200, "weight": 2}}  # USD list price a month; weekly quota vs Max
+BILLING_ERRORS: list = []
+
+
+def load_billing() -> dict:
+    """Each account's plan timeline from config: [(start ts, start date, plan, restarts
+    the billing cycle)]. A broken entry is reported in the panel and ignored: billing is
+    analytics and must never stop the proxy."""
+    import datetime as dt
+    for name, plan in (CFG.get("plans") or {}).items():
+        if (isinstance(plan, dict) and type(plan.get("price")) in (int, float) and plan["price"] >= 0
+                and type(plan.get("weight")) in (int, float) and plan["weight"] > 0):
+            PLANS[name] = plan
+        else:
+            BILLING_ERRORS.append(f"plan '{name}' needs a price >= 0 and a weight > 0")
+    out = {}
+    for name, acct in ACCOUNTS.items():
+        if "billing" not in acct:
+            continue
+        timeline = []
+        try:
+            for e in acct["billing"]:
+                start = dt.date.fromisoformat(e["from"])
+                if e["plan"] not in PLANS or (timeline and start <= timeline[-1][1]):
+                    raise ValueError
+                timeline.append((time.mktime(start.timetuple()), start, e["plan"], e.get("renews") is True))
+        except (TypeError, KeyError, ValueError, AttributeError):
+            timeline = []
+        if timeline:
+            out[name] = timeline
+        else:
+            BILLING_ERRORS.append(f"account '{name}': billing needs entries with a 'from' date "
+                                  f"(YYYY-MM-DD, increasing) and a plan ({', '.join(PLANS)})")
+    for error in BILLING_ERRORS:
+        print(f"warning: billing ignored: {error}", file=sys.stderr)
+    return out
+
+
+BILLING = load_billing()
+
+
+def plan_at(name: str, ts: float):
+    """The billing entry in force at ts (the first one before it starts), or None."""
+    timeline = BILLING.get(name)
+    if not timeline:
+        return None
+    return next((e for e in reversed(timeline) if e[0] <= ts), timeline[0])
+
+
+def weight(name: str, ts: float | None = None) -> float:
+    """Weekly capacity relative to a Max account (Ultra 2, Pro 0.2): the plan in force
+    at ts when the account has billing, else accounts[].weight."""
+    entry = plan_at(name, time.time() if ts is None else ts)
+    return PLANS[entry[2]]["weight"] if entry else ACCOUNTS[name].get("weight", 1)
 
 
 def disabled(name: str) -> bool:
@@ -493,7 +546,9 @@ def record_history(now: float) -> None:
     snapshot = weekly_snapshot()
     if not snapshot:
         return
-    HISTORY.append({"ts": round(now), "accounts": snapshot})
+    sample = {"ts": round(now), "accounts": snapshot}
+    ledger_sample(HISTORY[-1] if HISTORY else None, sample)
+    HISTORY.append(sample)
     while HISTORY[0]["ts"] < now - HISTORY_DAYS * 86400:
         HISTORY.pop(0)
     tmp = HISTORY_PATH.with_suffix(".json.tmp")
@@ -515,14 +570,15 @@ def weekly_series(now: float) -> list:
         for name, (u, reset) in sample["accounts"].items():
             if name not in ACCOUNTS or disabled(name):
                 continue
+            w = weight(name, sample["ts"])  # the plan in force then: an upgrade steps capacity
             last_reset, top = seen.get(name, (reset, u))  # first sight is a baseline
             if reset > last_reset + 3600:  # a new weekly window: all of it is new usage
-                spent, top = spent + weight(name) * u, u
+                spent, top = spent + w * u, u
             elif u > top:
-                spent, top = spent + weight(name) * (u - top), u
+                spent, top = spent + w * (u - top), u
             seen[name] = (max(reset, last_reset), top)
-            used += weight(name) * u
-            cap += weight(name)
+            used += w * u
+            cap += w
         points.append([round(sample["ts"]), round(used * 100, 1), round(cap * 100, 1), round(spent * 100, 1)])
     return points
 
@@ -902,41 +958,71 @@ def aggregate_audit() -> dict:
 
 
 USAGE_PATH = STATE_PATH.with_name("device_usage.json")
-ROLLUP_DAYS = 31
-ROLLUP: dict = {"days": {}, "total": {"device": {}, "model": {}}, "since": None}
+ROLLUP_DAYS, LEDGER_DAYS = 31, 400
+ROLLUP: dict = {"days": {}, "total": {"device": {}, "model": {}}, "since": None,
+                "accounts": {}, "quota": {}, "blocked": {}}
 ROLLUP_DIRTY = False
 
 
-def roll_up(rec: dict, day: str) -> None:
-    """Add one audit record to the per-day and all-time totals by device and model.
-    The audit log rotates and the stats cache holds 24 h; this keeps the longer view."""
+def roll_up(rec: dict, day: str, ledger_only: bool = False) -> None:
+    """Add one audit record to the per-day and all-time totals by device and model, and
+    to the account's day in the billing ledger. The audit log rotates and the stats
+    cache holds 24 h; this keeps the longer view."""
     global ROLLUP_DIRTY
     model = rec.get("model")
     model = model if isinstance(model, str) else None
     usage = rec.get("usage") or {}
     cost = api_cost(model, usage)
-    buckets = ROLLUP["days"].setdefault(day, {"device": {}, "model": {}})
-    for kind, key in (("device", str(rec.get("device", "?"))), ("model", model or "?")):
-        bump(buckets[kind], key, usage, cost)
-        bump(ROLLUP["total"][kind], key, usage, cost)
-    ROLLUP["since"] = min(ROLLUP["since"] or day, day)
+    if isinstance(rec.get("account"), str):
+        bump(ROLLUP.setdefault("accounts", {}).setdefault(day, {}), rec["account"], usage, cost)
+    if not ledger_only:
+        buckets = ROLLUP["days"].setdefault(day, {"device": {}, "model": {}})
+        for kind, key in (("device", str(rec.get("device", "?"))), ("model", model or "?")):
+            bump(buckets[kind], key, usage, cost)
+            bump(ROLLUP["total"][kind], key, usage, cost)
+        ROLLUP["since"] = min(ROLLUP["since"] or day, day)
+    ROLLUP_DIRTY = True
+
+
+def ledger_sample(prev: dict | None, cur: dict) -> None:
+    """Credit each account's weekly-quota rise since the previous history sample to its
+    day ([rise in % of its weekly quota, seconds at its weekly limit]), and the time
+    every account was at its limit to the pool's day."""
+    global ROLLUP_DIRTY
+    day = time.strftime("%Y-%m-%d", time.localtime(cur["ts"]))
+    gap = cur["ts"] - prev["ts"] if prev else 0
+    gap = gap if gap <= 2 * SAMPLE_S else 0  # downtime is not time at the limit
+    quota = ROLLUP.setdefault("quota", {}).setdefault(day, {})
+    for name, (u, reset) in cur["accounts"].items():
+        last = (prev or {"accounts": {}})["accounts"].get(name)
+        rise = 0.0 if not last else u if reset > last[1] + 3600 else max(0.0, u - last[0])
+        q = quota.setdefault(name, [0.0, 0])
+        q[0], q[1] = round(q[0] + rise * 100, 2), q[1] + (gap if u >= 1 else 0)
+    if cur["accounts"] and all(u >= 1 for u, _ in cur["accounts"].values()):
+        blocked = ROLLUP.setdefault("blocked", {})
+        blocked[day] = blocked.get(day, 0) + gap
     ROLLUP_DIRTY = True
 
 
 def load_rollup() -> None:
     """Load the totals; without a usable file, rebuild them once from the audit
-    log and its rotated copies, oldest first."""
+    log and its rotated copies, oldest first, and the ledger's quota from the usage
+    history. A file from before the ledger gets only the ledger rebuilt."""
     global ROLLUP
+    ledger_only = False
     try:
         loaded = json.loads(USAGE_PATH.read_text())
         if isinstance(loaded, dict) and {"days", "total", "since"} <= loaded.keys():
             ROLLUP = loaded
-            return
+            if "quota" in loaded:
+                return
+            ledger_only = True
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
         print(f"warning: rebuilding {USAGE_PATH} from the audit log ({type(exc).__name__})",
               file=sys.stderr)
+    ROLLUP.setdefault("quota", {})  # marks the ledger as built, even with no history yet
     for path in [Path(f"{AUDIT_PATH}.{n}") for n in range(AUDIT_BACKUPS, 0, -1)] + [AUDIT_PATH]:
         try:
             with path.open("rb") as f:
@@ -946,9 +1032,11 @@ def load_rollup() -> None:
                     except ValueError:
                         continue
                     if isinstance(rec, dict) and isinstance(rec.get("ts"), str):
-                        roll_up(rec, rec["ts"][:10])
+                        roll_up(rec, rec["ts"][:10], ledger_only)
         except OSError:
             continue
+    for prev, cur in zip([None] + HISTORY, HISTORY):
+        ledger_sample(prev, cur)
 
 
 load_rollup()
@@ -962,6 +1050,10 @@ def save_rollup() -> None:
     cutoff = (dt.date.today() - dt.timedelta(days=ROLLUP_DAYS)).isoformat()
     for day in [d for d in ROLLUP["days"] if d < cutoff]:
         del ROLLUP["days"][day]
+    cutoff = (dt.date.today() - dt.timedelta(days=LEDGER_DAYS)).isoformat()
+    for kind in ("accounts", "quota", "blocked"):
+        for day in [d for d in ROLLUP.get(kind, {}) if d < cutoff]:
+            del ROLLUP[kind][day]
     tmp = USAGE_PATH.with_suffix(".json.tmp")
     try:
         tmp.write_text(json.dumps(ROLLUP))
@@ -994,11 +1086,110 @@ def usage_periods() -> dict:
             "all": ROLLUP["total"], "trend": trend}
 
 
+def month_add(d, n: int):
+    """d plus n months, on the same day or the month's last one (a 31st renews on the 30th)."""
+    import calendar
+    import datetime as dt
+    y, m = divmod(d.month - 1 + n, 12)
+    return dt.date(d.year + y, m + 1, min(d.day, calendar.monthrange(d.year + y, m + 1)[1]))
+
+
+def billing_periods(timeline: list, today) -> list:
+    """[start, end) of each billing period up to the one holding today: monthly from the
+    first entry's date, restarting at an entry marked renews. Other plan changes keep
+    the renewal date (prorated upgrades)."""
+    starts = [e[1] for i, e in enumerate(timeline) if i == 0 or e[3]]
+    out = []
+    for i, first in enumerate(starts):
+        stop = starts[i + 1] if i + 1 < len(starts) else None
+        n = 0
+        while True:
+            start, end = month_add(first, n), month_add(first, n + 1)
+            if stop and end >= stop:
+                out.append((start, stop))
+                break
+            out.append((start, end))
+            if not stop and end > today:
+                break
+            n += 1
+    return [p for p in out if p[0] <= today]
+
+
+def share(days: list):
+    """Used over capacity, in %, for [(used, capacity)] per day."""
+    cap = sum(c for _, c in days)
+    return round(100 * sum(u for u, _ in days) / cap, 1) if cap else None
+
+
+def busiest_week(days: list):
+    """The highest share over any 7 recorded days in a row (fewer if that is all there is)."""
+    n = min(7, len(days))
+    return max((share(days[i:i + n]) for i in range(len(days) - n + 1)), default=None)
+
+
+def billing_report(today=None) -> dict:
+    """Per account with billing: its plan, the next renewal and the last 13 billing
+    periods. Each period has the prorated price, the account's weekly use and time at
+    its weekly limit, the pool's share of its weekly capacity used (period average and
+    busiest 7 days) and time with every account at its limit, the requests and their
+    cost-equivalent, and the pool's shares had this account been on the next plan down
+    or up. A 7-day span across weekly resets can use more than 100%; an average over
+    100% cannot last. Days without history are skipped and counted as not covered."""
+    import datetime as dt
+    today = today or dt.date.today()
+    ranked = sorted(PLANS, key=lambda p: (PLANS[p]["weight"], PLANS[p]["price"]))
+    out = {}
+    for name, timeline in BILLING.items():
+        periods = []
+        for start, end in billing_periods(timeline, today)[-13:]:
+            span = [start + dt.timedelta(days=n) for n in range((end - start).days)]
+            plans = [plan_at(name, time.mktime(d.timetuple()))[2] for d in span]
+            i = ranked.index(plans[-1])
+            alts = ranked[max(0, i - 1):i] + ranked[i + 1:i + 2]
+            row = {"start": start.isoformat(), "end": end.isoformat(), "days": len(span),
+                   "elapsed": 0, "covered": 0, "plans": list(dict.fromkeys(plans)),
+                   "price": round(sum(PLANS[p]["price"] for p in plans) / len(span), 2),
+                   "limited_h": 0.0, "blocked_h": 0.0, "usage": {}}
+            own, pool, alt = [], [], {p: [] for p in alts}  # per recorded day: (used, capacity)
+            for d, plan in zip(span, plans):
+                if d > today:
+                    break
+                key, ts = d.isoformat(), time.mktime(d.timetuple())
+                row["elapsed"] += 1
+                for field, v in ROLLUP.get("accounts", {}).get(key, {}).get(name, {}).items():
+                    row["usage"][field] = row["usage"].get(field, 0) + v
+                quota = {a: q for a, q in ROLLUP.get("quota", {}).get(key, {}).items() if a in ACCOUNTS}
+                if name not in quota:
+                    continue
+                row["covered"] += 1
+                row["limited_h"] += quota[name][1] / 3600
+                row["blocked_h"] += ROLLUP.get("blocked", {}).get(key, 0) / 3600
+                w = PLANS[plan]["weight"]
+                own.append((quota[name][0] * w, w * 100 / 7))
+                used = sum(q[0] * weight(a, ts) for a, q in quota.items())
+                cap = sum(weight(a, ts) for a in quota) * 100 / 7
+                pool.append((used, cap))
+                for p in alts:
+                    alt[p].append((used, cap + (PLANS[p]["weight"] - w) * 100 / 7))
+            row.update(used=share(own), peak=busiest_week(own), pool_used=share(pool),
+                       pool_peak=busiest_week(pool), limited_h=round(row["limited_h"], 1),
+                       blocked_h=round(row["blocked_h"], 1),
+                       whatif=[{"plan": p, "price": PLANS[p]["price"] - PLANS[plans[-1]]["price"],
+                                "pool_used": share(alt[p]), "pool_peak": busiest_week(alt[p])} for p in alts])
+            periods.append(row)
+        plan = plan_at(name, time.time())[2]
+        out[name] = {"plan": plan, "price": PLANS[plan]["price"],
+                     "renews": periods[-1]["end"] if periods else None, "periods": periods[::-1]}
+    return out
+
+
 @app.get("/rotate/stats")
 async def rotate_stats(request: Request):
     if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
-    return aggregate_audit() | {"periods": usage_periods()}
+    out = aggregate_audit() | {"periods": usage_periods(), "billing": billing_report()}
+    out["alerts"] = out["alerts"] + [{"level": "warn", "text": f"billing ignored: {e}"} for e in BILLING_ERRORS]
+    return out
 
 
 PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1039,14 +1230,15 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .seg button{background:none;border:0;color:var(--ink2);padding:4px 12px;font:inherit;font-size:12px;cursor:pointer} .seg button.on{background:var(--grid);color:var(--ink);font-weight:600}
  .split{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
  .timeline div{display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--grid);color:var(--ink2)} .timeline div:last-child{border-bottom:0}
+ #billing table+.acct-head{margin-top:20px}
  .linkbtn{background:none;border:1px solid var(--border);border-radius:6px;color:var(--ink2);font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}
  @media (max-width:900px){.kpis{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}.split{grid-template-columns:1fr}
   .meter-row{grid-template-columns:28px 1fr;row-gap:4px}.meter-row>span:last-child{grid-column:2}
-  #devices,#devices tbody{display:block} #devices tr:first-child{display:none}
-  #devices tr{display:grid;grid-template-columns:repeat(4,1fr);gap:8px 12px;padding:12px 0;border-bottom:1px solid var(--grid)} #devices tr:last-child{border-bottom:0}
-  #devices td{padding:0;border:0;text-align:left} #devices td:nth-child(n+4):not(:last-child){order:1}
-  #devices td[data-l]::before{content:attr(data-l);display:block;color:var(--muted);font-size:11px}}
- @media (max-width:600px){main{padding:12px 12px 32px;gap:12px}.card{padding:14px}#devices tr{grid-template-columns:1fr 1fr}
+  .cards,.cards tbody{display:block} .cards tr:first-child{display:none}
+  .cards tr{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px 12px;padding:12px 0;border-bottom:1px solid var(--grid)} .cards tr:last-child{border-bottom:0}
+  .cards td{padding:0;border:0;text-align:left;white-space:normal} .cards td:nth-child(n+4):not(:last-child){order:1}
+  .cards td[data-l]::before{content:attr(data-l);display:block;color:var(--muted);font-size:11px}}
+ @media (max-width:600px){main{padding:12px 12px 32px;gap:12px}.card{padding:14px}.cards tr{grid-template-columns:repeat(2,minmax(0,1fr))}
   th,td{padding:8px 6px} .split :is(th,td):nth-child(4){display:none}}
 </style></head><body><main>
 <header><h1>claude-rotate</h1><span class="muted" id="host"></span><span id="pills"></span><span class="spacer"></span><span class="muted small" id="upd"></span></header>
@@ -1064,7 +1256,8 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <span><span class="key dash" style="border-color:var(--muted)"></span>Projected</span><span><span class="key band"></span>&#9940; Every account at its limit</span></span>
  <button class="linkbtn" id="tbl">Table</button></h2>
  <div id="weekly" class="muted">collecting data</div><div class="tip" id="tip"></div></section>
-<section class="card"><h2>Devices</h2><table id="devices"></table></section>
+<section class="card"><h2>Subscriptions <span class="muted" style="font-weight:400">billing periods &middot; USD list prices</span></h2><div id="billing"></div></section>
+<section class="card"><h2>Devices</h2><table id="devices" class="cards"></table></section>
 <section class="split">
  <div class="card"><h2>By model <span class="seg" id="period"></span></h2><table id="models"></table></div>
  <div class="card"><h2>By account, 24 h</h2><table id="by-account"></table><h2 style="margin-top:20px">Recent switches</h2><div class="timeline" id="events"></div></div>
@@ -1094,6 +1287,22 @@ function meter(label,u,thr,reset){
     +`<span><b>${Math.round(u*100)}%</b> <span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
 function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
   return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
+function billing(b){
+  const names=Object.keys(b||{}), pct=v=>v==null?'–':esc(Math.round(v))+'%', date=s=>esc(day(Date.parse(s+'T00:00')/1000));
+  if(!names.length) return '<span class="muted small">Add <code>billing</code> to an account in config.json to see its plan, renewal date and monthly use.</span>';
+  return names.map(n=>{const a=b[n], left=Math.ceil((Date.parse(a.renews+'T00:00')-Date.now())/D/1000);
+    let h=`<div class="acct-head"><b>${esc(n)}</b><span class="badge">${esc(a.plan)} &middot; ${money(a.price)}/mo</span>`
+      +(a.renews?`<span class="muted small">renews ${date(a.renews)}${left>=0?' &middot; in '+left+' d':''}</span>`:'')+'</div>'
+      +'<table class="cards"><tr><th>Period</th><th class="l">Plan</th><th>Price</th><th>Weekly use</th><th>At its limit</th><th>$ equiv</th><th>All accounts</th></tr>';
+    for(const p of a.periods||[]){const u=p.usage||{}, notes=[p.elapsed<p.days?`so far: ${esc(p.elapsed)} of ${esc(p.days)} d`:'',p.covered<p.elapsed?`${esc(p.covered)} of ${esc(p.elapsed)} d recorded`:''].filter(Boolean);
+      h+=`<tr><td>${date(p.start)} &ndash; ${date(p.end)}${notes.length?'<span class="sub">'+notes.join(' &middot; ')+'</span>':''}</td>`
+        +`<td class="l" data-l="Plan">${(p.plans||[]).map(esc).join(' &rarr; ')}</td><td data-l="Price">${money(p.price)}</td>`
+        +`<td data-l="Weekly use">${pct(p.used)}${p.used==null?'':'<span class="sub">busiest week '+pct(p.peak)+'</span>'}</td>`
+        +`<td data-l="At its limit">${esc(p.limited_h)} h<span class="sub">all accounts ${esc(p.blocked_h)} h</span></td>`
+        +`<td data-l="$ equiv">${money(u.cost_usd)}<span class="sub">${p.price?((u.cost_usd||0)/p.price).toFixed(1)+'&times; the price':''}</span></td>`
+        +`<td data-l="All accounts">${p.pool_used==null?'&ndash;':pct(p.pool_used)+(p.pool_used>100?' &#9888;':'')+' &middot; busiest week '+pct(p.pool_peak)+(p.whatif||[]).map(w=>`<span class="sub">on ${esc(w.plan)} (${w.price<0?'&minus;':'+'}$${esc(Math.abs(w.price))}/mo): ${pct(w.pool_used)} &middot; ${pct(w.pool_peak)}${w.pool_used>100?' &#9888;':''}</span>`).join('')}</td></tr>`}
+    return h+'</table>'}).join('')
+    +'<p class="muted small">Weekly use: the share of its weekly quota the account used over the period, and in its busiest 7 days. All accounts: the same for the combined weekly quota, then with this account on the next plan down or up. An average over 100% cannot last (&#9888;); a busiest week over 100% can fit across weekly resets but means time at the limit.</p>'}
 function weekly(p){
   if(!p||!p.series.length) return 'collecting data';
   const cw=Math.max(300,$('weekly').clientWidth||1100),Hh=cw<600?220:270,L=48,R=12,T=14,B=26, now=p.series[p.series.length-1][0];
@@ -1163,15 +1372,17 @@ async function refresh(){
   $('k-req').textContent=fmt(sum(stats.by_device,b=>b.requests)); $('k-req-sub').textContent=fmt(sum(stats.by_device,tok))+' tokens';
   $('k-cost').textContent=money(sum((per['7d']||{}).model,b=>b.cost_usd)); $('k-cost-sub').textContent=money(sum(stats.by_model,b=>b.cost_usd))+' in the last 24 h';
   // accounts
-  $('accounts').innerHTML=accts.map(([name,a])=>{const u5=a.effective_util_5h||0, u7=a.effective_util_7d||0;
+  $('accounts').innerHTML=accts.map(([name,a])=>{const u5=a.effective_util_5h||0, u7=a.effective_util_7d||0, bl=(stats.billing||{})[name];
     const seen=a.last_seen?ago(Math.round((Date.now()/1000-a.last_seen)/60)):'never';
     return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${name===st.active_account?'<span class="badge"><span class="dot" style="background:var(--good)"></span>active</span>':''}`
+      +(bl?`<span class="badge">${esc(bl.plan)}${bl.renews?' &middot; renews '+esc(day(Date.parse(bl.renews+'T00:00')/1000)):''}</span>`:'')
       +(a.disabled?'<span class="badge">disabled</span>':'')+(a.priority!==100?`<span class="badge">prio ${esc(a.priority)}</span>`:'')
       +`<span class="muted small" style="margin-left:auto">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span></div>`
       +meter('5h',u5,st.switch_threshold,a.reset_5h_in_min>0?'resets in '+dur(a.reset_5h_in_min*60):'window idle')
       +meter('7d',u7,st.switch_threshold_7d,a.reset_7d_in_h>0?'resets in '+dur(a.reset_7d_in_h*H):'window idle')+'</div>'}).join('');
   const sc=$('wk-scroll'), keep=sc&&sc.scrollWidth?sc.scrollWidth-sc.clientWidth-sc.scrollLeft:null;  // keep the view across redraws
   $('weekly').innerHTML=weekly(wk);
+  $('billing').innerHTML=billing(stats.billing);
   const nsc=$('wk-scroll'); if(nsc&&WK) nsc.scrollLeft=keep==null?WK.start:nsc.scrollWidth-nsc.clientWidth-keep;
   // devices: configured ones, then removed ones that still have history
   const roster=stats.devices||{}, gone=Object.keys((per.all||{}).device||{}).filter(n=>!(n in roster)&&n!=='?');

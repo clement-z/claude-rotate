@@ -234,4 +234,82 @@ check("an existing file is loaded, not rebuilt", R.ROLLUP == saved)
 R.audit({"device": "laptop", "model": "claude-sonnet-5", "usage": use})
 check("every audited request is added", R.ROLLUP["total"]["device"]["laptop"]["requests"] == 2)
 
+# --- billing: plan timelines, billing periods, the daily ledger and the report ---
+D = dt.date
+check("a month later keeps the day or takes the month's last",
+      R.month_add(D(2027, 1, 31), 1) == D(2027, 2, 28) and R.month_add(D(2027, 1, 31), 2) == D(2027, 3, 31)
+      and R.month_add(D(2028, 1, 31), 1) == D(2028, 2, 29) and R.month_add(D(2026, 11, 14), 2) == D(2027, 1, 14))
+up = [(0, D(2026, 9, 14), "max", False), (0, D(2026, 10, 20), "ultra", False)]
+check("an upgrade keeps the renewal date", R.billing_periods(up, D(2026, 11, 3))
+      == [(D(2026, 9, 14), D(2026, 10, 14)), (D(2026, 10, 14), D(2026, 11, 14))])
+restart = [(0, D(2026, 9, 5), "pro", False), (0, D(2026, 10, 20), "max", True)]
+check("an entry marked renews restarts the cycle", R.billing_periods(restart, D(2026, 11, 25))
+      == [(D(2026, 9, 5), D(2026, 10, 5)), (D(2026, 10, 5), D(2026, 10, 20)),
+          (D(2026, 10, 20), D(2026, 11, 20)), (D(2026, 11, 20), D(2026, 12, 20))])
+
+R.BILLING_ERRORS.clear()
+R.CFG = {"plans": {"team": {"price": 30, "weight": 0.3}, "bad": {"price": -1}}}
+R.ACCOUNTS = {"a": {"name": "a", "billing": [{"from": "2026-09-14", "plan": "max"},
+                                             {"from": "2026-10-20", "plan": "ultra"}]},
+              "b": {"name": "b"},
+              "c": {"name": "c", "billing": [{"from": "2026-10-09", "plan": "max"},
+                                             {"from": "2026-10-05", "plan": "max"}]}}
+R.BILLING = R.load_billing()
+del R.PLANS["team"]
+check("bad plans and out-of-order timelines are reported and ignored, not fatal",
+      set(R.BILLING) == {"a"} and "bad" not in R.PLANS and len(R.BILLING_ERRORS) == 2)
+midnight = lambda d: time.mktime(d.timetuple())
+check("weight follows the plan in force",
+      R.weight("a", midnight(D(2026, 10, 1))) == 1 and R.weight("a", midnight(D(2026, 10, 20))) == 2
+      and R.weight("b") == 1)
+
+R.ROLLUP = empty_rollup()
+base = midnight(today - dt.timedelta(days=1)) + 10 * H
+r1, r2 = base + 3 * 86400, base + 9 * 86400
+samples = [{"ts": base, "accounts": {"a": [0.50, r1], "b": [0.90, r2]}},
+           {"ts": base + 1800, "accounts": {"a": [0.60, r1], "b": [1.00, r2]}},
+           {"ts": base + 3600, "accounts": {"a": [0.05, r1 + 7 * 86400], "b": [1.00, r2]}},  # a's reset
+           {"ts": base + 5400, "accounts": {"a": [1.00, r1 + 7 * 86400], "b": [1.00, r2]}},
+           {"ts": base + 6 * H, "accounts": {"a": [1.00, r1 + 7 * 86400], "b": [1.00, r2]}}]  # after downtime
+for prev, cur in zip([None] + samples, samples):
+    R.ledger_sample(prev, cur)
+q = R.ROLLUP["quota"][iso(1)]
+check("ledger credits rises, a new window in full, and time at the weekly limit",
+      q["a"] == [110.0, 1800] and q["b"] == [10.0, 5400])
+check("pool time at the limit, not counting downtime", R.ROLLUP["blocked"][iso(1)] == 1800)
+
+R.ROLLUP = empty_rollup()
+R.ROLLUP.update(quota={}, blocked={"2026-10-21": 1800}, accounts={"2026-10-20": {"a": {"requests": 3, "cost_usd": 361.3}}})
+for n in range(21):  # Oct 14 .. Nov 3, a missing on Oct 25
+    day = (D(2026, 10, 14) + dt.timedelta(days=n)).isoformat()
+    R.ROLLUP["quota"][day] = {"b": [5.0, 0]} | ({} if day == "2026-10-25" else {"a": [10.0, 3600 if n == 0 else 0]})
+rep = R.billing_report(D(2026, 11, 3))["a"]
+cur, prev = rep["periods"]
+check("report: current plan, renewal and newest period first",
+      rep["plan"] == "ultra" and rep["renews"] == "2026-11-14" and cur["start"] == "2026-10-14")
+check("an upgrade inside the period prorates its price by days",
+      cur["plans"] == ["max", "ultra"] and cur["price"] == round((6 * 100 + 25 * 200) / 31, 2))
+check("days elapsed and recorded", cur["days"] == 31 and cur["elapsed"] == 21 and cur["covered"] == 20)
+check("weekly use is the share of the quota the plan gave, whatever the plan", cur["used"] == 70.0)
+check("pool share: 15 of 200/7 a day on Max days, 25 of 300/7 on Ultra days",
+      cur["pool_used"] == round(100 * (6 * 15 + 14 * 25) * 7 / (6 * 200 + 14 * 300), 1) and cur["pool_peak"] == 58.3)
+check("on the next plan down every day has 200/7",
+      cur["whatif"] == [{"plan": "max", "price": -100, "pool_used": round(100 * 440 * 7 / (20 * 200), 1),
+                         "pool_peak": 87.5}])
+check("hours at the limit and the period's requests and cost",
+      cur["limited_h"] == 1.0 and cur["blocked_h"] == 0.5 and cur["usage"] == {"requests": 3, "cost_usd": 361.3})
+check("a period without history has no use figures; Max compares to Pro and Ultra",
+      prev["covered"] == 0 and prev["used"] is None and prev["price"] == 100
+      and [w["plan"] for w in prev["whatif"]] == ["pro", "ultra"])
+
+R.ROLLUP = {"days": {}, "total": {"device": {}, "model": {}}, "since": None}  # a file from before the ledger
+R.USAGE_PATH.write_text(json.dumps(R.ROLLUP))
+R.AUDIT_PATH.write_text(json.dumps({"ts": f"{iso(2)}T10:00:00+0000", "device": "laptop", "account": "a",
+                                    "model": "claude-sonnet-5", "usage": use}) + "\n")
+R.HISTORY = samples
+R.load_rollup()
+check("a file from before the ledger gets only the ledger rebuilt",
+      R.ROLLUP["accounts"][iso(2)]["a"]["requests"] == 1 and R.ROLLUP["quota"][iso(1)]["a"] == [110.0, 1800]
+      and R.ROLLUP["days"] == {})
+
 print(f"\nall {PASS} checks passed")
