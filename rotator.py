@@ -24,7 +24,8 @@ Per request, the proxy:
      daily totals per device and model for its 7-day, 30-day and all-time views,
      and per-account daily totals for each subscription's billing periods.
 
-GET /rotate/status (device-key auth) returns live state for the admin page.
+GET /rotate/status (device-key auth) returns live state for the admin page;
+POST /rotate/switch lets the panel select or rotate the active account.
 """
 
 import asyncio
@@ -158,8 +159,9 @@ class RequestAdmission:
         self.app, self.limit, self.active = app, limit, 0
 
     async def __call__(self, scope, receive, send):
-        admin = scope.get("method") == "GET" and scope.get("path") in {
-            "/rotate/status", "/rotate/stats", "/rotate/panel"}
+        admin = (scope.get("method"), scope.get("path")) in {
+            ("GET", "/rotate/status"), ("GET", "/rotate/stats"), ("GET", "/rotate/panel"),
+            ("POST", "/rotate/switch")}
         if scope["type"] != "http" or not self.limit or admin:
             return await self.app(scope, receive, send)
         # One event loop, with no await between the check and increment.
@@ -422,6 +424,9 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             return "burst"
 
         verdict = None
+        pin = STATE.get("pinned")
+        if pin != STATE["active_account"] or (pin == account and (quota_hit or not usable(account))):
+            STATE.pop("pinned", None)  # the pick ended: a threshold, the quota, or a move away
         if STATE["active_account"] != account:
             # Another request already rotated; a retry rides the new active.
             verdict = "switched" if quota_hit else None
@@ -444,7 +449,8 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                             or priority(nxt) < priority(account)
                             or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
                         reason = f"utilization>={THRESHOLD}"
-                elif cooled and usable(nxt):
+                elif cooled and usable(nxt) and STATE.get("pinned") != account:
+                    # A panel pick holds until a threshold, the quota or disabling ends it.
                     if priority(nxt) < priority(account):
                         # A preferred account has room again — pull traffic back.
                         reason = "priority_recovery"
@@ -683,6 +689,7 @@ async def rotate_status(request: Request):
         accounts[name] = info
     return {
         "active_account": STATE["active_account"],
+        "pinned": STATE.get("pinned") if STATE.get("pinned") == STATE["active_account"] else None,
         "switch_threshold": THRESHOLD,
         "switch_threshold_7d": THRESHOLD_7D,
         "strategy": STRATEGY,
@@ -692,6 +699,47 @@ async def rotate_status(request: Request):
         "storage_errors": STORAGE_ERRORS,
         "weekly": weekly_outlook(now),
     }
+
+
+@app.post("/rotate/switch")
+async def rotate_switch(request: Request):
+    """Panel buttons: {"account": name} makes it active, {"auto": true} hands back to
+    the strategy. A pick holds until the account crosses a switch threshold, runs out
+    of quota or is disabled."""
+    if not panel_allowed(request):
+        return JSONResponse({"error": "unknown device key"}, status_code=401)
+    # Serve adds the tailnet identity to any request, a cross-site form post included:
+    # only same-origin JSON, which another page cannot send without a CORS preflight.
+    if (request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json"
+            or request.headers.get("sec-fetch-site", "same-origin") != "same-origin"):
+        return JSONResponse({"error": "send same-origin JSON"}, status_code=403)
+    try:
+        body = json.loads(await bounded_body(request) or b"{}")
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    async with state_lock:
+        current = STATE["active_account"]
+        if body.get("auto"):
+            STATE.pop("pinned", None)
+            save_state()
+            return {"active_account": current, "pinned": None}
+        target = body.get("account")
+        if not isinstance(target, str) or target not in ACCOUNTS:
+            return JSONResponse({"error": "unknown account"}, status_code=404)
+        if not usable(target):
+            return JSONResponse({"error": f"{target} is disabled or at a switch threshold"},
+                                status_code=409)
+        if target != current:
+            STATE["active_account"], STATE["last_switch_ts"] = target, time.time()
+            STATE["events"].append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "switch",
+                                    "from": current, "to": target, "reason": "manual",
+                                    "util": utilization(current) if current in ACCOUNTS else 0.0})
+            STATE["events"] = STATE["events"][-200:]
+        STATE["pinned"] = target
+        save_state()
+    return {"active_account": target, "pinned": target}
 
 
 def panel_allowed(request: Request) -> bool:
@@ -746,7 +794,6 @@ PRICES = CFG.get("prices_per_mtok", {
 DEFAULT_PRICE = [5.0, 25.0]
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
-    "expensive_model_patterns": ["opus", "fable", "mythos"],
     "util_warn": 0.8,
 })
 
@@ -890,7 +937,6 @@ def aggregate_audit() -> dict:
     device_hour_tokens: dict = {}
     device_hour_reqs: dict = {}
     device_meta: dict = {}
-    expensive_hour: dict = {}
 
     _tail_audit()
     records = _AUDIT_CACHE["records"]
@@ -917,9 +963,6 @@ def aggregate_audit() -> dict:
             device_hour_tokens[rec.get("device", "?")] = (
                 device_hour_tokens.get(rec.get("device", "?"), 0) + total)
             device_hour_reqs[dev] = device_hour_reqs.get(dev, 0) + 1
-            if any(p in (model or "") for p in ALERT_CFG["expensive_model_patterns"]):
-                key = f'{rec.get("device", "?")} / {model}'
-                expensive_hour[key] = expensive_hour.get(key, 0) + 1
 
     limited = now < _AUDIT_CACHE.get("limited_until", 0)
     alerts = ([{"level": "warn", "text": "Statistics are partial: older history was "
@@ -929,8 +972,6 @@ def aggregate_audit() -> dict:
             alerts.append({"level": "warn",
                            "text": f"{dev} consumed {toks:,} tokens in the last hour "
                                    f"(threshold {ALERT_CFG['device_tokens_per_hour']:,})"})
-    for key, n in expensive_hour.items():
-        alerts.append({"level": "info", "text": f"expensive model in use: {key} — {n} requests in the last hour"})
     for name in ACCOUNTS:
         u = utilization(name)
         if u >= ALERT_CFG["util_warn"]:
@@ -1200,7 +1241,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  *{box-sizing:border-box} body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%;text-size-adjust:100%}
  main{max-width:1180px;margin:0 auto;padding:20px 24px 40px;display:grid;gap:16px}
  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap} h1{font-size:18px;margin:0;font-weight:600}
- .pill{border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:var(--ink2);font-size:13px}
+ .pill{border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:var(--ink2);font-size:13px} #pills{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
  .spacer{flex:1} .muted{color:var(--muted)} .small{font-size:12px}
  .card{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto}
@@ -1212,6 +1253,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .tile .v{font-size:26px;font-weight:600;margin:6px 0 2px}
  .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(380px,100%),1fr));gap:16px}
  .acct-head{display:flex;align-items:baseline;gap:8px;margin-bottom:12px;flex-wrap:wrap} .acct-head b{font-size:16px}
+ .acct-side{margin-left:auto;display:flex;align-items:baseline;gap:8px}
  .badge{font-size:12px;border-radius:999px;padding:1px 8px;border:1px solid var(--border);color:var(--ink2)}
  .meter-row{display:grid;grid-template-columns:28px 1fr 250px;gap:10px;align-items:center;margin:8px 0}
  .meter{position:relative;height:8px;border-radius:4px;background:var(--track)} .meter i{position:absolute;inset:0 auto 0 0;border-radius:4px}
@@ -1231,7 +1273,11 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .split{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
  .timeline div{display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--grid);color:var(--ink2)} .timeline div:last-child{border-bottom:0}
  #billing table+.acct-head{margin-top:20px}
- .linkbtn{background:none;border:1px solid var(--border);border-radius:6px;color:var(--ink2);font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}
+ .linkbtn{background:rgba(57,135,229,.10);border:1px solid rgba(57,135,229,.55);border-radius:6px;color:#8ab8f0;font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}
+ .linkbtn:hover:not(:disabled){background:rgba(57,135,229,.22)} .linkbtn:focus-visible{outline:2px solid var(--s1);outline-offset:1px}
+ .linkbtn:disabled{opacity:.4;cursor:default} .linkbtn.primary{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
+ dialog{background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:18px;max-width:min(440px,calc(100% - 24px))} dialog::backdrop{background:rgba(0,0,0,.6)}
+ .acts{display:flex;justify-content:flex-end;gap:8px;margin-top:16px} .acts .linkbtn{font-size:13px;padding:5px 14px}
  @media (max-width:900px){.kpis{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}.split{grid-template-columns:1fr}
   .meter-row{grid-template-columns:28px 1fr;row-gap:4px}.meter-row>span:last-child{grid-column:2}
   .cards,.cards tbody{display:block} .cards tr:first-child{display:none}
@@ -1264,13 +1310,15 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
 </section>
 <p class="muted small">Cost-equivalent = API list prices (cache read 0.1&times;, write 1.25&times;); actual spend is covered by the subscriptions.</p>
 </main>
+<dialog id="confirm"><div id="cf-text"></div><div class="small" id="cf-err" style="color:var(--crit)"></div>
+ <div class="acts"><button class="linkbtn" id="cf-no">Cancel</button><button class="linkbtn primary" id="cf-yes">Switch</button></div></dialog>
 <script>
 const KEY = new URLSearchParams(location.search).get('key');
 const cleanURL = new URL(location.href);
 cleanURL.searchParams.delete('key');
 history.replaceState(null, '', cleanURL.pathname + cleanURL.search + cleanURL.hash);
 const $=id=>document.getElementById(id), H=3600, D=86400, PERIODS={'24 h':'24h','7 d':'7d','30 d':'30d','All time':'all'};
-let period='7 d', showTable=false, WK=null;
+let period='7 d', showTable=false, WK=null, ST={}, PENDING=null;
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(n){n=n||0;return n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e4?0:1)+'k':''+Math.round(n)}
 function money(v){v=v||0;return '$'+(v>=100?Math.round(v).toLocaleString():v.toFixed(2))}
@@ -1355,13 +1403,25 @@ $('weekly').onpointerleave=e=>{if(e.pointerType==='touch') return;  // touch fir
   $('tip').style.display='none'; const xh=document.querySelector('#xh'); if(xh) xh.setAttribute('opacity','0')};
 $('tbl').onclick=()=>{showTable=!showTable; $('tbl').textContent=showTable?'Chart':'Table'; refresh()};
 $('period').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p; if(p){period=p; refresh()}};
+const usable=a=>!a.disabled&&(a.effective_util_5h||0)<ST.switch_threshold&&(a.effective_util_7d||0)<ST.switch_threshold_7d;
+$('pills').onclick=$('accounts').onclick=e=>{const b=e.target.closest&&e.target.closest('button[data-sw],button[data-auto]'); if(!b||b.disabled) return;
+  PENDING=b.dataset.auto?{auto:true}:{account:b.dataset.sw};
+  $('cf-text').innerHTML=PENDING.auto?`Hand <b>${esc(ST.active_account)}</b> back to the ${esc(ST.strategy)} strategy? It may switch account at the next request.`
+    :`Make <b>${esc(PENDING.account)}</b> the active account instead of <b>${esc(ST.active_account)}</b>? It stays active until it reaches a switch threshold or runs out of quota.`;
+  $('cf-err').textContent=''; $('confirm').showModal()};
+$('cf-no').onclick=()=>$('confirm').close();
+$('cf-yes').onclick=async()=>{$('cf-yes').disabled=true;
+  try{const r=await fetch('/rotate/switch',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},KEY?{Authorization:'Bearer '+KEY}:{}),body:JSON.stringify(PENDING)});
+    if(r.ok){$('confirm').close(); refresh()} else $('cf-err').textContent=(await r.json().catch(()=>({}))).error||'error '+r.status}
+  catch(err){$('cf-err').textContent='request failed'} finally{$('cf-yes').disabled=false}};
 async function refresh(){
   const [st, stats] = await Promise.all([
     fetch('/rotate/status',{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'}).then(r=>r.json()),
     fetch('/rotate/stats',{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'}).then(r=>r.json())]);
-  const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{});
+  const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{}); ST=st;
+  const names=accts.map(([n])=>n), i=names.indexOf(st.active_account), nxt=names.slice(i+1).concat(names.slice(0,i+1)).find(n=>n!==st.active_account&&usable(st.accounts[n]));
   $('host').textContent=location.host||'';
-  $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`;
+  $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is under its switch thresholds"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`;
   $('alerts').innerHTML=(stats.alerts||[]).map(a=>`<div class="banner ${a.level==='warn'?'warn':''}">&#9888; <span><b>${a.level==='warn'?'Warning':'Note'}</b> ${esc(a.text)}</span></div>`).join('');
   // headline figures
   const last=(wk.series||[]).slice(-1)[0], now=last?last[0]:Date.now()/1000;
@@ -1374,10 +1434,11 @@ async function refresh(){
   // accounts
   $('accounts').innerHTML=accts.map(([name,a])=>{const u5=a.effective_util_5h||0, u7=a.effective_util_7d||0, bl=(stats.billing||{})[name];
     const seen=a.last_seen?ago(Math.round((Date.now()/1000-a.last_seen)/60)):'never';
-    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${name===st.active_account?'<span class="badge"><span class="dot" style="background:var(--good)"></span>active</span>':''}`
+    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${name===st.active_account?'<span class="badge"><span class="dot" style="background:var(--good)"></span>active'+(st.pinned===name?' &middot; manual':'')+'</span>':''}`
       +(bl?`<span class="badge">${esc(bl.plan)}${bl.renews?' &middot; renews '+esc(day(Date.parse(bl.renews+'T00:00')/1000)):''}</span>`:'')
       +(a.disabled?'<span class="badge">disabled</span>':'')+(a.priority!==100?`<span class="badge">prio ${esc(a.priority)}</span>`:'')
-      +`<span class="muted small" style="margin-left:auto">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span></div>`
+      +`<span class="acct-side"><span class="muted small">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span>`
+      +(name!==st.active_account?`<button class="linkbtn" data-sw="${esc(name)}"${usable(a)?'':' disabled title="disabled or at a switch threshold"'}>Select</button>`:st.pinned===name?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
       +meter('5h',u5,st.switch_threshold,a.reset_5h_in_min>0?'resets in '+dur(a.reset_5h_in_min*60):'window idle')
       +meter('7d',u7,st.switch_threshold_7d,a.reset_7d_in_h>0?'resets in '+dur(a.reset_7d_in_h*H):'window idle')+'</div>'}).join('');
   const sc=$('wk-scroll'), keep=sc&&sc.scrollWidth?sc.scrollWidth-sc.clientWidth-sc.scrollLeft:null;  // keep the view across redraws
@@ -1412,7 +1473,9 @@ async def rotate_panel(request: Request):
     if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key — open /rotate/panel?key=<device key>"},
                             status_code=401)
-    return Response(content=PANEL_HTML, media_type="text/html")
+    # The panel can switch accounts: no other page may frame it and steer a click.
+    return Response(content=PANEL_HTML, media_type="text/html",
+                    headers={"Content-Security-Policy": "frame-ancestors 'none'", "X-Frame-Options": "DENY"})
 
 
 async def retry_wait(seconds: float, request: Request | None) -> None:

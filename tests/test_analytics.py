@@ -74,7 +74,7 @@ def rec(ts, device, model, account, inp=0, out=0, cr=0, cw=0):
 
 
 records = [
-    rec(now - 60, "laptop", "claude-opus-5", "a", inp=1000, out=500),        # last hour, expensive
+    rec(now - 60, "laptop", "claude-opus-5", "a", inp=1000, out=500),        # last hour
     rec(now - 7200, "laptop", "claude-haiku-4-5", "a", inp=2000, out=100),   # today, outside hour
     rec(now - 90000, "laptop", "claude-opus-5", "a", inp=9999, out=9999),    # >24h → excluded
     rec(now - 120, "ci-box", "claude-sonnet-5", "b", inp=6_000_000, out=10), # token/hour alert
@@ -96,7 +96,6 @@ check("cost accumulated", agg["by_device"]["laptop"]["cost_usd"] > 0)
 
 alert_texts = " | ".join(a["text"] for a in agg["alerts"])
 check("token/hour alert fires", "ci-box" in alert_texts and "6,000,010" in alert_texts)
-check("expensive-model alert fires", "laptop / claude-opus-5" in alert_texts)
 check("util warn alert fires", "a 5h window at 85%" in alert_texts)
 
 devs = agg["devices"]

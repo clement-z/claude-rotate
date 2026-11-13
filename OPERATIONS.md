@@ -2,7 +2,7 @@
 
 Manage the installed service over SSH. Accounts, device keys and the active
 upstream account are administered with `claude-rotate-admin`, installed by
-`install.sh`; the web dashboard is read-only. For installation, upgrades and
+`install.sh`; the web dashboard can only switch the active account. For installation, upgrades and
 removal, see [the deployment guide](deploy/README.md).
 
 ## Install, upgrade, remove
@@ -150,7 +150,12 @@ The manual choice is protected by the normal switch cooldown
 applies again: `consume-first`, `priority` and the thresholds can move traffic
 to another account, and a quota exhaustion or a disabled account moves it
 immediately. To prefer one account durably, give it a lower `priority` in the
-configuration. `status` shows the active account from the saved state and,
+configuration.
+
+The dashboard's **Select** and **Rotate** buttons switch without a restart, to
+an enabled account under both thresholds, after a confirmation. A dashboard pick
+is held: `consume-first` and `priority` leave it alone until it reaches a
+threshold, runs out of quota or is disabled, or until **Resume auto**. `status` shows the active account from the saved state and,
 while the service runs, from the live `/rotate/status` response together with
 `storage_errors`, per-account last-seen times and upstream status. A present
 token file says nothing about whether the token is still valid; only real
@@ -167,7 +172,7 @@ Use its reported HTTPS URL as clients' `ANTHROPIC_BASE_URL`. Their
 `127.0.0.1:8484`; Tailscale Serve handles tailnet access. Serve is configured
 separately from this service. See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
-Open the read-only dashboard on a tailnet-connected client:
+Open the dashboard on a tailnet-connected client:
 
 ```text
 https://YOUR-TAILSCALE-HOST/rotate/panel?key=YOUR-DEVICE-KEY

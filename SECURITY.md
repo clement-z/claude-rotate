@@ -2,8 +2,9 @@
 
 This proxy holds account credentials and grants every registered device access
 to the shared account pool. Treat device keys as secrets and give them only to
-trusted clients. All device keys can view the account and device usage dashboard;
-there is no separate administrator role or per-device quota enforcement.
+trusted clients. All device keys can view the account and device usage dashboard
+and switch the active account from it; there is no separate administrator role or
+per-device quota enforcement.
 
 ## Tailscale deployment
 
@@ -20,13 +21,17 @@ See the [official Serve documentation](https://tailscale.com/docs/features/tails
 Binding directly to the server's Tailscale IP is also supported. Avoid `0.0.0.0`
 unless a separately configured firewall restricts every other interface.
 
-`panel_tailnet: true` opens the read-only dashboard and its JSON endpoints to any
+`panel_tailnet: true` opens the dashboard, its JSON endpoints and its account switch to any
 request carrying `Tailscale-User-Login`. Serve sets that header for tailnet users
 (not tagged devices, not Funnel) and strips client-supplied copies, so with the
 required loopback bind only Serve can add it — or any process on the server
 itself, which can then read the dashboard without a key. The dashboard shows
 account and device names, the last 4 characters of device keys and per-device
 usage; never tokens or message content. Proxy endpoints still require a device key.
+The account switch (`POST /rotate/switch`) accepts only `application/json` and
+refuses a request a browser marks as cross-site (`Sec-Fetch-Site`), and the panel
+forbids framing, so another web page open in a tailnet user's browser can neither
+send the switch nor trick a click on the panel's buttons.
 
 Run the service as a dedicated unprivileged user. Keep the installation directory
 and backups private. `setup.sh` enforces mode 0600 for configuration and tokens,

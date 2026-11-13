@@ -23,8 +23,9 @@ const value = '<mark data-audit="marker">&\'"</mark>';
 const elements = {}, urls = [], replaced = [];
 const usage = {requests:1,input_tokens:1,output_tokens:1,cache_read:0,cache_write:0,cost_usd:0};
 const stats = {devices:{[value]:{last_model:value,last_account:value,key_suffix:value}},alerts:[{level:'warn',text:value}],by_device:{[value]:usage},by_model:{[value]:usage},by_account:{[value]:usage},periods:{since:value,'7d':{device:{[value]:usage},model:{[value]:usage}},'30d':{device:{[value]:usage},model:{[value]:usage}},all:{device:{[value]:usage,[value+'-gone']:usage},model:{[value]:usage}},trend:{[value]:[0,1,2]}},billing:{[value]:{plan:value,price:200,renews:value,periods:[{start:value,end:value,days:31,elapsed:20,covered:18,plans:[value],price:180.5,used:70,peak:80,pool_peak:60,limited_h:1,blocked_h:0.5,usage,whatif:[{plan:value,price:-100,pool_peak:120}]}]}}};
-const status = {accounts:{[value]:{priority:100}},active_account:value,strategy:value,switch_threshold:.8,switch_threshold_7d:.98,recent_events:[{ts:value,from:value,to:value,reason:value}],weekly:{series:[[0,0,100],[3600,10,100]],projection:[[3600,10,100],[7200,100,100]],rate_per_day:5,eta:7200,back:9000,back_account:value,capacity:200}};
-const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fake-viewer-key',href:'http://proxy/rotate/panel?key=fake-viewer-key'},history:{replaceState:(_a,_b,url)=>replaced.push(url)},document:{getElementById:id=>elements[id]??=( {innerHTML:'',textContent:''} )},setInterval:()=>{},fetch:async(url,opts)=>{urls.push({url,opts});return {json:async()=>url.includes('/status')?status:stats}}});
+const status = {accounts:{[value]:{priority:100},[value+'2']:{priority:100}},active_account:value,pinned:value,strategy:value,switch_threshold:.8,switch_threshold_7d:.98,recent_events:[{ts:value,from:value,to:value,reason:value}],weekly:{series:[[0,0,100],[3600,10,100]],projection:[[3600,10,100],[7200,100,100]],rate_per_day:5,eta:7200,back:9000,back_account:value,capacity:200}};
+const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fake-viewer-key',href:'http://proxy/rotate/panel?key=fake-viewer-key'},history:{replaceState:(_a,_b,url)=>replaced.push(url)},document:{getElementById:id=>elements[id]??=( {innerHTML:'',textContent:''} )},setInterval:()=>{},fetch:async(url,opts)=>{urls.push({url,opts});return {ok:true,json:async()=>url.includes('/status')?status:stats}}});
+elements.confirm={showModal(){this.open=true},close(){this.open=false}};
 (async()=>{
   vm.runInContext(script,context,{timeout:1000});
   await vm.runInContext('refresh()',context,{timeout:1000});
@@ -36,6 +37,16 @@ const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fak
     assert(!elements[id].innerHTML.includes('<mark'),id+' contains raw markup');
     assert(elements[id].innerHTML.includes('&lt;mark'),id+' lost escaped text');
   }
+  assert(elements.pills.innerHTML.includes('>Rotate<')&&!elements.pills.innerHTML.includes('disabled'),'rotate button missing');
+  assert(elements.accounts.innerHTML.includes('Resume auto')&&elements.accounts.innerHTML.includes('>Select<'),'account buttons missing');
+  elements.accounts.onclick({target:{closest:()=>({dataset:{sw:value+'2'}})}});
+  assert(elements.confirm.open,'confirmation not shown');
+  assert(!elements['cf-text'].innerHTML.includes('<mark')&&elements['cf-text'].innerHTML.includes('&lt;mark'),'confirmation not escaped');
+  await elements['cf-yes'].onclick();
+  const post=urls.find(u=>u.url==='/rotate/switch');
+  assert(post&&post.opts.method==='POST'&&JSON.parse(post.opts.body).account===value+'2'
+    &&post.opts.headers.Authorization==='Bearer fake-viewer-key'&&post.opts.headers['Content-Type']==='application/json','switch request');
+  assert(!elements.confirm.open,'confirmation stays open after a switch');
   console.log('panel JavaScript security checks passed');
 })().catch(error=>{console.error(error);process.exitCode=1});
 '''

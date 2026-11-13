@@ -193,4 +193,25 @@ R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now + 10},
                        "c": {"util_5h": 1.0, "reset_5h": now + 50}}
 check("fallback skips disabled", R.pick_account() == "c")
 
+# 12. a panel pick holds against consume-first until the account reaches a threshold
+R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
+fresh_state("a")
+R.STATE["pinned"] = "a"
+R.STATE["accounts"] = {"a": {"util_5h": 0.2, "reset_7d": now + 500000},
+                       "b": {"util_5h": 0.1, "reset_7d": now + 100000}, "c": {"util_5h": 0.9}}
+v = run(R.note_response("a", headers(u5=0.2), 200))
+check("pinned account holds against consume-first", v is None and R.STATE["active_account"] == "a")
+v = run(R.note_response("a", headers(u5=0.85), 200))
+check("pinned account still leaves at its threshold", v == "switched" and R.STATE["active_account"] == "b")
+run(R.note_response("b", headers(u5=0.1), 200))
+check("the pin ends with the switch", "pinned" not in R.STATE)
+
+# 12b. ...and when the account runs out of quota with nowhere to go
+fresh_state("a")
+R.STATE["pinned"] = "a"
+R.STATE["accounts"] = {"a": {"util_5h": 0.5}, "b": {"util_5h": 1.0, "reset_5h": now + 900},
+                       "c": {"util_5h": 1.0, "reset_5h": now + 900}}
+v = run(R.note_response("a", headers(u5=1.0, r5=now + 600, status="rejected"), 429))
+check("the pin ends at quota exhaustion without a switch", v == "exhausted" and "pinned" not in R.STATE)
+
 print(f"\nall {PASS} checks passed")

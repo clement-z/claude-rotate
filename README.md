@@ -334,11 +334,15 @@ rate-limit headers:
 - **Headline** — time until every account is spent, with when it happens and
   which reset brings quota back; tiles for weekly quota left, burn rate,
   requests in the last 24 h and the 7-day cost-equivalent. Alerts (device over
-  N tokens/hour, expensive-model usage, account near the switch threshold;
-  thresholds in `config.json`) sit in a banner above it.
+  N tokens/hour, account near the switch threshold; thresholds in
+  `config.json`) sit in a banner above it.
 - **Accounts** — live 5-hour and weekly meters (from Anthropic's own headers)
   with a tick at the switch threshold, reset countdowns, upstream status and
-  the active account.
+  the active account. **Select** on an account, or **Rotate** next to the
+  active account (the next usable one in config order), switches to it after a
+  confirmation. The pick holds: consume-first and priority recovery leave it
+  alone until it reaches a switch threshold, runs out of quota or is disabled.
+  **Resume auto** hands it back to the strategy earlier.
 - **Weekly quota, all accounts** — the enabled accounts' current weekly
   usage, summed (blue), against their combined capacity (orange: 100% per
   account, scaled by its plan's weight). Usage drops at each account's weekly
@@ -384,7 +388,8 @@ from `audit.jsonl` and its rotated copies, and the weekly-quota part from
 
 JSON endpoints: `/rotate/status` (accounts + switch events) and
 `/rotate/stats` (rollups, alerts, the longer `periods` and `billing`), same `?key=` or `Authorization: Bearer`
-auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
+auth. `POST /rotate/switch` with `{"account": NAME}` or `{"auto": true}` is the
+panel's switch; it accepts only `application/json`. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 
 ## OpenAI-compatible endpoint
 
@@ -425,7 +430,7 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `refresh_idle_s` | send an account with no traffic for this long a 1-token `claude-haiku-4-5` request (~9 tokens of its quota) to read its current usage, so quota spent outside the proxy is seen before a switch (default 1800; 0 = off). Usage is otherwise only learned from traffic. |
 | `panel_tailnet` | `true` lets tailnet users open the panel without a device key, trusting the `Tailscale-User-Login` header from Tailscale Serve; requires a loopback `bind` (default false). See [SECURITY.md](SECURITY.md). |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
-| `alerts` | `device_tokens_per_hour`, `expensive_model_patterns`, `util_warn` |
+| `alerts` | `device_tokens_per_hour`, `util_warn` |
 
 ### Rotation policy
 
@@ -532,8 +537,8 @@ soonest 5h window reset. Check `recent_events` in `/rotate/status` for a
 **"Why did it switch accounts?"** Every switch is an event in
 `/rotate/status` → `recent_events` (and the panel's *Recent switches*), with a
 reason: `quota_exhausted`, `utilization>=<threshold>`, `consume_first`,
-`priority_recovery`, `account_disabled`, or `manual` (an operator ran
-`claude-rotate-admin rotate`). If you saw a 429 upstream but *no*
+`priority_recovery`, `account_disabled`, or `manual` (someone used the panel's
+switch or ran `claude-rotate-admin rotate`). If you saw a 429 upstream but *no*
 switch, it was a per-minute burst — the proxy paced the same account on
 purpose (see [Rotation policy](#rotation-policy)).
 
@@ -608,6 +613,8 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
 - **Manual account switch.** `sudo claude-rotate-admin rotate [ACCOUNT]` makes
   another usable account active, with a brief restart. The configured policy
   resumes after the switch cooldown; see [OPERATIONS.md](OPERATIONS.md#switching-the-upstream-account).
+  The panel's **Select** and **Rotate** switch without a restart and hold the
+  pick until the account reaches a threshold.
 - **Health check.** Monitor `/rotate/status` using an `Authorization: Bearer`
   header, then separately monitor real provider success. Local readiness/watchdog
   checks cannot detect an expired provider token or an upstream outage. Keep

@@ -240,6 +240,8 @@ check("stats returns rollups", r.status_code == 200 and "by_device" in r.json()
       and set(r.json()["periods"]) == {"since", "7d", "30d", "all", "trend"})
 r = call(path="/rotate/panel?key=devkey-1", key=None, method="GET")
 check("panel serves html", r.status_code == 200 and "text/html" in r.headers["content-type"])
+check("panel refuses to be framed", r.headers["content-security-policy"] == "frame-ancestors 'none'"
+      and r.headers["x-frame-options"] == "DENY")
 
 # --- 9. idle-account usage refresh -------------------------------------------
 fresh_state(active="a", accounts={"a": {"last_seen": time.time()},
@@ -286,6 +288,39 @@ check("panel_tailnet: keyless without the header → 401",
 use_upstream(lambda req: httpx.Response(200))
 check("panel_tailnet: the header never opens the proxy itself",
       call(key=None, headers=ts).status_code == 401)
+R.PANEL_TAILNET = False
+
+# --- 11. panel switch: select an account and hold it, or hand back to the strategy
+J = {"content-type": "application/json"}
+
+
+def sw(body, key="devkey-1", headers=J):
+    return call(path="/rotate/switch", key=key, body=body, headers=headers)
+
+
+fresh_state(active="a", accounts={"a": {"util_5h": 0.3}, "b": {"util_5h": 0.9}})
+check("switch needs auth", sw({"account": "b"}, key="nope").status_code == 401)
+check("switch refuses an account at its threshold",
+      sw({"account": "b"}).status_code == 409 and R.STATE["active_account"] == "a")
+check("switch refuses an unknown account", sw({"account": "zz"}).status_code == 404)
+R.STATE["accounts"]["b"]["util_5h"] = 0.1
+check("switch refuses a form post",
+      sw({"account": "b"}, headers={"content-type": "application/x-www-form-urlencoded"}).status_code == 403)
+check("switch refuses a cross-site request",
+      sw({"account": "b"}, headers=J | {"sec-fetch-site": "cross-site"}).status_code == 403)
+r = sw({"account": "b"})
+check("switch selects and pins", r.status_code == 200 and R.STATE["active_account"] == "b"
+      and R.STATE["pinned"] == "b" and R.STATE["events"][-1]["reason"] == "manual")
+check("status reports the pin", call(path="/rotate/status", method="GET").json()["pinned"] == "b")
+r = sw({"auto": True})
+check("auto releases the pin", r.status_code == 200 and "pinned" not in R.STATE
+      and R.STATE["active_account"] == "b")
+R.PANEL_TAILNET = True
+check("panel_tailnet: a tailnet viewer can switch with same-origin JSON",
+      sw({"account": "a"}, key=None, headers=J | ts).status_code == 200 and R.STATE["active_account"] == "a")
+check("panel_tailnet: a cross-site post through Serve is refused",
+      sw({"account": "b"}, key=None, headers=ts | {"content-type": "text/plain",
+                                                   "sec-fetch-site": "cross-site"}).status_code == 403)
 R.PANEL_TAILNET = False
 
 print(f"\nall {PASS} checks passed")
