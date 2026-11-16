@@ -130,6 +130,15 @@ check("chart sums each account's current weekly usage, dropping at a reset",
 check("capacity sums the weights", [p[2] for p in s] == [200, 200, 200, 200])
 check("spent counts rises after the first sample, a new window in full",
       [p[3] for p in s] == [0, 0, 20, 40])
+base = R.HISTORY
+R.HISTORY = [{"ts": now - 30 * H, "accounts": {"a": [0.60, new_a], "b": [1.0, rb]}},
+             {"ts": now - 20 * H, "accounts": {"a": [0.10, new_a], "b": [1.0, rb]}},  # a bought reset
+             {"ts": now - 10 * H, "accounts": {"a": [0.20, new_a], "b": [1.0, rb]}}]
+weekly_state(0.30, 1.0)
+check("a mid-week drop does not hide the rises after it",
+      [p[3] for p in R.weekly_series(now)] == [0, 0, 10, 20] and R.weekly_outlook(now)["projection"])
+R.HISTORY = base
+weekly_state(0.30, 0.30)
 
 out = R.weekly_outlook(now)
 check("rate taken over the last 24 h; the series goes out without spent",

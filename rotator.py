@@ -577,12 +577,12 @@ def weekly_series(now: float) -> list:
             if name not in ACCOUNTS or disabled(name):
                 continue
             w = weight(name, sample["ts"])  # the plan in force then: an upgrade steps capacity
-            last_reset, top = seen.get(name, (reset, u))  # first sight is a baseline
+            last_reset, last_u = seen.get(name, (reset, u))  # first sight is a baseline
             if reset > last_reset + 3600:  # a new weekly window: all of it is new usage
-                spent, top = spent + w * u, u
-            elif u > top:
-                spent, top = spent + w * (u - top), u
-            seen[name] = (max(reset, last_reset), top)
+                spent += w * u
+            elif u > last_u:  # against the last reading: a bought reset lowers usage mid-week
+                spent += w * (u - last_u)
+            seen[name] = (max(reset, last_reset), u)
             used += w * u
             cap += w
         points.append([round(sample["ts"]), round(used * 100, 1), round(cap * 100, 1), round(spent * 100, 1)])
