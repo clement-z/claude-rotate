@@ -1702,8 +1702,10 @@ async def openai_chat(request: Request):
 
 
 def connection_nominated(headers) -> set:
-    """Headers a Connection header names are hop-by-hop too (RFC 9110, section 7.6.1)."""
-    return {t.strip().lower() for t in headers.get("connection", "").split(",") if t.strip()}
+    """Headers a Connection header names are hop-by-hop too (RFC 9110, section 7.6.1),
+    on every Connection line: Starlette's get() returns only the first."""
+    return {t.strip().lower() for k, v in headers.items() if k.lower() == "connection"
+            for t in v.split(",") if t.strip()}
 
 
 def forward_headers(request: Request) -> dict:

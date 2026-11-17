@@ -15,6 +15,7 @@ import fcntl
 import getpass
 import grp
 import json
+import math
 import os
 import pwd
 import re
@@ -774,7 +775,8 @@ def cmd_install_credential(args) -> int:
             rec = json.loads(data)
         except ValueError:
             raise Refused("the credential is not JSON; nothing changed")
-        if not isinstance(rec, dict) or type(rec.get("expires_at")) not in (int, float) or not all(
+        if not isinstance(rec, dict) or type(rec.get("expires_at")) not in (int, float) \
+                or not math.isfinite(rec["expires_at"]) or not all(
                 isinstance(rec.get(k), str) and rec[k].strip() for k in ("access_token", "refresh_token", "client_id")):
             raise Refused("the credential lacks access_token, refresh_token, client_id or expires_at; nothing changed")
         refuse_symlink(STATE_DIR, "state directory")
@@ -788,11 +790,14 @@ def cmd_install_credential(args) -> int:
             if before not in QUIESCENT:
                 # activating and auto-restart can start a process that refreshes too
                 stopped = systemctl("stop", UNIT_NAME, timeout=120)
-                stopped_by_us = True
                 after = active_state()
-                if stopped.returncode != 0 or after not in QUIESCENT:
-                    raise Refused(f"could not bring {UNIT_NAME} to a stopped state (was {before}, now {after}); "
-                                  "credential not installed")
+                # Stopped is what counts, even if systemctl stop reported an error; a unit
+                # that is still up was not stopped by us and is left as it is.
+                if after not in QUIESCENT:
+                    detail = (stopped.stderr or stopped.stdout).strip()
+                    raise Refused(f"could not bring {UNIT_NAME} to a stopped state (was {before}, now {after}"
+                                  + (f": {detail}" if detail else "") + "); credential not installed")
+                stopped_by_us = True
         try:
             as_service(lambda: install_credential_file(f"{args.provider}.json",
                                                        data if data.endswith("\n") else data + "\n"))

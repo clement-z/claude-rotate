@@ -16,6 +16,7 @@ import codecs
 import hashlib
 import http.cookiejar
 import json
+import math
 import os
 import re
 import shutil
@@ -320,8 +321,13 @@ class OpenAISiwc:
                 "host_id": self.rec.get("ext_agent_host_id"), "scopes": self.rec.get("scopes")}
 
 
+def finite(value) -> bool:
+    """A JSON number Python can do arithmetic with: not a bool, NaN or Infinity."""
+    return type(value) in (int, float) and math.isfinite(value)
+
+
 def usable_record(rec) -> bool:
-    return (isinstance(rec, dict) and type(rec.get("expires_at")) in (int, float)
+    return (isinstance(rec, dict) and finite(rec.get("expires_at"))
             and all(isinstance(rec.get(k), str) and rec[k].strip()
                     for k in ("access_token", "refresh_token", "client_id")))
 
@@ -340,12 +346,14 @@ def error_code(data) -> str | None:
 
 def record_from(resp: dict, previous: dict) -> dict | None:
     """Credential record from a token response, fields a refresh omits kept; None when
-    the expiry is unusable. Same shape as siwc_login.py writes."""
+    the answer has no access token or an unusable expiry. Same shape as siwc_login.py
+    writes."""
     expires_in = resp.get("expires_in", 3600)
-    if type(expires_in) not in (int, float) or expires_in <= 0:
+    if not finite(expires_in) or expires_in <= 0 or not isinstance(resp.get("access_token"), str):
         return None
     now = int(time.time())
     rec = dict(previous)
+    rec.pop("earliest_refresh_at", None)  # it belongs to the token it came with
     for key in ("access_token", "refresh_token", "id_token", "token_type", "expires_in", "earliest_refresh_at"):
         if resp.get(key) is not None:
             rec[key] = resp[key]
@@ -361,7 +369,7 @@ def earliest_refresh(rec: dict) -> int:
     """earliest_refresh_at as Unix seconds, or 0 when absent or unreadable."""
     value = rec.get("earliest_refresh_at")
     if type(value) in (int, float):
-        return int(value)
+        return int(value) if math.isfinite(value) else 0
     if isinstance(value, str):
         try:
             return int(value)
