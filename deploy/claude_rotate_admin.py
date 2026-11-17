@@ -53,7 +53,7 @@ SERVICE_USER = "claude-rotate"
 SERVICE_GROUP = "claude-rotate"
 EXAMPLE = Path(__file__).resolve().parent.parent / "config.example.json"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-CRED_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")  # as providers.FILE_RE
+CREDENTIALS = STATE_DIR / "credentials"  # as providers.OpenAISiwc: credentials/<provider>.json
 CRED_MAX_BYTES = 64 * 1024
 ANTHROPIC = "anthropic"  # the Claude accounts, as a device grant
 TOKEN_PREFIX = "sk-ant-oat01-"
@@ -221,8 +221,9 @@ def device_key(entry):
 
 
 def device_providers(entry):
-    """What a devices entry may reach; the string form is the Claude accounts only."""
-    return entry.get("providers", [ANTHROPIC]) if isinstance(entry, dict) else [ANTHROPIC]
+    """What a devices entry may reach; the string form is the Claude accounts only. An
+    object must list its grants: a missing list grants nothing (and fails readiness)."""
+    return entry.get("providers") if isinstance(entry, dict) else [ANTHROPIC]
 
 
 def known_providers(cfg: dict) -> set:
@@ -369,8 +370,10 @@ def readiness(cfg: dict):
     known = known_providers(cfg)
     for k, v in devices.items():
         names = device_providers(v)
-        if not isinstance(names, list) or not names or any(n not in known for n in names):
-            problems.append(f"device '{k}': providers must list names from: {', '.join(sorted(known))}")
+        if not isinstance(names, list) or not names or any(n not in known for n in names) \
+                or (isinstance(v, dict) and set(v) - {"key", "providers"}):
+            problems.append(f"device '{k}': an object needs \"key\" and a nonempty \"providers\" list "
+                            f"of names from: {', '.join(sorted(known))}")
     return not problems, problems, warnings
 
 
@@ -628,6 +631,8 @@ def print_device_block(cfg: dict, name: str, key: str, names=(ANTHROPIC,)):
     if ANTHROPIC in names:
         out(f"  export ANTHROPIC_BASE_URL={shlex.quote(url)}")
         out(f"  export CLAUDE_CODE_OAUTH_TOKEN={shlex.quote(key)}")
+    else:
+        out(f"  device key: {key}")
     for provider in names:
         spec = (cfg.get("providers") or {}).get(provider)
         if provider != ANTHROPIC and isinstance(spec, dict):
@@ -648,9 +653,9 @@ def cmd_add_user(args) -> int:
         if args.name in cfg["devices"]:
             raise Refused(f"device '{args.name}' already exists; nothing changed. "
                           "To issue a new key: remove-user then add-user")
-        names = [n for n in (args.providers or ANTHROPIC).split(",") if n]
+        names = [ANTHROPIC] if args.providers is None else [n.strip() for n in args.providers.split(",")]
         unknown = [n for n in names if n not in known_providers(cfg)]
-        if not names or unknown or len(set(names)) != len(names):
+        if not names or "" in names or unknown or len(set(names)) != len(names):
             raise Refused(f"--providers must list distinct names from: {', '.join(sorted(known_providers(cfg)))}; "
                           "nothing changed")
         removed = [k for k, v in cfg["devices"].items() if PLACEHOLDER in (device_key(v) or "")]
@@ -697,11 +702,66 @@ def read_credential(args) -> str:
         raise Refused("the credential file is not UTF-8 JSON; nothing changed")
 
 
+def install_credential_file(name: str, data: str):
+    """Runs as the service user (see as_service): credentials/<name> replaced
+    atomically, the previous file kept as <name>.prev."""
+    CREDENTIALS.mkdir(mode=0o700, exist_ok=True)
+    dfd = os.open(CREDENTIALS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=CREDENTIALS, prefix=f".{name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            target, prev = CREDENTIALS / name, CREDENTIALS / (name + ".prev")
+            if target.is_file() and not target.is_symlink():
+                prev.unlink(missing_ok=True)
+                os.link(target, prev)
+            os.replace(tmp, target)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def as_service(action):
+    """Run action() in a child with the service's uid and gid. The state directory
+    belongs to the service user, who could swap its entries between root's checks and
+    root's writes; as that user, a swapped entry only redirects its own writes."""
+    uid, gid = service_ids()
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        code = 0
+        try:
+            if os.geteuid() == 0:
+                os.setgroups([])
+                os.setgid(gid)
+                os.setuid(uid)
+            action()
+        except BaseException as exc:
+            os.write(wfd, f"{type(exc).__name__}: {exc}".encode()[:2000])
+            code = 1
+        finally:
+            os._exit(code)
+    os.close(wfd)
+    with os.fdopen(rfd, "rb") as pipe:
+        message = pipe.read().decode(errors="replace")
+    _, status = os.waitpid(pid, 0)
+    if status != 0:
+        raise Refused(message or "the child process failed")
+
+
 def cmd_install_credential(args) -> int:
     """Install a Sign in with ChatGPT credential made by siwc_login.py. It goes to the
-    state directory, owned by the service, because the service rewrites it at every
-    refresh. The service is stopped first so it cannot overwrite the new file with a
-    refresh of the old one."""
+    state directory, written as the service user, because the service rewrites it at
+    every refresh. The service is brought to a stopped state first so it cannot
+    overwrite the new file with a refresh of the old one, and is started again whether
+    or not the installation worked."""
     validate_name(args.provider, "provider name")
     with AdminLock():
         check_fixed_tree()
@@ -709,33 +769,44 @@ def cmd_install_credential(args) -> int:
         spec = (cfg.get("providers") or {}).get(args.provider)
         if not isinstance(spec, dict) or spec.get("kind") != "openai-siwc":
             raise Refused(f"'{args.provider}' is not an openai-siwc provider in {CONFIG}; nothing changed")
-        filename = spec.get("credential_file", f"{args.provider}-credential.json")
-        if not isinstance(filename, str) or not CRED_FILE_RE.match(filename):
-            raise Refused(f"provider '{args.provider}': credential_file must be a file name; nothing changed")
         data = read_credential(args)
         try:
             rec = json.loads(data)
         except ValueError:
             raise Refused("the credential is not JSON; nothing changed")
-        if not isinstance(rec, dict) or not all(isinstance(rec.get(k), str) and rec[k]
-                                                for k in ("access_token", "refresh_token", "client_id")):
-            raise Refused("the credential lacks access_token, refresh_token or client_id; nothing changed")
-        uid, gid = service_ids()
+        if not isinstance(rec, dict) or type(rec.get("expires_at")) not in (int, float) or not all(
+                isinstance(rec.get(k), str) and rec[k].strip() for k in ("access_token", "refresh_token", "client_id")):
+            raise Refused("the credential lacks access_token, refresh_token, client_id or expires_at; nothing changed")
         refuse_symlink(STATE_DIR, "state directory")
         if not STATE_DIR.exists():
+            uid, gid = service_ids()
             STATE_DIR.mkdir(mode=0o700)
             os.chown(STATE_DIR, uid, gid)
-        if systemctl_available() and unit_installed() and is_active():
-            stopped = systemctl("stop", UNIT_NAME, timeout=120)
-            if stopped.returncode != 0 or is_active():
-                raise Refused(f"could not stop {UNIT_NAME}; credential not installed")
-        path = STATE_DIR / filename
-        refuse_symlink(path, "credential")
-        if path.is_file():
-            write_private_file(path.with_name(filename + ".prev"), path.read_text(), 0o600, uid, gid)
-        write_private_file(path, data if data.endswith("\n") else data + "\n", 0o600, uid, gid)
-        out(f"credential for '{args.provider}' installed as {path} (owner {SERVICE_USER}, mode 600, "
-            f"previous copy kept as {filename}.prev). Delete the file you installed from.")
+        stopped_by_us = False
+        if systemctl_available() and unit_installed():
+            before = active_state()
+            if before not in QUIESCENT:
+                # activating and auto-restart can start a process that refreshes too
+                stopped = systemctl("stop", UNIT_NAME, timeout=120)
+                stopped_by_us = True
+                after = active_state()
+                if stopped.returncode != 0 or after not in QUIESCENT:
+                    raise Refused(f"could not bring {UNIT_NAME} to a stopped state (was {before}, now {after}); "
+                                  "credential not installed")
+        try:
+            as_service(lambda: install_credential_file(f"{args.provider}.json",
+                                                       data if data.endswith("\n") else data + "\n"))
+        except Refused as exc:
+            note = "the service was not running"
+            if stopped_by_us:
+                started = systemctl("start", UNIT_NAME, timeout=120)
+                note = ("service started again" if started.returncode == 0 and active_state() == "active"
+                        else f"service start FAILED; {journal_hint()}")
+            err(f"error: credential NOT installed ({exc}); {note}")
+            return EXIT_REFUSED
+        out(f"credential for '{args.provider}' installed as {CREDENTIALS / (args.provider + '.json')} "
+            f"(owner {SERVICE_USER}, mode 600; the previous one kept as .prev). "
+            "Delete the file you installed from.")
         return activate(cfg, what=f"credential for '{args.provider}'")
 
 
@@ -887,7 +958,7 @@ def cmd_rotate(args) -> int:
 def live_status(cfg: dict):
     # The status endpoint needs a key with the Claude grant.
     keys = [device_key(v) for v in cfg["devices"].values() if (device_key(v) or "").strip()
-            and PLACEHOLDER not in device_key(v) and ANTHROPIC in device_providers(v)]
+            and PLACEHOLDER not in device_key(v) and ANTHROPIC in (device_providers(v) or [])]
     if not keys:
         return None, "no device key available for an authenticated query"
     host, port = bind_address(cfg)
@@ -954,7 +1025,7 @@ def collect_status():
     report["accounts"] = accounts
     report["devices"] = [{"name": k, "key_suffix": (device_key(v)[-4:] if len(device_key(v) or "") >= 8 else None),
                           "placeholder": PLACEHOLDER in (device_key(v) or ""),
-                          "providers": device_providers(v)}
+                          "providers": device_providers(v) or []}
                          for k, v in cfg["devices"].items()]
     report["recent_events"] = ((state or {}).get("events") or [])[-5:]
     report["live"] = None
@@ -963,6 +1034,10 @@ def collect_status():
         if live is not None:
             report["live"] = {"active_account": live.get("active_account"),
                               "storage_errors": live.get("storage_errors"),
+                              "providers": {n: {k: p.get(k) for k in (
+                                  "kind", "prefix", "state", "reason", "last_error", "client_id", "host_id",
+                                  "access_token_min", "refresh_token_days")}
+                                  for n, p in (live.get("providers") or {}).items() if isinstance(p, dict)},
                               "accounts": {n: {k: a.get(k) for k in ("effective_util_5h", "effective_util_7d",
                                                                     "last_seen", "status")}
                                            for n, a in (live.get("accounts") or {}).items()}}
