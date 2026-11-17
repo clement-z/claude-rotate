@@ -409,12 +409,102 @@ it returns `503` + `Retry-After: <seconds to earliest reset>` — point a
 router's circuit breaker at that. Responses carry `x-rotate-account` and the
 upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 
+## Other providers
+
+The same process can hold credentials for other AI providers, so a coding agent
+holds only a device key you issued and can revoke. Each provider gets its own
+path prefix; the bare root stays the rotated Claude accounts, unchanged.
+
+```json
+"providers": {
+  "openai": {"kind": "openai-siwc"},
+  "openrouter": {"kind": "static-bearer", "upstream": "https://openrouter.ai/api",
+                 "token_file": "tokens/openrouter.token"}
+},
+"devices": {
+  "my-laptop": "dev-my-laptop-…",
+  "team-a": {"key": "dev-team-a-…", "providers": ["openai"]},
+  "desk": {"key": "dev-desk-…", "providers": ["anthropic", "openai", "openrouter"]}
+}
+```
+
+- **`static-bearer`**: `upstream` is a base URL, `token_file` a file next to the
+  account tokens. Requests under the prefix go to the upstream with
+  `Authorization: Bearer <token>` in place of the device key. For OpenRouter, an
+  employer's OpenAI-compatible endpoint, a model server on the LAN.
+- **`openai-siwc`**: one "Sign in with ChatGPT" credential, used on ChatGPT plan
+  usage against `https://api.openai.com`
+  ([OpenAI's flow](https://developers.openai.com/siwc/token-sharing-open-source)).
+  The credential file lives in the state directory (`credential_file`, default
+  `<name>-credential.json`) because the proxy rewrites it at every refresh. The
+  access token lasts an hour: the proxy refreshes it ten minutes before expiry,
+  one refresh at a time, writes the new tokens to disk before using them (the
+  previous file is kept as `.prev`), and refreshes once more if OpenAI answers a
+  request with 401. A refused refresh (`invalid_grant`, `invalid_client`,
+  `refresh_token_reused`, `_expired` or `_invalidated`) takes the provider down:
+  requests get 503 with the reason, the panel shows an alert, and a new sign-in
+  is needed.
+- **`prefix`** defaults to `/<name>`. It is one path segment and takes that
+  segment away from the Claude passthrough; `/v1`, `/api`, `/rotate` and
+  `/anthropic` are refused.
+- **Grants.** A device given as a string reaches the Claude accounts only, as
+  before. The object form lists what the key may reach; `anthropic` is the Claude
+  accounts. Anything else gets 403. The panel and its JSON endpoints need the
+  `anthropic` grant.
+
+Under a prefix every path and method is forwarded with the same request and
+response limits, admission limit and header hygiene as the Claude passthrough;
+the device key and upstream cookies are dropped, and the body is not rewritten.
+Nothing there is paced or rotated: a 429 from another provider goes back to the
+client and never touches a Claude account. Usage from Responses (`response.completed`),
+Chat Completions and Anthropic-format answers is recorded in the audit log with a
+`provider` field and counted per device. Costs come from `prices_per_mtok`; a model
+it does not name counts as $0 rather than at a made-up Claude price.
+
+**Signing in.** On a machine with a browser:
+
+```bash
+python3 siwc_login.py login --out openai-credential.json
+scp openai-credential.json server:
+# on the server
+sudo claude-rotate-admin install-credential openai --file openai-credential.json
+rm openai-credential.json      # and the laptop's copy
+```
+
+The proxy is then the only holder of the credential. Any other copy that
+refreshes kills it for both, so delete them. `claude-rotate-admin status` shows
+the registered client and host ids; `siwc_login.py login --client-id … --host-id …`
+signs in again to the same registration.
+
+**Codex.** Point a provider entry at the gateway and give Codex the device key, in
+`~/.codex/config.toml`:
+
+```toml
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "claude-rotate"
+base_url = "https://YOUR-TAILSCALE-HOST/openai/v1"
+wire_api = "responses"
+env_key = "CLAUDE_ROTATE_KEY"        # export CLAUDE_ROTATE_KEY=<device key>
+requires_openai_auth = false
+supports_websockets = false
+```
+
+Codex then sends `POST /openai/v1/responses` with `store: false` and
+`stream: true`, which the plan route requires, and `GET /openai/v1/models`. In
+this mode Codex shows no plan usage in `/status`. OpenAI lists request fields and
+tools this route refuses (`max_output_tokens`, `temperature`, image generation,
+file search, hosted MCP, `tool_search` among them); the proxy passes such errors
+through unchanged.
+
 ## Configuration (`config.json`)
 
 | Field | Meaning |
 |---|---|
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
-| `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
+| `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN`. Or `name → {"key": …, "providers": [...]}` to grant other providers; see [Other providers](#other-providers) |
+| `providers{}` | other upstreams under their own path prefix: `name → {"kind": "static-bearer", "upstream", "token_file"}` or `{"kind": "openai-siwc", "credential_file"}`, each with an optional `prefix`. See [Other providers](#other-providers) |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `accounts[].billing` | the account's plans over time, for the panel's Subscriptions card and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra"}]`. The first date sets the monthly renewal day; a later entry changes plan from its date and keeps the renewal day (Anthropic prorates upgrades). Add `"renews": true` to an entry that restarts the billing cycle, such as Pro to Max. Record a downgrade with the renewal date it takes effect on. A broken entry is ignored and shown as a panel alert. |
@@ -701,9 +791,11 @@ commercial or shared, use the API with metered billing instead.
 
 ## For the next agent (continuation notes)
 
-Everything lives in **`rotator.py` (~450 lines, FastAPI)** — read it top to
-bottom before changing anything. `phase0_proxy.py` is a standalone logging
-passthrough kept for debugging header behavior; not part of the service.
+The Claude side lives in **`rotator.py` (about 1,800 lines, FastAPI)** — read it
+top to bottom before changing anything. Other providers, their credentials and
+their usage parsing are in `providers.py`; `siwc_login.py` is the standalone
+sign-in helper for them. `phase0_proxy.py` is a standalone logging passthrough
+kept for debugging header behavior; not part of the service.
 
 Load-bearing implementation facts (each was verified empirically — keep them):
 

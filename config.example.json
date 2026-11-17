@@ -23,6 +23,7 @@
   "devices": {
     "my-laptop": "dev-my-laptop-REPLACE-WITH-RANDOM-HEX"
   },
+  "providers": {},
   "prices_per_mtok": {
     "fable": [
       10.0,
@@ -47,11 +48,6 @@
   },
   "alerts": {
     "device_tokens_per_hour": 5000000,
-    "expensive_model_patterns": [
-      "opus",
-      "fable",
-      "mythos"
-    ],
     "util_warn": 0.8
   },
   "public_url": ""

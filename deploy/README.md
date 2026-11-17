@@ -82,12 +82,12 @@ produces, and what any hand-built release must match:
 
 | Path | Owner / mode | Notes |
 | --- | --- | --- |
-| `/opt/claude-rotate/releases/<id>/` | root, dirs `0755`, files `0644` | `rotator.py`, `oai_compat.py`, `requirements*.txt/.lock`, `config.example.json`, `deploy/systemd_runner.py`, `deploy/claude_rotate_admin.py`, `.venv/`, `installed-requirements.txt`, `.claude-rotate-release` |
+| `/opt/claude-rotate/releases/<id>/` | root, dirs `0755`, files `0644` | `rotator.py`, `providers.py`, `oai_compat.py`, `requirements*.txt/.lock`, `config.example.json`, `deploy/systemd_runner.py`, `deploy/claude_rotate_admin.py`, `.venv/`, `installed-requirements.txt`, `.claude-rotate-release` |
 | `/opt/claude-rotate/current` | root symlink | switched atomically to a complete release only |
 | `/usr/local/sbin/claude-rotate-admin` | root `0755` | wrapper; runs the admin module from `current` with the release interpreter |
 | `/etc/systemd/system/claude-rotate.service` | root `0644` | copy of `deploy/claude-rotate.service` |
 | `/etc/claude-rotate/`, `tokens/` | `root:claude-rotate 0750` | `config.json` and `tokens/*.token` are `0640 root:claude-rotate` |
-| `/var/lib/claude-rotate`, `/var/log/claude-rotate` | `claude-rotate 0700` | created by systemd (`StateDirectory`/`LogsDirectory`); files `0600` |
+| `/var/lib/claude-rotate`, `/var/log/claude-rotate` | `claude-rotate 0700` | created by systemd (`StateDirectory`/`LogsDirectory`); files `0600`, including Sign in with ChatGPT credentials installed by `claude-rotate-admin install-credential` |
 | `claude-rotate` user/group | system account, home `/nonexistent`, no login | created once; an existing account is reused |
 
 Never copy a running developer checkout, its writable virtualenv, or its secrets

@@ -75,6 +75,43 @@ private state/log directories, but cannot modify installed code or credentials.
   while waiting, and before retrying. A network operation already in progress
   can continue until its own completion or timeout.
 
+## Other providers
+
+With a `providers` table, this one process holds every provider credential: the
+Claude account tokens, each static bearer token and the Sign in with ChatGPT
+credential. What that changes:
+
+- A compromise of the service process, its user or the host exposes all of them at
+  once, not only the Claude accounts. Keep the existing hardening (dedicated user,
+  root-owned code, private directories, loopback bind behind Tailscale Serve) and
+  give the host nothing else to do.
+- A device key reaches only what its entry grants. The string form keeps meaning
+  the Claude accounts alone; a device calling a provider it was not granted gets
+  403. Give a team or agent container a key that lists only what it needs. The
+  dashboard and its JSON endpoints, including the account switch, need the
+  `anthropic` grant.
+- Under a provider prefix the device key (`Authorization`, `x-api-key` and the
+  `key` query parameter), browser cookies and forwarding headers are dropped; the
+  provider's own bearer is the only credential sent, and only to that provider's
+  upstream. Upstream `Set-Cookie` headers are dropped on the way back. Other
+  request headers and the body pass through unchanged.
+- Static bearer tokens sit with the account tokens under `/etc/claude-rotate/tokens`
+  (read-only to the service). The ChatGPT credential sits in
+  `/var/lib/claude-rotate`, owned by the service with mode 0600, because each
+  refresh rotates the refresh token and the service must write the replacement.
+  The previous file is kept as `.prev`; its refresh token is dead once the next
+  refresh succeeds. Back up the state directory as a secret.
+- Tokens are never written to the audit log, status, alerts or error bodies. A
+  refused refresh shows only the OAuth error code.
+- One holder per ChatGPT credential. OpenAI's CI guidance warns against sharing one
+  login across machines, and a second holder that refreshes kills the credential
+  for both. Delete the copy on the machine where the sign-in ran. OpenAI documents
+  the plan route for a user's own open-source or self-hosted tool; it says nothing
+  about a gateway serving several of one person's agents. Revoking plan access per
+  transferred session is not available yet on OpenAI's side; disconnect the agent
+  in ChatGPT's settings to cut it off.
+- Revoking a device is still a config edit and a restart.
+
 ## Remaining limits
 
 This is intended for a trusted private deployment. It does not provide tenant

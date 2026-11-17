@@ -86,6 +86,7 @@ upstream token validity; also test a small Claude request through the proxy.
 | Accounts, device keys and rotation policy | `/etc/claude-rotate/config.json` |
 | Account tokens | `/etc/claude-rotate/tokens/` |
 | Saved rotation state | `/var/lib/claude-rotate/state.json` |
+| Sign in with ChatGPT credentials, rewritten at each refresh | `/var/lib/claude-rotate/<provider>-credential.json` |
 | Request audit and rotated backups | `/var/log/claude-rotate/audit.jsonl*` |
 | Active release symlink | `/opt/claude-rotate/current` |
 | Versioned code and virtual environments | `/opt/claude-rotate/releases/` |
@@ -111,6 +112,8 @@ the service active; otherwise it says `NOT live` and exits 2.
 | Show service, accounts, devices, active account | `sudo claude-rotate-admin status` (`--json` for scripts) |
 | Add an account, or replace an existing account's token | `sudo claude-rotate-admin add-token NAME` |
 | Add a device and print its two `export` lines | `sudo claude-rotate-admin add-user NAME` |
+| Add a device that may reach other providers | `sudo claude-rotate-admin add-user NAME --providers anthropic,openai` |
+| Install a ChatGPT credential made by `siwc_login.py` | `sudo claude-rotate-admin install-credential PROVIDER --file FILE` |
 | Revoke a device | `sudo claude-rotate-admin remove-user NAME` |
 | Remove an account and delete its token file | `sudo claude-rotate-admin remove-token NAME` |
 | Set the URL printed for new devices | `sudo claude-rotate-admin set-url https://HOST` |
@@ -160,6 +163,35 @@ while the service runs, from the live `/rotate/status` response together with
 `storage_errors`, per-account last-seen times and upstream status. A present
 token file says nothing about whether the token is still valid; only real
 upstream traffic does.
+
+## Other providers
+
+Providers are set in `config.json` under `providers` (see the README's "Other
+providers"); edit it with `sudoedit` and run `activate`. A static bearer token goes
+in `/etc/claude-rotate/tokens/` like an account token; `activate` restores its
+mode. A device reaches a provider only if its entry lists it: `add-user NAME
+--providers openai` mints such a key and prints the base URL to use.
+
+For an `openai-siwc` provider, sign in on a machine with a browser with
+`python3 siwc_login.py login`, copy the file to the server, then:
+
+```text
+sudo claude-rotate-admin install-credential openai --file openai-credential.json
+rm openai-credential.json
+```
+
+The command stops the service, installs the file in `/var/lib/claude-rotate`
+owned by the service with mode 0600 (keeping the previous one as `.prev`), and
+starts the service. Delete every other copy of the file: a second holder that
+refreshes it kills it for both.
+
+`status` lists each provider with its state, the access token's remaining minutes
+and the client and host ids. A provider marked down answers 503 with the reason.
+A refused refresh needs a new sign-in: run `siwc_login.py login --client-id ID
+--host-id ID` with the ids from `status` to reuse the registration, then
+`install-credential` again. A failing refresh that was not refused (OpenAI
+unreachable, a 5xx) is retried every minute and shown as a panel alert; requests
+keep working while the access token in hand lasts.
 
 ## Tailscale and dashboard
 
