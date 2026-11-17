@@ -184,8 +184,12 @@ rm openai.credential.json
 The command checks the file, brings the service to a stopped state, writes
 `/var/lib/claude-rotate/credentials/openai.json` as the service user with mode 0600
 (keeping the previous one as `.prev`), and starts the service again, also when the
-installation failed. It reports the installation and the restart separately. Delete every other copy of the file: a second holder that
-refreshes it kills it for both.
+installation failed. It reports the installation and the restart separately. If
+the new file is in place but the directory could not be synced, it says so: the
+service runs on the new credential, and a power loss before the disk catches up
+could bring back the previous file, so check the disk and install the same file
+again. Delete every other copy of the file: a second holder that refreshes it
+kills it for both.
 
 `status` (and `status --json`) lists each provider with its state (`ok`,
 `unavailable` or `down`), whether its credential is on disk, the access token's

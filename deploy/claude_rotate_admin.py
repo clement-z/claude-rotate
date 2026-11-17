@@ -62,6 +62,10 @@ PLACEHOLDER = "REPLACE-WITH"
 EXIT_OK, EXIT_REFUSED, EXIT_NOT_LIVE, EXIT_SETUP_NEEDED = 0, 1, 2, 3
 
 
+class NotDurable(Exception):
+    """The new file is in place, but the directory entry may not have reached the disk."""
+
+
 class Refused(Exception):
     """Nothing was changed; the message explains why."""
 
@@ -705,25 +709,40 @@ def read_credential(args) -> str:
 
 def install_credential_file(name: str, data: str):
     """Runs as the service user (see as_service): credentials/<name> replaced
-    atomically, the previous file kept as <name>.prev."""
+    atomically, the previous file kept as <name>.prev. Every step works relative to
+    one descriptor of the directory, so the directory synced is the one written."""
     CREDENTIALS.mkdir(mode=0o700, exist_ok=True)
     dfd = os.open(CREDENTIALS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        fd, tmp = tempfile.mkstemp(dir=CREDENTIALS, prefix=f".{name}.", suffix=".tmp")
+        tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
         try:
             with os.fdopen(fd, "w") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            target, prev = CREDENTIALS / name, CREDENTIALS / (name + ".prev")
-            if target.is_file() and not target.is_symlink():
-                prev.unlink(missing_ok=True)
-                os.link(target, prev)
-            os.replace(tmp, target)
+            try:
+                live = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                live = None
+            if live is not None and stat.S_ISREG(live.st_mode):
+                try:
+                    os.unlink(name + ".prev", dir_fd=dfd)
+                except FileNotFoundError:
+                    pass
+                os.chmod(name, 0o600, dir_fd=dfd)  # the backup shares its mode
+                os.link(name, name + ".prev", src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
         except BaseException:
-            Path(tmp).unlink(missing_ok=True)
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
             raise
-        os.fsync(dfd)
+        try:
+            os.fsync(dfd)
+        except OSError as exc:
+            raise NotDurable(f"the directory could not be synced ({exc.strerror or type(exc).__name__})")
     finally:
         os.close(dfd)
 
@@ -746,13 +765,15 @@ def as_service(action):
             action()
         except BaseException as exc:
             os.write(wfd, f"{type(exc).__name__}: {exc}".encode()[:2000])
-            code = 1
+            code = 2 if isinstance(exc, NotDurable) else 1
         finally:
             os._exit(code)
     os.close(wfd)
     with os.fdopen(rfd, "rb") as pipe:
         message = pipe.read().decode(errors="replace")
     _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
+        raise NotDurable(message.partition(": ")[2])
     if status != 0:
         raise Refused(message or "the child process failed")
 
@@ -785,6 +806,15 @@ def cmd_install_credential(args) -> int:
             STATE_DIR.mkdir(mode=0o700)
             os.chown(STATE_DIR, uid, gid)
         stopped_by_us = False
+
+        def restore():
+            if not stopped_by_us:
+                return "the service was not running"
+            started = systemctl("start", UNIT_NAME, timeout=120)
+            if started.returncode == 0 and active_state() == "active":
+                return "service started again"
+            return f"service start FAILED; {journal_hint()}"
+
         if systemctl_available() and unit_installed():
             before = active_state()
             if before not in QUIESCENT:
@@ -798,18 +828,23 @@ def cmd_install_credential(args) -> int:
                     raise Refused(f"could not bring {UNIT_NAME} to a stopped state (was {before}, now {after}"
                                   + (f": {detail}" if detail else "") + "); credential not installed")
                 stopped_by_us = True
+        live = CREDENTIALS / (args.provider + ".json")
         try:
             as_service(lambda: install_credential_file(f"{args.provider}.json",
                                                        data if data.endswith("\n") else data + "\n"))
-        except Refused as exc:
-            note = "the service was not running"
-            if stopped_by_us:
-                started = systemctl("start", UNIT_NAME, timeout=120)
-                note = ("service started again" if started.returncode == 0 and active_state() == "active"
-                        else f"service start FAILED; {journal_hint()}")
-            err(f"error: credential NOT installed ({exc}); {note}")
+        except NotDurable as exc:
+            code = activate(cfg, what=f"credential for '{args.provider}'")
+            err(f"warning: the new credential is in place as {live} and is the one the service reads, "
+                f"but {exc}: a power loss before the disk catches up could bring back the previous "
+                "file. Check the disk, then run install-credential again with the same file.")
+            return code if code != EXIT_OK else EXIT_REFUSED
+        except (Refused, OSError) as exc:  # OSError: pipe() or fork() in this process
+            err(f"error: credential NOT installed ({exc}); {restore()}")
             return EXIT_REFUSED
-        out(f"credential for '{args.provider}' installed as {CREDENTIALS / (args.provider + '.json')} "
+        except BaseException:
+            err(f"error: install-credential interrupted; {restore()}")
+            raise
+        out(f"credential for '{args.provider}' installed as {live} "
             f"(owner {SERVICE_USER}, mode 600; the previous one kept as .prev). "
             "Delete the file you installed from.")
         return activate(cfg, what=f"credential for '{args.provider}'")

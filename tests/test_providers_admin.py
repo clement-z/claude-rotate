@@ -10,13 +10,14 @@ import http.server
 import json
 import os
 import shlex
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_admin import FAKE_SYSTEMCTL, TOKEN, Fixture, mode  # noqa: E402
+from test_admin import ADMIN, FAKE_SYSTEMCTL, TOKEN, Fixture, mode  # noqa: E402
 
 PASS = 0
 FIXTURES = []
@@ -395,8 +396,59 @@ def test_readiness_of_object_devices():
               r.returncode == 0 and "configuration complete" in r.stdout and "device 'obj'" not in r.stdout, r)
 
 
+# The real entry point with one os function replaced first; the child that writes
+# as the service user is a fork, so it inherits the replacement.
+FAULTS = {
+    "dir-fsync": """
+import os, stat
+real = os.fsync
+def fsync(fd):
+    if stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == os.stat(CREDS).st_ino:
+        raise OSError(5, "Input/output error")
+    return real(fd)
+os.fsync = fsync
+""",
+    "fork": """
+import os
+def fork():
+    raise OSError(11, "Resource temporarily unavailable")
+os.fork = fork
+""",
+}
+
+
+def run_with_fault(f, fault, *args):
+    code = (f"import runpy, sys\nCREDS = {str(f.creds)!r}\n" + FAULTS[fault]
+            + f"sys.argv = [{str(ADMIN)!r}, *{list(args)!r}]\nrunpy.run_path({str(ADMIN)!r}, run_name='__main__')\n")
+    return subprocess.run([sys.executable, "-I", "-c", code], env=f.env, text=True, capture_output=True, timeout=60)
+
+
+def test_install_partial_failures():
+    f = make()
+    one, two = (json.dumps(credential(n)) + "\n" for n in (1, 2))
+    f.set_active(True)
+    check("a first install works", install(f, source(f, "one.json", one)).returncode == 0)
+    reset(f)
+    r = run_with_fault(f, "dir-fsync", "install-credential", "openai", "--file", str(source(f, "two.json", two)))
+    check("a directory sync failing after the rename says the new credential is in place and live",
+          r.returncode == 1 and "is the one the service reads" in r.stderr and "could not be synced" in r.stderr
+          and "NOT installed" not in r.stderr + r.stdout, r)
+    check("the new file is live, the old one kept as .prev, and the service runs on the new one",
+          f.live.read_text() == two and (f.creds / "openai.json.prev").read_text() == one
+          and stop_then_start(f.calls()) and seen_at(f, "start") == two
+          and sorted(p.name for p in f.creds.iterdir()) == ["openai.json", "openai.json.prev"], f.calls())
+
+    f.set_active(True)
+    reset(f)
+    r = run_with_fault(f, "fork", "install-credential", "openai", "--file", str(source(f, "one.json", one)))
+    check("fork() failing after the stop reports NOT installed and starts the service again",
+          r.returncode == 1 and "credential NOT installed" in r.stderr and "service started again" in r.stderr
+          and stop_then_start(f.calls()) and f.live.read_text() == two, (r, f.calls()))
+
+
 test_install_refusals()
 test_install_success_and_prev()
+test_install_partial_failures()
 test_install_unit_states_and_failures()
 test_add_user_providers()
 test_status_reports_providers()
