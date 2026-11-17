@@ -53,6 +53,9 @@ SERVICE_USER = "claude-rotate"
 SERVICE_GROUP = "claude-rotate"
 EXAMPLE = Path(__file__).resolve().parent.parent / "config.example.json"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+CRED_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")  # as providers.FILE_RE
+CRED_MAX_BYTES = 64 * 1024
+ANTHROPIC = "anthropic"  # the Claude accounts, as a device grant
 TOKEN_PREFIX = "sk-ant-oat01-"
 PLACEHOLDER = "REPLACE-WITH"
 EXIT_OK, EXIT_REFUSED, EXIT_NOT_LIVE, EXIT_SETUP_NEEDED = 0, 1, 2, 3
@@ -210,6 +213,23 @@ def validate_name(name: str, what="name"):
                       "starting with a letter or digit")
 
 
+def device_key(entry):
+    """The key of a devices entry: a string, or {"key": ..., "providers": [...]}."""
+    if isinstance(entry, dict):
+        entry = entry.get("key")
+    return entry if isinstance(entry, str) else None
+
+
+def device_providers(entry):
+    """What a devices entry may reach; the string form is the Claude accounts only."""
+    return entry.get("providers", [ANTHROPIC]) if isinstance(entry, dict) else [ANTHROPIC]
+
+
+def known_providers(cfg: dict) -> set:
+    table = cfg.get("providers") or {}
+    return {ANTHROPIC} | (set(table) if isinstance(table, dict) else set())
+
+
 def token_path(acct: dict) -> Path:
     # Same resolution as rotator.load_config: relative to the config directory.
     return CONFIG.parent / str(acct.get("token_file", ""))
@@ -336,16 +356,21 @@ def readiness(cfg: dict):
     devices = cfg["devices"]
     if not devices:
         problems.append("no device key: sudo claude-rotate-admin add-user NAME")
-    bad = [k for k, v in devices.items() if not isinstance(v, str) or not v.strip()]
+    bad = [k for k, v in devices.items() if not (device_key(v) or "").strip()]
     if bad:
         problems.append(f"device(s) with an empty key: {', '.join(bad)}")
-    placeholders = [k for k, v in devices.items() if isinstance(v, str) and PLACEHOLDER in v]
+    placeholders = [k for k, v in devices.items() if PLACEHOLDER in (device_key(v) or "")]
     if placeholders:
         problems.append(f"placeholder device key(s) from the example config: {', '.join(placeholders)}; "
                         "remove them (remove-user) and use add-user")
-    keys = [v for v in devices.values() if isinstance(v, str)]
+    keys = [device_key(v) for v in devices.values() if device_key(v)]
     if len(set(keys)) != len(keys):
         problems.append("device keys are not unique")
+    known = known_providers(cfg)
+    for k, v in devices.items():
+        names = device_providers(v)
+        if not isinstance(names, list) or not names or any(n not in known for n in names):
+            problems.append(f"device '{k}': providers must list names from: {', '.join(sorted(known))}")
     return not problems, problems, warnings
 
 
@@ -597,12 +622,19 @@ def cmd_add_token(args) -> int:
         return activate(cfg, restart=not args.no_restart, what=what)
 
 
-def print_device_block(cfg: dict, name: str, key: str):
+def print_device_block(cfg: dict, name: str, key: str, names=(ANTHROPIC,)):
     url = public_url(cfg)
     out(f"device '{name}' registered. On that machine set:")
-    out(f"  export ANTHROPIC_BASE_URL={shlex.quote(url)}")
-    out(f"  export CLAUDE_CODE_OAUTH_TOKEN={shlex.quote(key)}")
-    out(f"Dashboard: {url}/rotate/panel?key={key}")
+    if ANTHROPIC in names:
+        out(f"  export ANTHROPIC_BASE_URL={shlex.quote(url)}")
+        out(f"  export CLAUDE_CODE_OAUTH_TOKEN={shlex.quote(key)}")
+    for provider in names:
+        spec = (cfg.get("providers") or {}).get(provider)
+        if provider != ANTHROPIC and isinstance(spec, dict):
+            base = url + spec.get("prefix", "/" + provider) + ("/v1" if spec.get("kind") == "openai-siwc" else "")
+            out(f"  {provider}: base URL {base}, this key as the bearer token")
+    if ANTHROPIC in names:
+        out(f"Dashboard: {url}/rotate/panel?key={key}")
     if not cfg.get("public_url"):
         out("(set the real URL once with: sudo claude-rotate-admin set-url https://HOST)")
     out("The key is a bearer credential for this device only; do not share or commit it.")
@@ -616,17 +648,22 @@ def cmd_add_user(args) -> int:
         if args.name in cfg["devices"]:
             raise Refused(f"device '{args.name}' already exists; nothing changed. "
                           "To issue a new key: remove-user then add-user")
-        removed = [k for k, v in cfg["devices"].items() if isinstance(v, str) and PLACEHOLDER in v]
+        names = [n for n in (args.providers or ANTHROPIC).split(",") if n]
+        unknown = [n for n in names if n not in known_providers(cfg)]
+        if not names or unknown or len(set(names)) != len(names):
+            raise Refused(f"--providers must list distinct names from: {', '.join(sorted(known_providers(cfg)))}; "
+                          "nothing changed")
+        removed = [k for k, v in cfg["devices"].items() if PLACEHOLDER in (device_key(v) or "")]
         for name in removed:
             del cfg["devices"][name]
         key = f"dev-{args.name}-{secrets.token_hex(8)}"
-        while key in cfg["devices"].values():
+        while key in {device_key(v) for v in cfg["devices"].values()}:
             key = f"dev-{args.name}-{secrets.token_hex(8)}"
-        cfg["devices"][args.name] = key
+        cfg["devices"][args.name] = key if names == [ANTHROPIC] else {"key": key, "providers": names}
         write_config(cfg)
         for name in removed:
             out(f"removed placeholder device '{name}' from the example config")
-        print_device_block(cfg, args.name, key)
+        print_device_block(cfg, args.name, key, names)
         return activate(cfg, restart=not args.no_restart, what=f"key for '{args.name}'")
 
 
@@ -641,6 +678,65 @@ def cmd_remove_user(args) -> int:
         write_config(cfg)
         out(f"device '{args.name}' removed from the configuration")
         return activate(cfg, restart=not args.no_restart, what=f"revocation of '{args.name}'")
+
+
+def read_credential(args) -> str:
+    if args.file:
+        refuse_symlink(Path(args.file), "credential file")
+        with open(args.file, "rb") as handle:
+            data = handle.read(CRED_MAX_BYTES + 1)
+    elif sys.stdin.isatty():
+        raise Refused("pass --file FILE or pipe the credential file in; nothing changed")
+    else:
+        data = sys.stdin.buffer.read(CRED_MAX_BYTES + 1)
+    if len(data) > CRED_MAX_BYTES:
+        raise Refused("the credential file is too large to be one; nothing changed")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("the credential file is not UTF-8 JSON; nothing changed")
+
+
+def cmd_install_credential(args) -> int:
+    """Install a Sign in with ChatGPT credential made by siwc_login.py. It goes to the
+    state directory, owned by the service, because the service rewrites it at every
+    refresh. The service is stopped first so it cannot overwrite the new file with a
+    refresh of the old one."""
+    validate_name(args.provider, "provider name")
+    with AdminLock():
+        check_fixed_tree()
+        cfg = load_config()
+        spec = (cfg.get("providers") or {}).get(args.provider)
+        if not isinstance(spec, dict) or spec.get("kind") != "openai-siwc":
+            raise Refused(f"'{args.provider}' is not an openai-siwc provider in {CONFIG}; nothing changed")
+        filename = spec.get("credential_file", f"{args.provider}-credential.json")
+        if not isinstance(filename, str) or not CRED_FILE_RE.match(filename):
+            raise Refused(f"provider '{args.provider}': credential_file must be a file name; nothing changed")
+        data = read_credential(args)
+        try:
+            rec = json.loads(data)
+        except ValueError:
+            raise Refused("the credential is not JSON; nothing changed")
+        if not isinstance(rec, dict) or not all(isinstance(rec.get(k), str) and rec[k]
+                                                for k in ("access_token", "refresh_token", "client_id")):
+            raise Refused("the credential lacks access_token, refresh_token or client_id; nothing changed")
+        uid, gid = service_ids()
+        refuse_symlink(STATE_DIR, "state directory")
+        if not STATE_DIR.exists():
+            STATE_DIR.mkdir(mode=0o700)
+            os.chown(STATE_DIR, uid, gid)
+        if systemctl_available() and unit_installed() and is_active():
+            stopped = systemctl("stop", UNIT_NAME, timeout=120)
+            if stopped.returncode != 0 or is_active():
+                raise Refused(f"could not stop {UNIT_NAME}; credential not installed")
+        path = STATE_DIR / filename
+        refuse_symlink(path, "credential")
+        if path.is_file():
+            write_private_file(path.with_name(filename + ".prev"), path.read_text(), 0o600, uid, gid)
+        write_private_file(path, data if data.endswith("\n") else data + "\n", 0o600, uid, gid)
+        out(f"credential for '{args.provider}' installed as {path} (owner {SERVICE_USER}, mode 600, "
+            f"previous copy kept as {filename}.prev). Delete the file you installed from.")
+        return activate(cfg, what=f"credential for '{args.provider}'")
 
 
 def cmd_remove_token(args) -> int:
@@ -789,7 +885,9 @@ def cmd_rotate(args) -> int:
 
 
 def live_status(cfg: dict):
-    keys = [v for v in cfg["devices"].values() if isinstance(v, str) and v.strip() and PLACEHOLDER not in v]
+    # The status endpoint needs a key with the Claude grant.
+    keys = [device_key(v) for v in cfg["devices"].values() if (device_key(v) or "").strip()
+            and PLACEHOLDER not in device_key(v) and ANTHROPIC in device_providers(v)]
     if not keys:
         return None, "no device key available for an authenticated query"
     host, port = bind_address(cfg)
@@ -854,8 +952,9 @@ def collect_status():
             "eligible_for_rotate": not account_eligibility(cfg, state, acct["name"]),
         })
     report["accounts"] = accounts
-    report["devices"] = [{"name": k, "key_suffix": (v[-4:] if isinstance(v, str) and len(v) >= 8 else None),
-                          "placeholder": isinstance(v, str) and PLACEHOLDER in v}
+    report["devices"] = [{"name": k, "key_suffix": (device_key(v)[-4:] if len(device_key(v) or "") >= 8 else None),
+                          "placeholder": PLACEHOLDER in (device_key(v) or ""),
+                          "providers": device_providers(v)}
                          for k, v in cfg["devices"].items()]
     report["recent_events"] = ((state or {}).get("events") or [])[-5:]
     report["live"] = None
@@ -924,10 +1023,18 @@ def cmd_status(args) -> int:
     out("devices:")
     for device in report["devices"]:
         out(f"  {device['name']}: key ...{device['key_suffix'] or '????'}"
-            + (" PLACEHOLDER" if device["placeholder"] else ""))
+            + (" PLACEHOLDER" if device["placeholder"] else "")
+            + (f"; providers {', '.join(map(str, device['providers']))}"
+               if device["providers"] != [ANTHROPIC] else ""))
     if live:
         errors = live.get("storage_errors") or {}
         out("live /rotate/status: reachable; storage_errors: " + (json.dumps(errors) if errors else "none"))
+        for name, p in (live.get("providers") or {}).items():
+            if isinstance(p, dict):
+                out(f"  provider {name} ({p.get('kind')}, {p.get('prefix')}): {p.get('state')}"
+                    + (f": {p['reason']}" if p.get("reason") else "")
+                    + (f"; client_id {p['client_id']}, host id {p.get('host_id')}" if p.get("client_id") else "")
+                    + (f"; access token {p['access_token_min']} min" if p.get("access_token_min") is not None else ""))
     elif report.get("live_error"):
         out(f"live /rotate/status: unavailable ({report['live_error']})")
     events = report.get("recent_events") or []
@@ -969,7 +1076,14 @@ def build_parser():
     p.add_argument("--no-restart", action="store_true", help="store only; do not touch the service")
     p = add("add-user", cmd_add_user, "mint a device key and print the client settings", aliases=("add-device",))
     p.add_argument("name", metavar="NAME")
+    p.add_argument("--providers", help="comma-separated providers the key may reach "
+                   "(default: anthropic, the Claude accounts)")
     p.add_argument("--no-restart", action="store_true")
+    p = add("install-credential", cmd_install_credential,
+            "install a Sign in with ChatGPT credential made by siwc_login.py (from --file or stdin); "
+            "restarts the service")
+    p.add_argument("provider", metavar="PROVIDER")
+    p.add_argument("--file", help="read the credential from this file instead of stdin")
     p = add("remove-user", cmd_remove_user, "revoke a device key", aliases=("remove-device",))
     p.add_argument("name", metavar="NAME")
     p.add_argument("--no-restart", action="store_true")
