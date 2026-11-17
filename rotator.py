@@ -26,6 +26,11 @@ Per request, the proxy:
 
 GET /rotate/status (device-key auth) returns live state for the admin page;
 POST /rotate/switch lets the panel select or rotate the active account.
+
+Other providers (providers.py) sit under their own path prefix, such as /openai/v1/...
+for a Sign in with ChatGPT credential, and are forwarded without rotation or pacing.
+A device key given as a string reaches the Claude accounts only; an object
+{"key": ..., "providers": [...]} names what the device may reach.
 """
 
 import asyncio
@@ -44,7 +49,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.datastructures import MutableHeaders
 
+import providers
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
+from providers import ANTHROPIC
 
 ROOT = Path(__file__).parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_ROTATE_CONFIG", ROOT / "config.json"))
@@ -61,9 +68,10 @@ PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
 
 @asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(refresh_loop())
+    tasks = [asyncio.create_task(refresh_loop()), asyncio.create_task(providers.maintain_loop(PROVIDERS))]
     yield
-    task.cancel()
+    for task in tasks:
+        task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -111,9 +119,20 @@ def load_config() -> dict:
     # while one remains, so add-account-without-add-device can't open the proxy
     # to anyone who read the example (GitHub issue #2).
     devices = cfg.get("devices")
-    if not isinstance(devices, dict) or any(
-            not isinstance(k, str) or not k.strip() for k in devices.values()):
+    if not isinstance(devices, dict):
         raise SystemExit("devices must map names to nonempty device keys")
+    grants = {}
+    for name, entry in devices.items():
+        # A string is a key for the Claude accounts alone; an object names providers.
+        if isinstance(entry, dict):
+            names = entry.get("providers", [ANTHROPIC])
+            if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+                raise SystemExit(f"device '{name}': providers must be a nonempty list of provider names")
+            grants[name], entry = names, entry.get("key")
+        if not isinstance(entry, str) or not entry.strip():
+            raise SystemExit("devices must map names to nonempty device keys")
+        devices[name] = entry
+    cfg["device_grants"] = grants
     if len(set(devices.values())) != len(devices):
         raise SystemExit("device keys must be unique")
     bad = [d for d, k in devices.items() if "REPLACE-WITH" in k]
@@ -179,6 +198,19 @@ class RequestAdmission:
 app.add_middleware(RequestAdmission, limit=MAX_CONCURRENT_REQUESTS)
 app.add_middleware(PrivateResponseHeaders)
 DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
+PROVIDERS = providers.load_providers(CFG, CONFIG_PATH.parent, STATE_PATH.parent)
+PREFIXES = {p.prefix[1:]: p for p in PROVIDERS.values()}
+for _device, _names in CFG.get("device_grants", {}).items():
+    if set(_names) - {ANTHROPIC} - set(PROVIDERS):
+        raise SystemExit(f"device '{_device}': unknown provider(s) "
+                         + ", ".join(sorted(set(_names) - {ANTHROPIC} - set(PROVIDERS))))
+DEVICE_GRANTS = {d: frozenset(n) for d, n in CFG.get("device_grants", {}).items()}
+
+
+def granted(device: str, provider: str) -> bool:
+    return provider in DEVICE_GRANTS.get(device, (ANTHROPIC,))
+
+
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
 THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
@@ -698,6 +730,7 @@ async def rotate_status(request: Request):
         "recent_events": STATE["events"][-10:],
         "storage_errors": STORAGE_ERRORS,
         "weekly": weekly_outlook(now),
+        "providers": {name: p.status() for name, p in PROVIDERS.items()},
     }
 
 
@@ -745,8 +778,10 @@ async def rotate_switch(request: Request):
 def panel_allowed(request: Request) -> bool:
     # Tailscale Serve sets Tailscale-User-Login for tailnet users and strips client
     # copies; startup enforces a loopback bind, so only Serve (or a local process) can add it.
+    # The panel runs the Claude accounts, so a key needs that grant to open it.
+    device = device_from_request(request)
     return ((PANEL_TAILNET and bool(request.headers.get("tailscale-user-login")))
-            or device_from_request(request) is not None)
+            or (device is not None and granted(device, ANTHROPIC)))
 
 
 def device_from_request(request: Request) -> str | None:
@@ -798,17 +833,22 @@ ALERT_CFG = CFG.get("alerts", {
 })
 
 
-def price_for(model: str | None) -> list[float]:
+def price_for(model: str | None, default=DEFAULT_PRICE) -> list[float] | None:
     model = model if isinstance(model, str) else None
     for pat, p in PRICES.items():
         if model and pat in model:
             return p
-    return DEFAULT_PRICE
+    return default
 
 
-def api_cost(model: str | None, usage: dict) -> float:
-    """API-equivalent $ for one request: in + out + cache read (0.1x) + cache write (1.25x)."""
-    p_in, p_out = price_for(model)
+def api_cost(model: str | None, usage: dict, provider=None) -> float:
+    """API-equivalent $ for one request: in + out + cache read (0.1x) + cache write (1.25x).
+    Another provider's model costs 0 unless prices_per_mtok names it: the Claude
+    default price would be invented."""
+    price = price_for(model, None if provider else DEFAULT_PRICE)
+    if price is None:
+        return 0.0
+    p_in, p_out = price
     return (
         usage.get("input_tokens", 0) * p_in
         + usage.get("output_tokens", 0) * p_out
@@ -948,15 +988,16 @@ def aggregate_audit() -> dict:
         model = model if isinstance(model, str) else None
         usage = rec.get("usage") or {}
         ts = rec["_ts"]
-        cost = api_cost(model, usage)
+        provider = rec.get("provider") if isinstance(rec.get("provider"), str) else None
+        cost = api_cost(model, usage, provider)
         dev = rec.get("device", "?")
         meta = device_meta.setdefault(dev, {})
         if ts >= meta.get("last_ts", 0):
             meta.update({"last_ts": ts, "last_model": model,
-                         "last_account": rec.get("account")})
+                         "last_account": rec.get("account"), "last_provider": provider})
         bump(by_device, rec.get("device", "?"), usage, cost)
         bump(by_model, model or "?", usage, cost)
-        bump(by_account, rec.get("account", "?"), usage, cost)
+        bump(by_account, rec.get("account") or provider or "?", usage, cost)
         if ts >= hour_ago:
             total = sum(usage.get(k, 0) for k in (
                 "input_tokens", "output_tokens", "cache_creation_input_tokens"))
@@ -988,6 +1029,8 @@ def aggregate_audit() -> dict:
             "last_seen_min": round((now - last_ts) / 60) if last_ts else None,
             "last_model": meta.get("last_model"),
             "last_account": meta.get("last_account"),
+            "last_provider": meta.get("last_provider"),
+            "providers": sorted(DEVICE_GRANTS.get(name, (ANTHROPIC,))),
             "req_1h": device_hour_reqs.get(name, 0),
             "tokens_1h": device_hour_tokens.get(name, 0),
         }
@@ -1013,7 +1056,7 @@ def roll_up(rec: dict, day: str, ledger_only: bool = False) -> None:
     model = rec.get("model")
     model = model if isinstance(model, str) else None
     usage = rec.get("usage") or {}
-    cost = api_cost(model, usage)
+    cost = api_cost(model, usage, rec.get("provider") if isinstance(rec.get("provider"), str) else None)
     if isinstance(rec.get("account"), str):
         bump(ROLLUP.setdefault("accounts", {}).setdefault(day, {}), rec["account"], usage, cost)
     if not ledger_only:
@@ -1230,6 +1273,14 @@ async def rotate_stats(request: Request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
     out = aggregate_audit() | {"periods": usage_periods(), "billing": billing_report()}
     out["alerts"] = out["alerts"] + [{"level": "warn", "text": f"billing ignored: {e}"} for e in BILLING_ERRORS]
+    for name, p in PROVIDERS.items():
+        s = p.status()
+        if s["reason"]:
+            out["alerts"].append({"level": "warn", "text": f"provider {name} is down: {s['reason']}"})
+        for problem in (s.get("unsaved"), s.get("last_error") and f"token refresh failing ({s['last_error']}); "
+                        f"the access token in hand lasts {s.get('access_token_min')} min"):
+            if problem:
+                out["alerts"].append({"level": "warn", "text": f"provider {name}: {problem}"})
     return out
 
 
@@ -1421,7 +1472,8 @@ async function refresh(){
   const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{}); ST=st;
   const names=accts.map(([n])=>n), i=names.indexOf(st.active_account), nxt=names.slice(i+1).concat(names.slice(0,i+1)).find(n=>n!==st.active_account&&usable(st.accounts[n]));
   $('host').textContent=location.host||'';
-  $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is under its switch thresholds"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`;
+  $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is under its switch thresholds"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`
+    +Object.entries(st.providers||{}).map(([n,p])=>`<span class="pill" title="${esc(p.reason||p.unsaved||p.last_error||p.kind)}"><span class="dot" style="background:var(--${p.state!=='ok'?'crit':p.unsaved||p.last_error?'warn':'good'})"></span>${esc(n)}</span>`).join('');
   $('alerts').innerHTML=(stats.alerts||[]).map(a=>`<div class="banner ${a.level==='warn'?'warn':''}">&#9888; <span><b>${a.level==='warn'?'Warning':'Note'}</b> ${esc(a.text)}</span></div>`).join('');
   // headline figures
   const last=(wk.series||[]).slice(-1)[0], now=last?last[0]:Date.now()/1000;
@@ -1450,7 +1502,7 @@ async function refresh(){
   let dh=`<tr><th>Device</th><th class="l">Status</th><th class="l">Last model</th><th>24 h</th><th>7 d</th><th>30 d</th><th>All time${per.since?' <span class="muted">since '+esc(per.since)+'</span>':''}</th><th>30-day trend</th></tr>`;
   for(const name of Object.keys(roster).concat(gone)){const d=roster[name], removed=!d;
     const status=removed?'removed':d.online?'<span class="dot" style="background:var(--good)"></span>online':'<span class="dot" style="background:var(--muted)"></span>idle';
-    dh+=`<tr class="${removed?'removed':''}"><td><b>${esc(name)}</b>${d?'<span class="sub">key '+esc(d.key_suffix)+'</span>':''}</td><td class="l">${status}${d?'<span class="sub">'+ago(d.last_seen_min)+'</span>':''}</td><td class="l" data-l="Last model">${esc(d&&d.last_model||'–')}</td>`
+    dh+=`<tr class="${removed?'removed':''}"><td><b>${esc(name)}</b>${d?'<span class="sub">key '+esc(d.key_suffix)+((d.providers||[]).join()!=='anthropic'?' &middot; '+esc((d.providers||[]).join(', ')):'')+'</span>':''}</td><td class="l">${status}${d?'<span class="sub">'+ago(d.last_seen_min)+'</span>':''}</td><td class="l" data-l="Last model">${d&&d.last_provider?esc(d.last_provider)+' &middot; ':''}${esc(d&&d.last_model||'–')}</td>`
       +cell((stats.by_device||{})[name],'24 h')+cell(((per['7d']||{}).device||{})[name],'7 d')+cell(((per['30d']||{}).device||{})[name],'30 d')
       +cell(((per.all||{}).device||{})[name],'All time'+(per.since?' since '+esc(per.since):''))+`<td data-l="30-day trend">${spark((per.trend||{})[name])}</td></tr>`}
   $('devices').innerHTML=dh;
@@ -1557,6 +1609,10 @@ async def openai_chat(request: Request):
     if device is None:
         return JSONResponse({"error": {"message": "claude-rotate: unknown device key",
                                        "type": "authentication_error"}}, status_code=401)
+    if not granted(device, ANTHROPIC):
+        return JSONResponse({"error": {"message": f"claude-rotate: device '{device}' may not use "
+                                                  "the Claude accounts", "type": "permission_error"}},
+                            status_code=403)
     try:
         oai = json.loads(await bounded_body(request))
     except (ValueError, RecursionError):
@@ -1636,39 +1692,118 @@ async def openai_chat(request: Request):
     return JSONResponse(anthropic_to_oai(data), headers=resp_headers)
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def proxy(request: Request, path: str):
-    device = device_from_request(request)
-    if device is None:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "authentication_error",
-                                        "message": "claude-rotate: unknown device key"}},
-            status_code=401)
+def forward_headers(request: Request) -> dict:
+    """Client headers minus hop-by-hop, browser and reverse-proxy ones, and x-api-key."""
+    fwd = {k: v for k, v in request.headers.items()
+           if k.lower() not in HOP | PRIVATE_HEADERS
+           and not k.lower().startswith(("tailscale-", "x-forwarded-", "sec-fetch-"))}
+    fwd["accept-encoding"] = "identity"
+    fwd.pop("x-api-key", None)
+    return fwd
 
-    body = await bounded_body(request)
-    fwd_headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in HOP | PRIVATE_HEADERS
-                   and not k.lower().startswith(("tailscale-", "x-forwarded-", "sec-fetch-"))}
-    fwd_headers["accept-encoding"] = "identity"
-    fwd_headers.pop("x-api-key", None)
 
-    model = None
-    if body and request.method == "POST":
-        try:
-            model = json.loads(body).get("model")
-            if not isinstance(model, str):
-                model = None
-        except (ValueError, RecursionError, AttributeError):
-            pass
-
-    # Preserve raw upstream query spelling/order while removing local credentials.
+def upstream_query(request: Request) -> str:
+    """The raw query, spelling and order kept, without the device key."""
     try:
         query = request.scope["query_string"].decode("ascii")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="query string must use percent-encoding")
     query = "&".join(part for part in query.split("&")
                      if unquote_plus(part.partition("=")[0]) != "key")
-    url = "/" + path + ("?" + query if query else "")
+    return "?" + query if query else ""
+
+
+def request_model(request: Request, body: bytes) -> str | None:
+    if body and request.method == "POST":
+        try:
+            model = json.loads(body).get("model")
+            return model if isinstance(model, str) else None
+        except (ValueError, RecursionError, AttributeError):
+            pass
+    return None
+
+
+async def provider_proxy(request: Request, prov, rest: str):
+    """A plain forward to another provider: its own client and credential, the device
+    key stripped, no pacing or rotation, so its 429s never touch a Claude account."""
+    def refuse(status, message, kind):
+        return JSONResponse({"error": {"message": f"claude-rotate: {message}", "type": kind}},
+                            status_code=status)
+
+    device = device_from_request(request)
+    if device is None:
+        return refuse(401, "unknown device key", "authentication_error")
+    if not granted(device, prov.name):
+        return refuse(403, f"device '{device}' may not use provider '{prov.name}'", "permission_error")
+    body = await bounded_body(request)
+    fwd = forward_headers(request)
+    fwd.pop("authorization", None)
+    url = "/" + rest + upstream_query(request)
+    rec = {"device": device, "provider": prov.name, "path": prov.prefix + "/" + rest,
+           "method": request.method, "model": request_model(request, body)}
+    try:
+        upstream, retries = await prov.send(request.method, url, fwd, body)
+    except providers.ProviderDown as exc:
+        audit(rec | {"status": 503})
+        return refuse(503, f"provider '{prov.name}' is down: {exc}", "provider_unavailable")
+    except httpx.HTTPError as exc:
+        audit(rec | {"status": 502})
+        return refuse(502, f"provider '{prov.name}' is unreachable ({type(exc).__name__})", "api_error")
+    rec["status"] = upstream.status_code
+    if retries:
+        rec["retries"] = retries
+    # Upstream cookies belong to the upstream, not to this host.
+    resp_headers = {k: v for k, v in upstream.headers.items()
+                    if k.lower() not in HOP | {"content-encoding", "set-cookie"}}
+    resp_headers["x-rotate-provider"] = prov.name
+
+    if "text/event-stream" in upstream.headers.get("content-type", ""):
+        meter = providers.SseUsage()
+
+        async def relay():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    meter.feed(chunk)
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                rec["usage"] = meter.usage
+                audit(rec)
+
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers,
+                                 media_type=upstream.headers.get("content-type"))
+
+    content = await bounded_response(upstream)
+    try:
+        rec["usage"] = providers.usage_of(json.loads(content))
+    except (ValueError, RecursionError):
+        pass
+    audit(rec)
+    return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def proxy(request: Request, path: str):
+    prov = PREFIXES.get(path.partition("/")[0])
+    if prov is not None:
+        return await provider_proxy(request, prov, path.partition("/")[2])
+    device = device_from_request(request)
+    if device is None:
+        return JSONResponse(
+            {"type": "error", "error": {"type": "authentication_error",
+                                        "message": "claude-rotate: unknown device key"}},
+            status_code=401)
+    if not granted(device, ANTHROPIC):
+        return JSONResponse(
+            {"type": "error", "error": {"type": "permission_error",
+                                        "message": f"claude-rotate: device '{device}' may not use "
+                                                   "the Claude accounts"}},
+            status_code=403)
+
+    body = await bounded_body(request)
+    fwd_headers = forward_headers(request)
+    model = request_model(request, body)
+    url = "/" + path + upstream_query(request)
     upstream, account, retries, noted, _verdict = await send_upstream(
         request.method, url, fwd_headers, body, request)
 
