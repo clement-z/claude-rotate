@@ -9,6 +9,9 @@ the credential over a secure channel, let the server own later refreshes):
                               [--agent-name claude-rotate] [--client-id ID --host-id ID]
   python3 siwc_login.py show FILE      account, client, scopes and expiry, never tokens
 
+FILE defaults to ~/.config/claude-rotate/openai.credential.json (directory mode 700),
+outside any checkout. Then:
+
   scp FILE server:   then on the server:
   sudo claude-rotate-admin install-credential openai --file FILE && rm FILE
 
@@ -27,6 +30,7 @@ ported from the devbox siwc.py test helper.
 """
 import argparse
 import base64
+import tempfile
 import hashlib
 import http.server
 import json
@@ -42,6 +46,8 @@ import webbrowser
 from datetime import datetime, timezone
 
 AUTH_BASE = os.environ.get("SIWC_AUTH_BASE", "https://auth.openai.com").rstrip("/")
+ISSUER = "https://auth.openai.com"  # checked in the ID token, stand-in or not
+DEFAULT_OUT = os.path.expanduser("~/.config/claude-rotate/openai.credential.json")
 RESOURCE = "https://api.openai.com/v1"  # the token's audience, fixed by the flow
 SCOPES = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
 PLAN_SCOPE = "chatgpt.tokens.use.direct"
@@ -79,27 +85,46 @@ def post_form(url, fields):
 
 
 def write_private(path, text):
-    """Atomic owner-only write; a file it replaces is kept as <path>.prev."""
-    tmp = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    if os.path.exists(path):
-        os.replace(path, path + ".prev")
-    os.replace(tmp, path)
+    """Atomic owner-only write: a fresh temporary file (mkstemp, mode 600), the live
+    name kept until the rename, the file it replaces kept as <path>.prev."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".siwc-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.isfile(path) and not os.path.islink(path):
+            prev = path + ".prev"
+            if os.path.lexists(prev):
+                os.unlink(prev)
+            os.link(path, prev)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 class Callback(http.server.BaseHTTPRequestHandler):
     result = None
+    state = None  # a callback carrying another state is answered and ignored
 
     def do_GET(self):
         url = urllib.parse.urlsplit(self.path)
         if url.path != CALLBACK_PATH:
             self.send_error(404)
             return
-        Callback.result = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        if params.get("state") != Callback.state:
+            self.send_error(400, "state does not match this sign-in; ignored")
+            return
+        Callback.result = params
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -128,6 +153,12 @@ def cmd_login(args):
         params["client_id"], params["agent_name_hint"] = "dynamic_agent_client", args.agent_name
     url = f"{AUTH_BASE}/api/accounts/authorize?" + urllib.parse.urlencode(params)
 
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if args.out == DEFAULT_OUT:
+        os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    if not os.path.isdir(out_dir):
+        die(f"{out_dir} does not exist")
+    Callback.state = state
     server = http.server.HTTPServer((os.environ.get("SIWC_BIND", "127.0.0.1"), args.port), Callback)
     server.timeout = 1
     print("Open this address in your browser and approve the request:\n")
@@ -138,15 +169,13 @@ def cmd_login(args):
         except Exception:
             pass
     print(f"Waiting for the callback on {redirect_uri} (5 minutes) ...", flush=True)
-    deadline = time.time() + 300
-    while Callback.result is None and time.time() < deadline:
+    deadline = time.monotonic() + 300
+    while Callback.result is None and time.monotonic() < deadline:
         server.handle_request()
     server.server_close()
     cb = Callback.result
     if cb is None:
         die("no callback received")
-    if cb.get("state") != state:
-        die("callback state does not match; attempt dropped")
     if cb.get("error"):
         die(f"authorization refused: {cb['error']} {cb.get('error_description', '')}")
     if "code" not in cb:
@@ -167,6 +196,8 @@ def cmd_login(args):
         if not resp.get(key):
             die(f"token response lacks {key}")
     claims = jwt_payload(resp["id_token"])
+    if claims.get("iss") != ISSUER:
+        die("ID token issuer is not OpenAI's")
     aud = claims.get("aud")
     if client_id not in (aud if isinstance(aud, list) else [aud]):
         die("ID token audience is not the issued client_id")
@@ -214,7 +245,7 @@ def main():
     parser = argparse.ArgumentParser(prog="siwc_login.py", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("login", help="sign in through the browser and write the credential file")
-    p.add_argument("--out", default="openai-credential.json")
+    p.add_argument("--out", default=DEFAULT_OUT)
     p.add_argument("--port", type=int, default=1455)
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--agent-name", default="claude-rotate")

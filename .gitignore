@@ -10,3 +10,7 @@ __pycache__/
 .omc/
 usage_history.json
 device_usage.json
+# Sign in with ChatGPT credentials (siwc_login.py, the state directory)
+*.credential.json
+*.credential.json.prev
+credentials/
