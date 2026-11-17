@@ -41,7 +41,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import unquote_plus
+from urllib.parse import quote, unquote, unquote_plus
 
 import httpx
 import uvicorn
@@ -61,7 +61,7 @@ AUDIT_PATH = Path(os.environ.get("CLAUDE_ROTATE_AUDIT", ROOT / "logs" / "audit.j
 UPSTREAM = "https://api.anthropic.com"
 HOP = {
     "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
+    "te", "trailer", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
 }
 # These belong to the local browser or reverse-proxy trust boundary.
 PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
@@ -75,7 +75,8 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
-client =httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, connect=15.0))
+client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, connect=15.0),
+                           cookies=providers.NO_COOKIES)
 state_lock = asyncio.Lock()
 
 
@@ -123,11 +124,15 @@ def load_config() -> dict:
         raise SystemExit("devices must map names to nonempty device keys")
     grants = {}
     for name, entry in devices.items():
-        # A string is a key for the Claude accounts alone; an object names providers.
+        # A string is a key for the Claude accounts alone; an object must name what it
+        # grants, so a missing or misspelt "providers" cannot fall back to the Claude
+        # accounts and the panel.
         if isinstance(entry, dict):
-            names = entry.get("providers", [ANTHROPIC])
-            if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
-                raise SystemExit(f"device '{name}': providers must be a nonempty list of provider names")
+            names = entry.get("providers")
+            if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names) \
+                    or set(entry) - {"key", "providers"}:
+                raise SystemExit(f"device '{name}': an object needs \"key\" and a nonempty "
+                                 "\"providers\" list, and nothing else")
             grants[name], entry = names, entry.get("key")
         if not isinstance(entry, str) or not entry.strip():
             raise SystemExit("devices must map names to nonempty device keys")
@@ -974,6 +979,7 @@ def aggregate_audit() -> dict:
     by_device: dict = {}
     by_model: dict = {}
     by_account: dict = {}
+    by_provider: dict = {}
     device_hour_tokens: dict = {}
     device_hour_reqs: dict = {}
     device_meta: dict = {}
@@ -997,7 +1003,10 @@ def aggregate_audit() -> dict:
                          "last_account": rec.get("account"), "last_provider": provider})
         bump(by_device, rec.get("device", "?"), usage, cost)
         bump(by_model, model or "?", usage, cost)
-        bump(by_account, rec.get("account") or provider or "?", usage, cost)
+        if provider:
+            bump(by_provider, provider, usage, cost)  # apart: a provider may share an account's name
+        else:
+            bump(by_account, rec.get("account", "?"), usage, cost)
         if ts >= hour_ago:
             total = sum(usage.get(k, 0) for k in (
                 "input_tokens", "output_tokens", "cache_creation_input_tokens"))
@@ -1024,7 +1033,7 @@ def aggregate_audit() -> dict:
         meta = device_meta.get(name, {})
         last_ts = meta.get("last_ts")
         devices[name] = {
-            "key_suffix": "…" + key[-4:],
+            "key_suffix": "…" + key[-4:] if len(key) >= 8 else None,  # a short key would show whole
             "online": bool(last_ts and now - last_ts < 600),
             "last_seen_min": round((now - last_ts) / 60) if last_ts else None,
             "last_model": meta.get("last_model"),
@@ -1038,7 +1047,7 @@ def aggregate_audit() -> dict:
     return {"window": "last 24h (partial)" if limited else "last 24h",
             "history_limited": limited, "retained_records": len(records),
             "devices": devices, "by_device": by_device,
-            "by_model": by_model, "by_account": by_account, "alerts": alerts}
+            "by_model": by_model, "by_account": by_account, "by_provider": by_provider, "alerts": alerts}
 
 
 USAGE_PATH = STATE_PATH.with_name("device_usage.json")
@@ -1276,11 +1285,10 @@ async def rotate_stats(request: Request):
     for name, p in PROVIDERS.items():
         s = p.status()
         if s["reason"]:
-            out["alerts"].append({"level": "warn", "text": f"provider {name} is down: {s['reason']}"})
-        for problem in (s.get("unsaved"), s.get("last_error") and f"token refresh failing ({s['last_error']}); "
-                        f"the access token in hand lasts {s.get('access_token_min')} min"):
-            if problem:
-                out["alerts"].append({"level": "warn", "text": f"provider {name}: {problem}"})
+            out["alerts"].append({"level": "warn", "text": f"provider {name} is {s['state']}: {s['reason']}"})
+        elif s.get("last_error"):
+            out["alerts"].append({"level": "warn", "text": f"provider {name}: token refresh failing "
+                                  f"({s['last_error']}); the access token in hand lasts {s['access_token_min']} min"})
     return out
 
 
@@ -1473,7 +1481,7 @@ async function refresh(){
   const names=accts.map(([n])=>n), i=names.indexOf(st.active_account), nxt=names.slice(i+1).concat(names.slice(0,i+1)).find(n=>n!==st.active_account&&usable(st.accounts[n]));
   $('host').textContent=location.host||'';
   $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is under its switch thresholds"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`
-    +Object.entries(st.providers||{}).map(([n,p])=>`<span class="pill" title="${esc(p.reason||p.unsaved||p.last_error||p.kind)}"><span class="dot" style="background:var(--${p.state!=='ok'?'crit':p.unsaved||p.last_error?'warn':'good'})"></span>${esc(n)}</span>`).join('');
+    +Object.entries(st.providers||{}).map(([n,p])=>`<span class="pill" title="${esc(p.reason||p.last_error||p.kind)}"><span class="dot" style="background:var(--${['down','unavailable'].includes(p.state)?'crit':p.state!=='ok'||p.last_error?'warn':'good'})"></span>${esc(n)}</span>`).join('');
   $('alerts').innerHTML=(stats.alerts||[]).map(a=>`<div class="banner ${a.level==='warn'?'warn':''}">&#9888; <span><b>${a.level==='warn'?'Warning':'Note'}</b> ${esc(a.text)}</span></div>`).join('');
   // headline figures
   const last=(wk.series||[]).slice(-1)[0], now=last?last[0]:Date.now()/1000;
@@ -1512,7 +1520,8 @@ async function refresh(){
     return `<tr><td>${esc(n)}</td><td>${fmt(b.requests)}</td><td>${fmt(tok(b))}</td><td>${prompt?Math.round((b.cache_read||0)/prompt*100):0}%</td><td>${money(b.cost_usd)}</td></tr>`}).join('');
   const head='<tr><th>{}</th><th>Requests</th><th>Tokens</th><th>From cache</th><th>$ equiv</th></tr>';
   $('models').innerHTML=head.replace('{}','Model')+rows(PERIODS[period]==='24h'?stats.by_model:(per[PERIODS[period]]||{}).model);
-  $('by-account').innerHTML=head.replace('{}','Account')+rows(stats.by_account);
+  $('by-account').innerHTML=head.replace('{}','Account')+rows(stats.by_account)
+    +rows(Object.fromEntries(Object.entries(stats.by_provider||{}).map(([n,b])=>[n+' (provider)',b])));
   $('events').innerHTML=(st.recent_events||[]).slice().reverse().map(e=>`<div><span class="muted">${esc(String(e.ts||'').slice(5,16).replace('T',' '))}</span><span>${esc(e.from)} &rarr; ${esc(e.to)}</span><span class="badge" style="margin-left:auto">${esc(e.reason)}</span></div>`).join('')||'<span class="muted">none</span>';
   $('upd').textContent='updated '+new Date().toLocaleTimeString();
 }
@@ -1692,14 +1701,56 @@ async def openai_chat(request: Request):
     return JSONResponse(anthropic_to_oai(data), headers=resp_headers)
 
 
+def connection_nominated(headers) -> set:
+    """Headers a Connection header names are hop-by-hop too (RFC 9110, section 7.6.1)."""
+    return {t.strip().lower() for t in headers.get("connection", "").split(",") if t.strip()}
+
+
 def forward_headers(request: Request) -> dict:
     """Client headers minus hop-by-hop, browser and reverse-proxy ones, and x-api-key."""
+    drop = HOP | PRIVATE_HEADERS | connection_nominated(request.headers)
     fwd = {k: v for k, v in request.headers.items()
-           if k.lower() not in HOP | PRIVATE_HEADERS
+           if k.lower() not in drop
            and not k.lower().startswith(("tailscale-", "x-forwarded-", "sec-fetch-"))}
     fwd["accept-encoding"] = "identity"
     fwd.pop("x-api-key", None)
     return fwd
+
+
+def response_headers(upstream: httpx.Response, *extra: str) -> dict:
+    drop = HOP | {"content-encoding", *extra} | connection_nominated(upstream.headers)
+    return {k: v for k, v in upstream.headers.items() if k.lower() not in drop}
+
+
+def upstream_path(request: Request, drop: int = 0) -> str:
+    """The path as the client sent it, percent-encoding kept, without its first `drop`
+    segments. Rebuilt from the decoded path, an encoded "?" or "/" would become a
+    delimiter, and a segment that decodes to "." or ".." could climb out of the
+    upstream's base path once normalized; both are refused."""
+    raw = request.scope.get("raw_path") or quote(request.scope["path"]).encode()
+    try:
+        raw = raw.split(b"?", 1)[0].decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="path must use percent-encoding")
+    segments = raw.split("/")[1:]
+    for segment in segments:
+        plain = unquote(segment)
+        if plain in (".", "..") or "/" in plain or "\\" in plain:
+            raise HTTPException(status_code=400, detail="path has a dot segment or an encoded separator")
+    return "/" + "/".join(segments[drop:])
+
+
+def upstream_url(base: str, path: str, query: str) -> httpx.URL:
+    """base + path + query, checked to stay on base's origin and under its path."""
+    try:
+        origin, url = httpx.URL(base), httpx.URL(base.rstrip("/") + path + query)
+    except httpx.InvalidURL:
+        raise HTTPException(status_code=400, detail="path is not a valid URL path")
+    root = origin.raw_path.split(b"?")[0].rstrip(b"/")
+    if (url.scheme, url.host, url.port) != (origin.scheme, origin.host, origin.port) \
+            or not (url.raw_path + b"/").startswith(root + b"/"):
+        raise HTTPException(status_code=400, detail="path leaves the upstream")
+    return url
 
 
 def upstream_query(request: Request) -> str:
@@ -1723,7 +1774,7 @@ def request_model(request: Request, body: bytes) -> str | None:
     return None
 
 
-async def provider_proxy(request: Request, prov, rest: str):
+async def provider_proxy(request: Request, prov):
     """A plain forward to another provider: its own client and credential, the device
     key stripped, no pacing or rotation, so its 429s never touch a Claude account."""
     def refuse(status, message, kind):
@@ -1738,34 +1789,49 @@ async def provider_proxy(request: Request, prov, rest: str):
     body = await bounded_body(request)
     fwd = forward_headers(request)
     fwd.pop("authorization", None)
-    url = "/" + rest + upstream_query(request)
-    rec = {"device": device, "provider": prov.name, "path": prov.prefix + "/" + rest,
+    path = upstream_path(request, drop=1)
+    url = upstream_url(prov.upstream, path, upstream_query(request))
+    rec = {"device": device, "provider": prov.name, "path": prov.prefix + path,
            "method": request.method, "model": request_model(request, body)}
+
+    async def alive():
+        return not await request.is_disconnected()
+
     try:
-        upstream, retries = await prov.send(request.method, url, fwd, body)
+        upstream, retries = await prov.send(request.method, url, fwd, body, alive)
+    except providers.ClientGone:
+        audit(rec | {"status": 499})
+        raise HTTPException(status_code=499, detail="client disconnected")
     except providers.ProviderDown as exc:
         audit(rec | {"status": 503})
-        return refuse(503, f"provider '{prov.name}' is down: {exc}", "provider_unavailable")
+        return refuse(503, f"provider '{prov.name}' is unavailable: {exc}", "provider_unavailable")
     except httpx.HTTPError as exc:
         audit(rec | {"status": 502})
         return refuse(502, f"provider '{prov.name}' is unreachable ({type(exc).__name__})", "api_error")
     rec["status"] = upstream.status_code
     if retries:
         rec["retries"] = retries
-    # Upstream cookies belong to the upstream, not to this host.
-    resp_headers = {k: v for k, v in upstream.headers.items()
-                    if k.lower() not in HOP | {"content-encoding", "set-cookie"}}
+    # Upstream cookies belong to the upstream. A provider page opened in a browser must
+    # not run script on this origin, where the panel and device keys are used.
+    resp_headers = response_headers(upstream, "set-cookie", "content-security-policy")
+    resp_headers["content-security-policy"] = "default-src 'none'; sandbox; frame-ancestors 'none'"
     resp_headers["x-rotate-provider"] = prov.name
 
     if "text/event-stream" in upstream.headers.get("content-type", ""):
         meter = providers.SseUsage()
 
         async def relay():
+            done = False
             try:
                 async for chunk in upstream.aiter_bytes():
                     meter.feed(chunk)
                     yield chunk
+                done = True
+            except httpx.HTTPError as exc:
+                rec["interrupted"] = f"upstream {type(exc).__name__}"
             finally:
+                if not done and "interrupted" not in rec:
+                    rec["interrupted"] = "client"
                 await upstream.aclose()
                 rec["usage"] = meter.usage
                 audit(rec)
@@ -1773,11 +1839,21 @@ async def provider_proxy(request: Request, prov, rest: str):
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers,
                                  media_type=upstream.headers.get("content-type"))
 
-    content = await bounded_response(upstream)
+    try:
+        content = await bounded_response(upstream)
+    except HTTPException as exc:  # larger than max_response_bytes; already closed
+        audit(rec | {"status": exc.status_code, "upstream_status": upstream.status_code})
+        return refuse(exc.status_code, str(exc.detail), "api_error")
+    except httpx.HTTPError as exc:
+        await upstream.aclose()
+        audit(rec | {"status": 502, "upstream_status": upstream.status_code})
+        return refuse(502, f"provider '{prov.name}' broke off its answer ({type(exc).__name__})", "api_error")
     try:
         rec["usage"] = providers.usage_of(json.loads(content))
     except (ValueError, RecursionError):
         pass
+    if request.method == "HEAD" and "content-length" in upstream.headers:
+        resp_headers["content-length"] = upstream.headers["content-length"]
     audit(rec)
     return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
 
@@ -1786,7 +1862,7 @@ async def provider_proxy(request: Request, prov, rest: str):
 async def proxy(request: Request, path: str):
     prov = PREFIXES.get(path.partition("/")[0])
     if prov is not None:
-        return await provider_proxy(request, prov, path.partition("/")[2])
+        return await provider_proxy(request, prov)
     device = device_from_request(request)
     if device is None:
         return JSONResponse(
@@ -1803,7 +1879,7 @@ async def proxy(request: Request, path: str):
     body = await bounded_body(request)
     fwd_headers = forward_headers(request)
     model = request_model(request, body)
-    url = "/" + path + upstream_query(request)
+    url = upstream_url(UPSTREAM, upstream_path(request), upstream_query(request))
     upstream, account, retries, noted, _verdict = await send_upstream(
         request.method, url, fwd_headers, body, request)
 
@@ -1811,8 +1887,7 @@ async def proxy(request: Request, path: str):
            "model": model, "status": upstream.status_code}
     if retries:
         rec["retries"] = retries
-    resp_headers = {k: v for k, v in upstream.headers.items()
-                    if k.lower() not in HOP and k.lower() != "content-encoding"}
+    resp_headers = response_headers(upstream)
     resp_headers["x-rotate-account"] = account
 
     if "text/event-stream" in upstream.headers.get("content-type", ""):

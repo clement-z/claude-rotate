@@ -13,6 +13,8 @@ logs, audit records, status or error messages.
 """
 import asyncio
 import codecs
+import hashlib
+import http.cookiejar
 import json
 import os
 import re
@@ -25,23 +27,35 @@ from pathlib import Path
 import httpx
 
 ANTHROPIC = "anthropic"  # the rotated Claude accounts on the bare root
-# First path segments the Claude passthrough and the admin endpoints use.
-RESERVED = {"v1", "api", "rotate", ANTHROPIC}
+# First path segments the Claude passthrough, the admin endpoints and FastAPI's own
+# pages answer; a provider there would shadow them or be shadowed.
+RESERVED = {"v1", "api", "rotate", "docs", "redoc", ANTHROPIC}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-URL_RE = re.compile(r"^https?://[^/?#\s]+(/[^?#\s]*)?$")
+URL_RE = re.compile(r"^https?://[^/?#\s@]+(/[^?#\s]*)?$")  # no userinfo, query or fragment
+KEYS = {"static-bearer": {"kind", "prefix", "upstream", "token_file"},
+        "openai-siwc": {"kind", "prefix"}}
 TIMEOUT = httpx.Timeout(600.0, connect=15.0)
+# Pinned: a refresh sends the rotating refresh token, so no config may redirect it.
+SIWC_API = "https://api.openai.com"
+SIWC_AUTH = "https://auth.openai.com"
 SIWC_RESOURCE = "https://api.openai.com/v1"  # the token's audience, fixed by the flow
 # Refresh errors that only a new sign-in repairs.
 FATAL = {"invalid_grant", "invalid_client", "refresh_token_reused",
          "refresh_token_expired", "refresh_token_invalidated"}
 REFRESH_AHEAD_S = 600  # the background loop refreshes this long before expiry
-REFRESH_INLINE_S = 60  # below this a request refreshes first, earliest_refresh_at or not
+REFRESH_INLINE_S = 60  # below this a request refreshes first
+RETRY_S, RETRY_MAX_S = 30, 300  # backoff after a failed refresh, shared by every caller
 SSE_LINE_MAX = 8 * 1024 * 1024  # a longer SSE line is skipped for usage, still relayed
+# A cookie one device's call receives must not ride along on another device's call.
+NO_COOKIES = http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
 
 
 class ProviderDown(Exception):
     """The provider cannot serve now. The message is safe to show the caller."""
+
+
+class ClientGone(Exception):
+    """The caller disconnected before the request was sent or replayed."""
 
 
 def load_providers(cfg: dict, config_dir: Path, state_dir: Path) -> dict:
@@ -56,32 +70,28 @@ def load_providers(cfg: dict, config_dir: Path, state_dir: Path) -> dict:
         if not isinstance(name, str) or not NAME_RE.match(name) or name == ANTHROPIC:
             raise SystemExit(f"provider name {name!r}: use 1-32 lowercase letters, digits, "
                              "'_' or '-'; 'anthropic' names the Claude accounts")
-        if not isinstance(spec, dict):
-            raise SystemExit(f"provider '{name}' must be an object")
+        if not isinstance(spec, dict) or spec.get("kind") not in KEYS:
+            raise SystemExit(f"provider '{name}': kind must be static-bearer or openai-siwc")
+        unknown = set(spec) - KEYS[spec["kind"]]
+        if unknown:
+            raise SystemExit(f"provider '{name}': unknown key(s) {', '.join(sorted(unknown))} for "
+                             f"{spec['kind']}" + (" (it talks to OpenAI only)" if spec["kind"] == "openai-siwc" else ""))
         prefix = spec.get("prefix", "/" + name)
         segment = prefix[1:] if isinstance(prefix, str) and prefix.startswith("/") else ""
         if not NAME_RE.match(segment) or segment in RESERVED or segment in seen:
             raise SystemExit(f"provider '{name}': prefix must be one unique path segment such as "
-                             f"/{name}, and not /v1, /api, /rotate or /anthropic")
+                             f"/{name}, and not one of /{', /'.join(sorted(RESERVED))}")
         seen.add(segment)
         spec = dict(spec, prefix="/" + segment)
-        for key in ("upstream", "auth_url"):
-            if key in spec and not (isinstance(spec[key], str) and URL_RE.match(spec[key])):
-                raise SystemExit(f"provider '{name}': {key} must be an http(s) URL")
-        kind = spec.get("kind")
-        if kind == "static-bearer":
-            if "upstream" not in spec or not isinstance(spec.get("token_file"), str) \
-                    or not spec["token_file"].strip():
-                raise SystemExit(f"provider '{name}': static-bearer needs upstream and token_file")
+        if spec["kind"] == "static-bearer":
+            if not (isinstance(spec.get("upstream"), str) and URL_RE.match(spec["upstream"])):
+                raise SystemExit(f"provider '{name}': upstream must be an http(s) URL without "
+                                 "user info, query or fragment")
+            if not isinstance(spec.get("token_file"), str) or not spec["token_file"].strip():
+                raise SystemExit(f"provider '{name}': static-bearer needs a token_file")
             table[name] = StaticBearer(name, spec, config_dir)
-        elif kind == "openai-siwc":
-            spec.setdefault("credential_file", f"{name}-credential.json")
-            if not (isinstance(spec["credential_file"], str) and FILE_RE.match(spec["credential_file"])):
-                raise SystemExit(f"provider '{name}': credential_file must be a file name "
-                                 "(it lives in the state directory, which the service may write)")
-            table[name] = OpenAISiwc(name, spec, state_dir)
         else:
-            raise SystemExit(f"provider '{name}': kind must be static-bearer or openai-siwc")
+            table[name] = OpenAISiwc(name, spec, state_dir)
     return table
 
 
@@ -97,22 +107,28 @@ async def maintain_loop(table: dict) -> None:
         await asyncio.sleep(60)
 
 
+async def _check(alive) -> None:
+    if alive is not None and not await alive():
+        raise ClientGone()
+
+
 class StaticBearer:
     kind = "static-bearer"
 
     def __init__(self, name: str, spec: dict, config_dir: Path):
         self.name, self.prefix, self.upstream = name, spec["prefix"], spec["upstream"]
-        self.client = httpx.AsyncClient(base_url=self.upstream, timeout=TIMEOUT)
+        self.client = httpx.AsyncClient(timeout=TIMEOUT, cookies=NO_COOKIES)
         try:
             self._token = (config_dir / spec["token_file"]).read_text().strip()
         except OSError:
             self._token = ""
         self.down = None if self._token else f"token file {spec['token_file']} is missing or empty"
 
-    async def send(self, method: str, url: str, headers: dict, body: bytes):
+    async def send(self, method: str, url: httpx.URL, headers: dict, body: bytes, alive=None):
         """(streamed upstream response, retries)."""
         if self.down:
             raise ProviderDown(self.down)
+        await _check(alive)
         request = self.client.build_request(
             method, url, headers=headers | {"authorization": f"Bearer {self._token}"}, content=body)
         return await self.client.send(request, stream=True), 0
@@ -127,40 +143,49 @@ class StaticBearer:
 
 class OpenAISiwc:
     kind = "openai-siwc"
+    upstream = SIWC_API
 
     def __init__(self, name: str, spec: dict, state_dir: Path):
         self.name, self.prefix = name, spec["prefix"]
-        # upstream and auth_url exist for stand-ins; the real flow uses the defaults.
-        self.upstream = spec.get("upstream", "https://api.openai.com")
-        self.token_url = spec.get("auth_url", "https://auth.openai.com").rstrip("/") \
-            + "/api/accounts/oauth/token"
-        self.path = state_dir / spec["credential_file"]
-        self.client = httpx.AsyncClient(base_url=self.upstream, timeout=TIMEOUT)
-        self.auth = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0))
+        # Named after the provider, in a directory of its own: two providers can never
+        # hold the same rotating credential, and no other file shares the names.
+        self.path = state_dir / "credentials" / f"{name}.json"
+        self.marker = self.path.with_suffix(".down")
+        self.client = httpx.AsyncClient(timeout=TIMEOUT, cookies=NO_COOKIES)
+        self.auth = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0), cookies=NO_COOKIES)
         self.lock = asyncio.Lock()
         self.down = self.unsaved = self.last_error = None
-        self.refreshes = 0
+        self.lost = False  # a refresh answer went missing: OpenAI may have rotated the token
+        self.refreshes, self.failures, self.retry_at = 0, 0, 0.0
         self.rec = self._load()
 
     def _load(self) -> dict:
         try:
             rec = json.loads(self.path.read_text())
         except FileNotFoundError:
-            self.down = (f"no credential {self.path.name} in the state directory: sign in "
-                         "with siwc_login.py and install the file")
+            self.down = (f"no credential credentials/{self.path.name} in the state directory: "
+                         "sign in with siwc_login.py and install it with claude-rotate-admin")
             return {}
         except (OSError, ValueError) as exc:
-            self.down = f"credential {self.path.name} is unreadable ({type(exc).__name__})"
+            self.down = f"credential credentials/{self.path.name} is unreadable ({type(exc).__name__})"
             return {}
-        if not isinstance(rec, dict) or not all(
-                isinstance(rec.get(k), str) and rec[k] for k in ("access_token", "refresh_token", "client_id")):
-            self.down = f"credential {self.path.name} lacks a token or the client_id"
+        if not usable_record(rec):
+            self.down = f"credential credentials/{self.path.name} lacks a token, the client_id or its expiry"
             return {}
+        # A refusal is remembered against this credential, so a restart does not serve
+        # with it again; installing a new credential clears it.
+        try:
+            marker = json.loads(self.marker.read_text())
+        except (OSError, ValueError):
+            marker = None
+        if isinstance(marker, dict) and marker.get("generation") == generation(rec):
+            self.down = str(marker.get("reason") or "refused earlier")
+        elif marker is not None:
+            self.marker.unlink(missing_ok=True)
         return rec
 
     def _remaining(self) -> float:
-        expires = self.rec.get("expires_at")
-        return expires - time.time() if type(expires) in (int, float) else 0.0
+        return self.rec["expires_at"] - time.time() if self.rec else 0.0
 
     async def token(self) -> str:
         """A usable access token, refreshing first when it is about to expire."""
@@ -169,41 +194,62 @@ class OpenAISiwc:
         if self.down:
             raise ProviderDown(self.down)
         if self._remaining() <= 0:
-            raise ProviderDown("the access token expired and the refresh failed ("
-                               + (self.last_error or "no detail") + "); retrying every minute")
+            raise ProviderDown(self._unavailable())
         return self.rec["access_token"]
 
-    async def send(self, method: str, url: str, headers: dict, body: bytes):
-        """(streamed upstream response, retries). An upstream 401 gets one refresh and
-        one retry; the body is already buffered, so the retry resends it unchanged."""
-        retries = 0
-        while True:
-            token = await self.token()
-            request = self.client.build_request(
-                method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body)
-            upstream = await self.client.send(request, stream=True)
-            if upstream.status_code != 401 or retries:
-                return upstream, retries
+    def _unavailable(self) -> str:
+        wait = earliest_refresh(self.rec) - time.time()
+        return ("the access token expired and " + (
+            f"OpenAI allows the next refresh in {round(wait)} s" if wait > 0 else
+            f"the refresh is failing ({self.last_error or 'no detail'}); next try in "
+            f"{max(0, round(self.retry_at - time.time()))} s"))
+
+    async def send(self, method: str, url: httpx.URL, headers: dict, body: bytes, alive=None):
+        """(streamed upstream response, retries). An upstream 401 gets one refresh; the
+        request is replayed only with a new token, and not for a caller that left."""
+        token = await self.token()
+        await _check(alive)
+        upstream = await self.client.send(self.client.build_request(
+            method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True)
+        if upstream.status_code != 401:
+            return upstream, 0
+        await self.refresh(token, force=True)
+        if self.down:
             await upstream.aclose()
-            await self.refresh(token, force=True)
-            retries = 1
+            raise ProviderDown(self.down)
+        if self.rec.get("access_token") == token:
+            return upstream, 0  # no replacement: the caller gets OpenAI's 401
+        await upstream.aclose()
+        await _check(alive)
+        token = await self.token()
+        return await self.client.send(self.client.build_request(
+            method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True), 1
 
     async def refresh(self, seen: str | None, force: bool = False) -> None:
         """Serialized. A caller that waited on the lock finds the token it saw already
-        replaced and returns, so a rotating refresh token is never sent twice."""
+        replaced and returns, so a rotating refresh token is never sent twice. Failed
+        attempts set one retry time that every caller honours; routine refreshes also
+        wait for OpenAI's earliest_refresh_at, a refresh after a 401 does not."""
         async with self.lock:
             if self.down or not self.rec or self.rec.get("access_token") != seen:
                 return
-            if not force and self._remaining() > REFRESH_INLINE_S \
-                    and time.time() < earliest_refresh(self.rec):
-                return  # too early for the server; the token in hand is still good
+            now = time.time()
+            if now < self.retry_at or (not force and now < earliest_refresh(self.rec)):
+                return
+            if self.unsaved:
+                self._save(self.rec)
             try:
-                r = await self.auth.post(self.token_url, headers={"accept": "application/json"}, data={
+                r = await self.auth.post(SIWC_AUTH + "/api/accounts/oauth/token",
+                                         headers={"accept": "application/json"}, data={
                     "grant_type": "refresh_token", "client_id": self.rec["client_id"],
                     "refresh_token": self.rec["refresh_token"], "resource": SIWC_RESOURCE})
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                return self._failed(f"token endpoint unreachable ({type(exc).__name__})")
             except httpx.HTTPError as exc:
-                self.last_error = f"token endpoint unreachable ({type(exc).__name__})"
-                return
+                # The request may have arrived: OpenAI may have rotated the token.
+                self.lost = True
+                return self._failed(f"the refresh answer was lost ({type(exc).__name__}); "
+                                    "OpenAI may have rotated the token, the next try will tell")
             try:
                 data = r.json()
             except ValueError:
@@ -211,30 +257,44 @@ class OpenAISiwc:
             if r.status_code != 200:
                 code = error_code(data)
                 if r.status_code in (400, 401, 403) and code in FATAL:
-                    self.down = (f"the refresh was refused ({code}): sign in again with "
-                                 "siwc_login.py and install the new credential")
-                else:
-                    self.last_error = f"token endpoint answered {r.status_code}" + (f" ({code})" if code else "")
-                return
-            if not (isinstance(data, dict) and isinstance(data.get("access_token"), str)
-                    and isinstance(data.get("refresh_token"), str)):
-                self.last_error = "the refresh answer lacks a token; credential kept"
-                return
-            rec = record_from(data, self.rec)
-            # The old refresh token is dead from here on. Disk first, then use; if the
-            # write fails the new tokens still serve from memory (nothing better is
-            # left), and the save is retried every minute.
+                    return self._refused(code)
+                return self._failed(f"token endpoint answered {r.status_code}" + (f" ({code})" if code else ""))
+            rec = record_from(data, self.rec) if isinstance(data, dict) else None
+            if rec is None or not usable_record(rec):
+                self.lost = True  # a 200 rotates the token even when its body is unusable
+                return self._failed("the refresh answer was malformed; OpenAI may have rotated the token")
+            # The old refresh token is dead from here on. A crash before the file is
+            # renamed in place loses the new one too and needs a new sign-in; that
+            # window is a single write and rename. If the write fails, the new tokens
+            # still serve from memory, because refusing would not bring the old token
+            # back; status says "unsaved" and the save, not the refresh, is retried.
             self._save(rec)
-            self.rec, self.last_error = rec, None
-            self.refreshes += 1
+            self.rec, self.last_error, self.lost = rec, None, False
+            self.refreshes, self.failures, self.retry_at = self.refreshes + 1, 0, 0.0
+
+    def _failed(self, message: str) -> None:
+        self.last_error = message
+        self.failures += 1
+        self.retry_at = time.time() + min(RETRY_MAX_S, RETRY_S * 2 ** (self.failures - 1))
+
+    def _refused(self, code: str) -> None:
+        self.down = (f"the refresh was refused ({code})"
+                     + (" after a lost refresh answer, so OpenAI had rotated it" if self.lost else "")
+                     + ": sign in again with siwc_login.py and install the new credential")
+        try:
+            write_private(self.marker, json.dumps({"generation": generation(self.rec), "reason": self.down}))
+        except OSError as exc:
+            print(f"warning: provider {self.name}: could not record the refusal ({type(exc).__name__})",
+                  file=sys.stderr)
 
     def _save(self, rec: dict) -> None:
         try:
+            self.path.parent.mkdir(mode=0o700, exist_ok=True)
             write_private(self.path, json.dumps(rec, indent=2) + "\n")
             self.unsaved = None
         except OSError as exc:
             self.unsaved = (f"the refreshed credential could not be saved ({type(exc).__name__}); "
-                            "a restart now would need a new sign-in")
+                            "it serves from memory, and a restart now would need a new sign-in")
 
     async def maintain(self) -> None:
         if self.down or not self.rec:
@@ -247,15 +307,28 @@ class OpenAISiwc:
     def status(self) -> dict:
         now = time.time()
         saved = self.rec.get("refresh_saved_at")
-        return {"kind": self.kind, "prefix": self.prefix, "upstream": self.upstream,
-                "state": "down" if self.down else "ok", "reason": self.down,
-                "last_error": self.last_error, "unsaved": self.unsaved,
+        state = ("down" if self.down else "unavailable" if self._remaining() <= 0
+                 else "unsaved" if self.unsaved else "ok")
+        return {"kind": self.kind, "prefix": self.prefix, "upstream": self.upstream, "state": state,
+                "reason": self.down or (self._unavailable() if state == "unavailable" else self.unsaved),
+                "last_error": self.last_error,
                 "access_token_min": round(self._remaining() / 60) if self.rec else None,
                 # Refresh tokens live 30 days from their last rotation.
                 "refresh_token_days": round(30 - (now - saved) / 86400, 1)
                 if type(saved) in (int, float) else None,
                 "refreshes": self.refreshes, "client_id": self.rec.get("client_id"),
                 "host_id": self.rec.get("ext_agent_host_id"), "scopes": self.rec.get("scopes")}
+
+
+def usable_record(rec) -> bool:
+    return (isinstance(rec, dict) and type(rec.get("expires_at")) in (int, float)
+            and all(isinstance(rec.get(k), str) and rec[k].strip()
+                    for k in ("access_token", "refresh_token", "client_id")))
+
+
+def generation(rec: dict) -> str:
+    """Identifies one credential without storing anything that could be replayed."""
+    return hashlib.sha256(str(rec.get("refresh_token")).encode()).hexdigest()[:16]
 
 
 def error_code(data) -> str | None:
@@ -265,9 +338,12 @@ def error_code(data) -> str | None:
     return code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", code) else None
 
 
-def record_from(resp: dict, previous: dict) -> dict:
-    """Credential record from a token response; fields a refresh omits are kept.
-    Same shape as siwc_login.py writes."""
+def record_from(resp: dict, previous: dict) -> dict | None:
+    """Credential record from a token response, fields a refresh omits kept; None when
+    the expiry is unusable. Same shape as siwc_login.py writes."""
+    expires_in = resp.get("expires_in", 3600)
+    if type(expires_in) not in (int, float) or expires_in <= 0:
+        return None
     now = int(time.time())
     rec = dict(previous)
     for key in ("access_token", "refresh_token", "id_token", "token_type", "expires_in", "earliest_refresh_at"):
@@ -275,8 +351,7 @@ def record_from(resp: dict, previous: dict) -> dict:
             rec[key] = resp[key]
     if isinstance(resp.get("scope"), str):
         rec["scopes"] = sorted(resp["scope"].split())
-    expires_in = resp.get("expires_in", 3600)
-    rec["expires_at"] = now + (int(expires_in) if type(expires_in) in (int, float) else 3600)
+    rec["expires_at"] = now + int(expires_in)
     rec["saved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rec["refresh_saved_at"] = now
     return rec
@@ -302,7 +377,7 @@ def write_private(path: Path, text: str) -> None:
     """Atomic owner-only write. The file it replaces is kept as <name>.prev."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.unlink(missing_ok=True)  # left by a crash of an earlier process with this pid
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
@@ -333,15 +408,18 @@ def usage_of(event) -> dict | None:
     if not isinstance(event, dict):
         return None
     usage = event.get("usage")
-    if not isinstance(usage, dict) and isinstance(event.get("response"), dict):
-        usage = event["response"].get("usage")  # response.completed and friends
+    for holder in ("response", "message"):  # response.completed; Anthropic message_start
+        if not isinstance(usage, dict) and isinstance(event.get(holder), dict):
+            usage = event[holder].get("usage")
     if not isinstance(usage, dict):
         return None
 
     def n(value):
         return value if type(value) is int and value >= 0 else 0
 
-    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+    if "prompt_tokens" not in usage and "input_tokens_details" not in usage and (
+            "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+            or str(event.get("type", "")).startswith("message_")):
         return {k: n(usage.get(k)) for k in ("input_tokens", "output_tokens",
                                              "cache_read_input_tokens", "cache_creation_input_tokens")}
     prompt = usage.get("input_tokens", usage.get("prompt_tokens"))
@@ -355,7 +433,9 @@ def usage_of(event) -> dict | None:
 
 
 class SseUsage:
-    """Usage from an SSE stream fed chunk by chunk; lines may span chunks."""
+    """Usage from an SSE stream fed chunk by chunk; lines may span chunks. Counters
+    are cumulative, and Anthropic's arrive split (input in message_start, output in
+    message_delta), so each keeps the largest value seen."""
 
     def __init__(self):
         self.decode = codecs.getincrementaldecoder("utf-8")(errors="replace").decode
@@ -374,6 +454,6 @@ class SseUsage:
                 except (ValueError, RecursionError):
                     continue
                 if usage:
-                    self.usage = usage
+                    self.usage = {k: max(v, (self.usage or {}).get(k, 0)) for k, v in usage.items()}
         if len(self.buf) > SSE_LINE_MAX:
             self.buf, self.skip = "", True
