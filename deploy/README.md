@@ -87,7 +87,7 @@ produces, and what any hand-built release must match:
 | `/usr/local/sbin/claude-rotate-admin` | root `0755` | wrapper; runs the admin module from `current` with the release interpreter |
 | `/etc/systemd/system/claude-rotate.service` | root `0644` | copy of `deploy/claude-rotate.service` |
 | `/etc/claude-rotate/`, `tokens/` | `root:claude-rotate 0750` | `config.json` and `tokens/*.token` are `0640 root:claude-rotate` |
-| `/var/lib/claude-rotate`, `/var/log/claude-rotate` | `claude-rotate 0700` | created by systemd (`StateDirectory`/`LogsDirectory`); files `0600`, including Sign in with ChatGPT credentials installed by `claude-rotate-admin install-credential` |
+| `/var/lib/claude-rotate`, `/var/log/claude-rotate` | `claude-rotate 0700` | created by systemd (`StateDirectory`/`LogsDirectory`); files `0600`, including Sign in with ChatGPT credentials in `credentials/`, written as the service user by `claude-rotate-admin install-credential` |
 | `claude-rotate` user/group | system account, home `/nonexistent`, no login | created once; an existing account is reused |
 
 Never copy a running developer checkout, its writable virtualenv, or its secrets

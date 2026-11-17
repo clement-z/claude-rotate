@@ -53,8 +53,10 @@ private state/log directories, but cannot modify installed code or credentials.
   uses headers for polling; reopening the original link is required after a
   manual reload. Private responses use `no-store` and `no-referrer`.
 - The transparent proxy removes local query keys, browser cookies/referrers,
-  and Tailscale/forwarding identity headers before contacting Anthropic. It
-  still forwards ordinary API headers and permits all upstream paths/methods.
+  and Tailscale/forwarding identity headers before contacting Anthropic, and its
+  upstream client keeps no cookies between requests. It still forwards ordinary
+  API headers and permits all upstream paths/methods, except path segments that
+  decode to `.` or `..` or hide a separator, which get 400.
   Treat a device key as permission to use the shared upstream identity.
 - Empty, non-string, duplicate, and public placeholder device keys fail startup.
   Revoke a device by removing its entry from `config.json` and restarting.
@@ -87,20 +89,32 @@ credential. What that changes:
   give the host nothing else to do.
 - A device key reaches only what its entry grants. The string form keeps meaning
   the Claude accounts alone; a device calling a provider it was not granted gets
-  403. Give a team or agent container a key that lists only what it needs. The
-  dashboard and its JSON endpoints, including the account switch, need the
-  `anthropic` grant.
+  403. Give a team or agent container a key that lists only what it needs. A key
+  opens the dashboard and its JSON endpoints, including the account switch, only
+  with the `anthropic` grant. With `panel_tailnet` the tailnet identity is a
+  separate way in: any tailnet user can open the dashboard whatever key the
+  request carries, as before.
 - Under a provider prefix the device key (`Authorization`, `x-api-key` and the
   `key` query parameter), browser cookies and forwarding headers are dropped; the
   provider's own bearer is the only credential sent, and only to that provider's
-  upstream. Upstream `Set-Cookie` headers are dropped on the way back. Other
-  request headers and the body pass through unchanged.
+  upstream. Upstream `Set-Cookie` headers are dropped on the way back, and the
+  upstream clients keep no cookies, so one device's cookie never reaches another
+  device's request. Provider responses get `Content-Security-Policy: default-src
+  'none'; sandbox`, so HTML from a provider opened in a browser cannot run script
+  on this origin, where device keys and the dashboard live. The upstream URL is
+  built from the raw request path; a segment that decodes to `.` or `..` or hides a
+  separator is refused, and the result must stay under the configured base URL.
+  Other request headers and the body pass through unchanged.
 - Static bearer tokens sit with the account tokens under `/etc/claude-rotate/tokens`
   (read-only to the service). The ChatGPT credential sits in
-  `/var/lib/claude-rotate`, owned by the service with mode 0600, because each
-  refresh rotates the refresh token and the service must write the replacement.
-  The previous file is kept as `.prev`; its refresh token is dead once the next
-  refresh succeeds. Back up the state directory as a secret.
+  `/var/lib/claude-rotate/credentials`, owned by the service with mode 0600,
+  because each refresh rotates the refresh token and the service must write the
+  replacement. `claude-rotate-admin install-credential` writes it as the service
+  user, not as root. The previous file is kept as `.prev`; its refresh token is
+  dead once the next refresh succeeds. Back up the state directory as a secret.
+- The OpenAI origins of `openai-siwc` are fixed in the code, so no configuration
+  can send the refresh token elsewhere. Static upstream URLs may not carry user
+  info.
 - Tokens are never written to the audit log, status, alerts or error bodies. A
   refused refresh shows only the OAuth error code.
 - One holder per ChatGPT credential. OpenAI's CI guidance warns against sharing one

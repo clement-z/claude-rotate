@@ -428,33 +428,49 @@ path prefix; the bare root stays the rotated Claude accounts, unchanged.
 }
 ```
 
-- **`static-bearer`**: `upstream` is a base URL, `token_file` a file next to the
-  account tokens. Requests under the prefix go to the upstream with
-  `Authorization: Bearer <token>` in place of the device key. For OpenRouter, an
-  employer's OpenAI-compatible endpoint, a model server on the LAN.
+- **`static-bearer`**: `upstream` is a base URL (no user info, query or
+  fragment), `token_file` a file next to the account tokens. Requests under the
+  prefix go to the upstream with `Authorization: Bearer <token>` in place of the
+  device key. For OpenRouter, an employer's OpenAI-compatible endpoint, a model
+  server on the LAN.
 - **`openai-siwc`**: one "Sign in with ChatGPT" credential, used on ChatGPT plan
-  usage against `https://api.openai.com`
-  ([OpenAI's flow](https://developers.openai.com/siwc/token-sharing-open-source)).
-  The credential file lives in the state directory (`credential_file`, default
-  `<name>-credential.json`) because the proxy rewrites it at every refresh. The
-  access token lasts an hour: the proxy refreshes it ten minutes before expiry,
-  one refresh at a time, writes the new tokens to disk before using them (the
-  previous file is kept as `.prev`), and refreshes once more if OpenAI answers a
-  request with 401. A refused refresh (`invalid_grant`, `invalid_client`,
-  `refresh_token_reused`, `_expired` or `_invalidated`) takes the provider down:
-  requests get 503 with the reason, the panel shows an alert, and a new sign-in
-  is needed.
+  usage ([OpenAI's flow](https://developers.openai.com/siwc/token-sharing-open-source)).
+  It talks to `https://api.openai.com` and `https://auth.openai.com` only; neither
+  can be configured, since a refresh sends the rotating refresh token. The
+  credential is `credentials/<name>.json` in the state directory, which the proxy
+  rewrites at every refresh. The access token lasts an hour: the proxy refreshes it
+  ten minutes before expiry and not before OpenAI's `earliest_refresh_at`, one
+  refresh at a time, writes the new tokens to disk before using them (the previous
+  file is kept as `.prev`), and refreshes once if OpenAI answers a request with
+  401, replaying the request only with a new token. Failed refreshes back off from
+  30 s to 5 min. A refused refresh (`invalid_grant`, `invalid_client`,
+  `refresh_token_reused`, `_expired` or `_invalidated`) takes the provider down,
+  across restarts until a new credential is installed: requests get 503 with the
+  reason, the panel shows an alert.
+- **Status.** `/rotate/status` gives each provider a state: `ok`; `unsaved` when a
+  refreshed credential could not be written (it keeps serving from memory, since
+  the spent refresh token cannot come back, and the save is retried every minute;
+  a restart in that state needs a new sign-in); `unavailable` when the access
+  token has expired and no refresh has worked yet; `down` after a refusal or
+  without a credential. A crash between OpenAI's answer to a refresh and the
+  rename of the new file also needs a new sign-in; that window is one write.
 - **`prefix`** defaults to `/<name>`. It is one path segment and takes that
-  segment away from the Claude passthrough; `/v1`, `/api`, `/rotate` and
-  `/anthropic` are refused.
+  segment away from the Claude passthrough; `/v1`, `/api`, `/rotate`, `/docs`,
+  `/redoc` and `/anthropic` are refused.
 - **Grants.** A device given as a string reaches the Claude accounts only, as
-  before. The object form lists what the key may reach; `anthropic` is the Claude
-  accounts. Anything else gets 403. The panel and its JSON endpoints need the
-  `anthropic` grant.
+  before. The object form must list what the key may reach, `anthropic` being
+  the Claude accounts; an object without the list fails startup. Anything not
+  granted gets 403. A key opens the panel and its JSON endpoints only with the
+  `anthropic` grant; with `panel_tailnet`, a tailnet user opens it whatever key,
+  if any, the request carries.
 
-Under a prefix every path and method is forwarded with the same request and
-response limits, admission limit and header hygiene as the Claude passthrough;
-the device key and upstream cookies are dropped, and the body is not rewritten.
+Under a prefix, GET, POST, PUT, DELETE, PATCH, OPTIONS and HEAD are forwarded with
+the same request and response limits, admission limit and header hygiene as the
+Claude passthrough; the device key and upstream cookies are dropped, the body is
+not rewritten, and responses get a sandbox `Content-Security-Policy` so a page
+from the provider cannot run script on the proxy's origin. A path segment that
+decodes to `.` or `..` or hides a `/` or `\` gets 400, here and on the Claude
+passthrough.
 Nothing there is paced or rotated: a 429 from another provider goes back to the
 client and never touches a Claude account. Usage from Responses (`response.completed`),
 Chat Completions and Anthropic-format answers is recorded in the audit log with a
@@ -464,11 +480,12 @@ it does not name counts as $0 rather than at a made-up Claude price.
 **Signing in.** On a machine with a browser:
 
 ```bash
-python3 siwc_login.py login --out openai-credential.json
-scp openai-credential.json server:
+python3 siwc_login.py login       # writes ~/.config/claude-rotate/openai.credential.json
+scp ~/.config/claude-rotate/openai.credential.json server:
+rm ~/.config/claude-rotate/openai.credential.json*
 # on the server
-sudo claude-rotate-admin install-credential openai --file openai-credential.json
-rm openai-credential.json      # and the laptop's copy
+sudo claude-rotate-admin install-credential openai --file openai.credential.json
+rm openai.credential.json
 ```
 
 The proxy is then the only holder of the credential. Any other copy that
@@ -504,7 +521,7 @@ through unchanged.
 |---|---|
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN`. Or `name → {"key": …, "providers": [...]}` to grant other providers; see [Other providers](#other-providers) |
-| `providers{}` | other upstreams under their own path prefix: `name → {"kind": "static-bearer", "upstream", "token_file"}` or `{"kind": "openai-siwc", "credential_file"}`, each with an optional `prefix`. See [Other providers](#other-providers) |
+| `providers{}` | other upstreams under their own path prefix: `name → {"kind": "static-bearer", "upstream", "token_file"}` or `{"kind": "openai-siwc"}`, each with an optional `prefix`. See [Other providers](#other-providers) |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `accounts[].billing` | the account's plans over time, for the panel's Subscriptions card and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra"}]`. The first date sets the monthly renewal day; a later entry changes plan from its date and keeps the renewal day (Anthropic prorates upgrades). Add `"renews": true` to an entry that restarts the billing cycle, such as Pro to Max. Record a downgrade with the renewal date it takes effect on. A broken entry is ignored and shown as a panel alert. |

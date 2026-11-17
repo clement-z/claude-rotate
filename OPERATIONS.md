@@ -86,7 +86,7 @@ upstream token validity; also test a small Claude request through the proxy.
 | Accounts, device keys and rotation policy | `/etc/claude-rotate/config.json` |
 | Account tokens | `/etc/claude-rotate/tokens/` |
 | Saved rotation state | `/var/lib/claude-rotate/state.json` |
-| Sign in with ChatGPT credentials, rewritten at each refresh | `/var/lib/claude-rotate/<provider>-credential.json` |
+| Sign in with ChatGPT credentials, rewritten at each refresh | `/var/lib/claude-rotate/credentials/<provider>.json` |
 | Request audit and rotated backups | `/var/log/claude-rotate/audit.jsonl*` |
 | Active release symlink | `/opt/claude-rotate/current` |
 | Versioned code and virtual environments | `/opt/claude-rotate/releases/` |
@@ -170,23 +170,29 @@ Providers are set in `config.json` under `providers` (see the README's "Other
 providers"); edit it with `sudoedit` and run `activate`. A static bearer token goes
 in `/etc/claude-rotate/tokens/` like an account token; `activate` restores its
 mode. A device reaches a provider only if its entry lists it: `add-user NAME
---providers openai` mints such a key and prints the base URL to use.
+--providers openai` mints such a key and prints it with the base URL to use. An
+object entry written by hand needs both `key` and a nonempty `providers` list.
 
 For an `openai-siwc` provider, sign in on a machine with a browser with
 `python3 siwc_login.py login`, copy the file to the server, then:
 
 ```text
-sudo claude-rotate-admin install-credential openai --file openai-credential.json
-rm openai-credential.json
+sudo claude-rotate-admin install-credential openai --file openai.credential.json
+rm openai.credential.json
 ```
 
-The command stops the service, installs the file in `/var/lib/claude-rotate`
-owned by the service with mode 0600 (keeping the previous one as `.prev`), and
-starts the service. Delete every other copy of the file: a second holder that
+The command checks the file, brings the service to a stopped state, writes
+`/var/lib/claude-rotate/credentials/openai.json` as the service user with mode 0600
+(keeping the previous one as `.prev`), and starts the service again, also when the
+installation failed. It reports the installation and the restart separately. Delete every other copy of the file: a second holder that
 refreshes it kills it for both.
 
-`status` lists each provider with its state, the access token's remaining minutes
-and the client and host ids. A provider marked down answers 503 with the reason.
+`status` (and `status --json`) lists each provider with its state (`ok`,
+`unsaved`, `unavailable` or `down`), the access token's remaining minutes and the
+client and host ids. A provider that is down or unavailable answers 503 with the
+reason. `unsaved` means a refreshed credential could not be written: it keeps
+serving, the save is retried every minute, and a restart before it succeeds needs
+a new sign-in. Fix the disk first.
 A refused refresh needs a new sign-in: run `siwc_login.py login --client-id ID
 --host-id ID` with the ids from `status` to reuse the registration, then
 `install-credential` again. A failing refresh that was not refused (OpenAI
