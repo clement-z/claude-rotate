@@ -98,6 +98,7 @@ def write_private(path, text):
             prev = path + ".prev"
             if os.path.lexists(prev):
                 os.unlink(prev)
+            os.chmod(path, 0o600)  # the backup shares its mode, whatever the old file had
             os.link(path, prev)
         os.replace(tmp, path)
     except BaseException:
@@ -193,8 +194,11 @@ def cmd_login(args):
         "grant_type": "authorization_code", "client_id": client_id, "code": cb["code"],
         "code_verifier": verifier, "redirect_uri": redirect_uri, "resource": RESOURCE})
     for key in ("access_token", "refresh_token", "id_token"):
-        if not resp.get(key):
+        if not isinstance(resp.get(key), str) or not resp[key].strip():
             die(f"token response lacks {key}")
+    expires_in = resp.get("expires_in", 3600)
+    if type(expires_in) not in (int, float) or not 1 <= expires_in <= 30 * 86400:
+        die("token response has no usable expires_in")
     claims = jwt_payload(resp["id_token"])
     if claims.get("iss") != ISSUER:
         die("ID token issuer is not OpenAI's")
@@ -213,7 +217,7 @@ def cmd_login(args):
         if resp.get(key) is not None:
             rec[key] = resp[key]
     rec["scopes"] = sorted(str(resp.get("scope", "")).split())
-    rec["expires_at"] = now + int(resp.get("expires_in", 3600))
+    rec["expires_at"] = now + int(expires_in)
     rec["saved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rec["refresh_saved_at"] = now
     write_private(args.out, json.dumps(rec, indent=2) + "\n")

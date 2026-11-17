@@ -13,4 +13,7 @@ device_usage.json
 # Sign in with ChatGPT credentials (siwc_login.py, the state directory)
 *.credential.json
 *.credential.json.prev
+# the names earlier builds of siwc_login.py and the state directory used
+*-credential.json
+*-credential.json.prev
 credentials/

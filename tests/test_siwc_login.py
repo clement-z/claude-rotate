@@ -36,6 +36,7 @@ TMP = Path(tempfile.mkdtemp(prefix="siwc-login-test-"))
 S.DEFAULT_OUT = str(TMP / "default-home" / "openai.credential.json")
 S.AUTH_BASE = "http://127.0.0.1:9"  # replaced by the stand-in's address before each login
 ISSUED = "oaiapp_issued_fake"
+OPENAI_ISSUER = "https://auth.openai.com"  # spelt out, not read from the module under test
 FULL_SCOPE = "chatgpt.tokens.use.direct email offline_access openid profile resource.invoke"
 PASS = 0
 
@@ -122,13 +123,14 @@ class AuthServer:
                 if not ok:
                     return self.reply(400, [("Content-Type", "application/json")], b'{"error": "invalid_grant"}')
                 now = int(time.time())
-                claims = {"iss": sc.get("iss", S.ISSUER), "aud": sc.get("aud", f["client_id"]), "sub": "user-fake",
+                claims = {"iss": sc.get("iss", OPENAI_ISSUER), "aud": sc.get("aud", f["client_id"]), "sub": "user-fake",
                           "email": "fake@example.com", "nonce": sc.get("nonce", q["nonce"]),
                           "exp": now + sc.get("exp_in", 3600)}
                 id_token = b64url(b'{"alg":"none"}') + "." + b64url(json.dumps(claims).encode()) + "."
                 body = {"access_token": "acc-FAKE-" + os.urandom(6).hex(), "refresh_token": "ref-FAKE-" + os.urandom(6).hex(),
                         "id_token": id_token, "token_type": "Bearer", "expires_in": 3600,
                         "scope": sc.get("scope", FULL_SCOPE), "earliest_refresh_at": now}
+                body.update(getattr(outer, "reply_extra", None) or {})
                 outer.last = body
                 self.reply(200, [("Content-Type", "application/json")], json.dumps(body).encode())
 
@@ -154,6 +156,7 @@ def http_get(port, target):
 
 
 def login(srv, out, *extra, scenario=None, wrong_state_first=False, timeout=8):
+    """out=None runs without --out, so the default output path is used."""
     """Run `siwc_login.py login` in-process. The patched webbrowser.open starts a
     thread that authorizes at the stand-in and delivers the callback it returns."""
     srv.scenario = scenario or {}
@@ -188,7 +191,7 @@ def login(srv, out, *extra, scenario=None, wrong_state_first=False, timeout=8):
     timer = threading.Timer(timeout, watchdog)
     timer.start()
     stdout, stderr, code = io.StringIO(), io.StringIO(), 0
-    argv = ["siwc_login.py", "login", "--out", str(out), "--port", str(port), *extra]
+    argv = ["siwc_login.py", "login", *(["--out", str(out)] if out is not None else []), "--port", str(port), *extra]
     try:
         with mock.patch.object(sys, "argv", argv), mock.patch.object(S.webbrowser, "open", side_effect=fake_open) as op, \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -219,7 +222,10 @@ def test_write_private():
     S.write_private(path, "second\n")
     check("write_private: a replaced file is kept as .prev, the live name holds the new content",
           Path(path).read_text() == "second\n" and Path(path + ".prev").read_text() == "first\n")
+    os.chmod(path, 0o644)
     S.write_private(path, "third\n")
+    check("write_private: an old file left at mode 644 is kept as .prev with mode 600",
+          mode(path + ".prev") == 0o600 and mode(path) == 0o600, oct(mode(path + ".prev")))
     check("write_private: the next replacement moves .prev along",
           Path(path).read_text() == "third\n" and Path(path + ".prev").read_text() == "second\n")
     with mock.patch("os.fsync", side_effect=OSError(28, "No space left on device")):
@@ -289,7 +295,7 @@ def test_login_flow(srv):
           rec.get("client_id") == ISSUED and rec.get("ext_agent_host_id") == q["ext_agent_host_id"]
           and rec.get("scopes") == sorted(FULL_SCOPE.split()) and abs(rec.get("expires_at", 0) - (now + 3600)) < 30
           and rec.get("access_token") == srv.last["access_token"] and rec.get("refresh_token") == srv.last["refresh_token"]
-          and rec.get("email") == "fake@example.com" and rec.get("issuer") == S.ISSUER, rec)
+          and rec.get("email") == "fake@example.com" and rec.get("issuer") == OPENAI_ISSUER, rec)
     check("login: no token in the output and no plan-scope warning",
           not any(srv.last[k] in stdout + stderr for k in ("access_token", "refresh_token", "id_token"))
           and "WARNING" not in stdout and ISSUED in stdout, stdout)
@@ -366,8 +372,34 @@ def test_show(path):
     check("show prints no token", not any(rec[k] in r.stdout + r.stderr for k in ("access_token", "refresh_token", "id_token")))
 
 
+def test_default_out(srv):
+    default = TMP / "home-default" / ".config" / "claude-rotate" / "openai.credential.json"
+    saved, S.DEFAULT_OUT = S.DEFAULT_OUT, str(default)
+    try:
+        code, stdout, stderr, seen = login(srv, None)
+    finally:
+        S.DEFAULT_OUT = saved
+    check("login without --out writes the default path, its directory created with mode 700",
+          code == 0 and default.is_file() and mode(default) == 0o600 and mode(default.parent) == 0o700
+          and json.loads(default.read_text()).get("client_id") == ISSUED, (code, stderr))
+
+
+def test_expires_in(srv):
+    for label, value in (("a NaN", float("nan")), ("a zero", 0), ("a string", "3600"), ("a 400-digit", 10 ** 400)):
+        out = TMP / f"expires-{label.split()[1]}.json"
+        original = srv.reply_extra if hasattr(srv, "reply_extra") else None
+        srv.reply_extra = {"expires_in": value}
+        try:
+            code, stdout, stderr, seen = login(srv, out)
+        finally:
+            srv.reply_extra = original
+        check(f"login refuses {label} expires_in, writing nothing",
+              code == 1 and "no usable expires_in" in stderr and not out.exists(), (code, stderr))
+
+
 def test_gitignore():
-    for name in ("openai.credential.json", "openai.credential.json.prev"):
+    for name in ("openai.credential.json", "openai.credential.json.prev",
+                 "openai-credential.json", "openai-credential.json.prev"):
         r = subprocess.run(["git", "check-ignore", "-q", name], cwd=ROOT, capture_output=True, text=True, timeout=20)
         check(f"git check-ignore reports {name} as ignored at the repository root", r.returncode == 0, r)
 
@@ -378,6 +410,8 @@ try:
     written = test_login_flow(srv)
     test_login_refusals(srv)
     test_show(written)
+    test_default_out(srv)
+    test_expires_in(srv)
     test_gitignore()
     check("nothing was written at the default output path", not os.path.lexists(S.DEFAULT_OUT))
 finally:
