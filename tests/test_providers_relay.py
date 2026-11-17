@@ -146,13 +146,14 @@ async def call(method, path, key=DESK, content=None):
     return r, rows()[before:]
 
 
-async def direct(method, path, body=b"", key=DESK, gone=None, cut_after_body=False):
+async def direct(method, path, body=b"", key=DESK, gone=None, cut_after_body=False, sent=None):
     """Run the app with a hand-made receive and send, as Uvicorn would (ASGI spec 2.3).
     receive hands over the body, then blocks until `gone` is set and reports a
     disconnect; cut_after_body sets `gone` at the first nonempty response chunk.
-    Returns (response start message, response body)."""
+    Returns (response start message, response body); `sent` collects the messages,
+    for a caller that expects the app to raise."""
     gone = gone or asyncio.Event()
-    sent, delivered = [], False
+    sent, delivered = [] if sent is None else sent, False
 
     async def receive():
         nonlocal delivered
@@ -295,10 +296,18 @@ async def main():
 
     stream = Body(created, delta, httpx.ReadError("connection reset"))
     openai.answer = lambda request: sse(stream)
-    r, new = await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex", "stream": True}))
-    check("a stream that breaks off keeps what was relayed and is audited as interrupted by the upstream error",
-          r.content == created + delta and one(new).get("interrupted") == "upstream ReadError"
-          and one(new).get("status") == 200 and stream.closed)
+    sent, before = [], len(rows())
+    try:
+        await direct("POST", "/openai/v1/responses", js({"model": "gpt-5.1-codex", "stream": True}), sent=sent)
+        raised = None
+    except Exception as exc:  # what Uvicorn sees: it then drops the connection without a last chunk
+        raised = exc
+    chunks, new = [m for m in sent if m["type"] == "http.response.body"], rows()[before:]
+    check("a stream that breaks off reaches the client broken: the bytes relayed, then no clean end",
+          "ReadError" in repr(raised) and b"".join(m.get("body", b"") for m in chunks) == created + delta
+          and all(m.get("more_body") for m in chunks))
+    check("and it is audited as interrupted by the upstream error, the upstream closed",
+          one(new).get("interrupted") == "upstream ReadError" and one(new).get("status") == 200 and stream.closed)
 
     oai = R.PROVIDERS["openai"]
     n = len(openai.calls)
@@ -347,6 +356,28 @@ async def main():
     check("HEAD is forwarded as HEAD and keeps the upstream content-length with an empty body",
           lan.calls[-1].method == "HEAD" and head.get("status") == 200 and hdrs.get("content-length") == "1234"
           and hdrs.get("etag") == '"v1"' and body == b"")
+    lan.answer = lambda request: httpx.Response(200, headers={"content-type": "application/json"})
+    head, body = await direct("HEAD", "/lan/v1/models")
+    hdrs = {k.decode(): v.decode() for k, v in head.get("headers", [])}
+    check("HEAD without an upstream content-length gets none, not 0",
+          head.get("status") == 200 and "content-length" not in hdrs and body == b"")
+    lan.answer = lambda request: httpx.Response(
+        200, headers={"content-type": "application/json", "content-length": "1234", "connection": "content-length"})
+    head, body = await direct("HEAD", "/lan/v1/models")
+    hdrs = {k.decode(): v.decode() for k, v in head.get("headers", [])}
+    check("HEAD does not pass on a content-length the upstream's Connection names",
+          head.get("status") == 200 and "content-length" not in hdrs and body == b"")
+    lan.answer = lambda request: sse(Body(), status=200)
+    head, body = await direct("HEAD", "/lan/v1/events")
+    hdrs = {k.decode(): v.decode() for k, v in head.get("headers", [])}
+    check("HEAD of an event stream is answered like any HEAD, with its headers and no body",
+          head.get("status") == 200 and hdrs.get("content-type", "").startswith("text/event-stream")
+          and "content-length" not in hdrs and body == b"")
+    lan.answer = lambda request: httpx.Response(200, stream=Body(b"data: {}\n\n"), headers={
+        "content-type": "text/event-stream", "connection": "content-type"})
+    r, new = await call("POST", "/lan/v1/messages", content=js({"model": "m", "stream": True}))
+    check("a stream whose Connection names content-type is relayed without it",
+          r.status_code == 200 and r.content == b"data: {}\n\n" and "content-type" not in r.headers)
     lan.answer = lambda request: httpx.Response(204, headers={"allow": "GET, POST, OPTIONS"})
     r, new = await call("OPTIONS", "/lan/v1/messages")
     check("OPTIONS is forwarded as OPTIONS and its answer returned",
@@ -467,10 +498,9 @@ async def main():
           set(stats["by_account"]) == {"lan"} and counts(stats["by_account"]["lan"]) == (1, 7, 3, 0, 0))
     check("by_device counts the device's provider and Claude requests together",
           counts(stats["by_device"].get("desk")) == (3, 218, 48, 102, 1))
-    agg = R.aggregate_audit()
-    check("aggregate_audit() agrees with /rotate/stats",
-          (agg["by_provider"], agg["by_account"], agg["by_device"])
-          == (stats["by_provider"], stats["by_account"], stats["by_device"]))
+    audited = rows()
+    check("each audit record names a provider or a Claude account, never both",
+          audited and all(("provider" in rec) != ("account" in rec) for rec in audited))
     await C.aclose()
 
 

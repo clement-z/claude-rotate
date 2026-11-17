@@ -214,6 +214,33 @@ async def paths(c):
         check(f"{path} stays on {host}" + (" under /api" if up == "lan" else ""),
               r.status_code == 200 and calls(before) == {up: 1}
               and (req.url.scheme, req.url.host, req.url.port) == ("https", host, None) and req.url.raw_path == raw)
+    # Under a base path, what a server behind the upstream could still turn into a dot
+    # segment or a separator: more layers of encoding, or ";" parameters it strips.
+    for path in ("/lan/%252e%252e/x", "/lan/%25252e%25252e/x", "/lan/a%252Fb", "/lan/a%255Cb",
+                 "/lan/..;x/y", "/lan/%2e%2e;jsessionid=1/x", "/lan/.;a/x", "/lan/%252e%252e%253Bx/y"):
+        before = snap()
+        r = await ask(c, path, "allbox")
+        check(f"{path}: 400 under lan's base path, without an upstream call",
+              r.status_code == 400 and calls(before) == {})
+    for path, up, raw in (("/lan/a;b/c", "lan", b"/api/a;b/c"), ("/lan/50%2525", "lan", b"/api/50%2525"),
+                          ("/openai/v1/%252e%252e/x", "openai", b"/v1/%252e%252e/x"),
+                          ("/openai/v1/..;x/y", "openai", b"/v1/..;x/y"),
+                          ("/v1/files/%252e%252e", "anthropic", b"/v1/files/%252e%252e"),
+                          ("/v1/files/..;x", "anthropic", b"/v1/files/..;x")):
+        before = snap()
+        r = await ask(c, path, "allbox")
+        check(f"{path}: forwarded as sent (" + ("an ordinary ; or %25" if up == "lan" else "no base path") + ")",
+              r.status_code == 200 and calls(before) == {up: 1} and seen[up][-1].url.raw_path == raw)
+    lan = R.PROVIDERS["lan"]
+    lan.upstream = "https://lan.example"
+    try:
+        before = snap()
+        r = await ask(c, "/lan/%252e%252e/x", "allbox")
+    finally:
+        lan.upstream = LAN_SPEC["upstream"]
+    check("a static provider at the root of its origin is not confined",
+          r.status_code == 200 and calls(before) == {"lan": 1} and seen["lan"][-1].url.raw_path == b"/%252e%252e/x")
+
     before = snap()
     r = await ask(c, f"/lan/x?a=1&key={KEY['allbox']}&b=x%20y&key=other&k%65y={KEY['allbox']}&c=%2B+d", "allbox")
     req = seen["lan"][-1]
@@ -334,12 +361,13 @@ async def connection_lines(c):
           r.status_code == 200 and "x-up" not in r.headers)
     forwarded = []
     for up, path in (("lan", "/lan/x"), ("anthropic", "/v1/messages")):
+        count = len(seen[up])
         r = await c.get("http://proxy" + path, headers=[
             ("authorization", f"Bearer {KEY['allbox']}"), ("connection", "keep-alive"),
             ("connection", "x-secret"), ("x-secret", "1")])
-        forwarded.append(r.status_code == 200 and "x-secret" in seen[up][-1].headers)
+        forwarded.append((r.status_code, len(seen[up]) - count, "x-secret" in seen[up][-1].headers))
     check("lan and Claude path: a header named on the request's second Connection line is not forwarded",
-          forwarded == [False, False])
+          forwarded == [(200, 1, False), (200, 1, False)])
 
 
 async def main():

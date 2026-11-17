@@ -61,7 +61,7 @@ AUDIT_PATH = Path(os.environ.get("CLAUDE_ROTATE_AUDIT", ROOT / "logs" / "audit.j
 UPSTREAM = "https://api.anthropic.com"
 HOP = {
     "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
 }
 # These belong to the local browser or reverse-proxy trust boundary.
 PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
@@ -1726,11 +1726,13 @@ def response_headers(upstream: httpx.Response, *extra: str) -> dict:
     return {k: v for k, v in upstream.headers.items() if k.lower() not in drop}
 
 
-def upstream_path(request: Request, drop: int = 0) -> str:
+def upstream_path(request: Request, drop: int = 0, confined: bool = False) -> str:
     """The path as the client sent it, percent-encoding kept, without its first `drop`
     segments. Rebuilt from the decoded path, an encoded "?" or "/" would become a
     delimiter, and a segment that decodes to "." or ".." could climb out of the
-    upstream's base path once normalized; both are refused."""
+    upstream's base path once normalized; both are refused. `confined`, for an
+    upstream mounted under a base path, also refuses what a server behind it could
+    still turn into one: more layers of encoding, or ";" parameters it strips."""
     raw = request.scope.get("raw_path") or quote(request.scope["path"]).encode()
     try:
         raw = raw.split(b"?", 1)[0].decode("ascii")
@@ -1738,8 +1740,11 @@ def upstream_path(request: Request, drop: int = 0) -> str:
         raise HTTPException(status_code=400, detail="path must use percent-encoding")
     segments = raw.split("/")[1:]
     for segment in segments:
-        plain = unquote(segment)
-        if plain in (".", "..") or "/" in plain or "\\" in plain:
+        forms, plain = [], segment
+        for _ in range(4 if confined else 1):
+            plain = unquote(plain)
+            forms += [plain, plain.split(";", 1)[0]] if confined else [plain]
+        if any(f in (".", "..") or "/" in f or "\\" in f for f in forms):
             raise HTTPException(status_code=400, detail="path has a dot segment or an encoded separator")
     return "/" + "/".join(segments[drop:])
 
@@ -1768,6 +1773,18 @@ def upstream_query(request: Request) -> str:
     return "?" + query if query else ""
 
 
+def head_length(response: Response, request: Request, upstream: httpx.Response) -> Response:
+    """A HEAD answer carries the length the upstream gave for the body it left out, or
+    none: not the 0 Starlette computes from the empty body. A Connection-nominated
+    length is hop-by-hop and is not passed on."""
+    if request.method == "HEAD":
+        length = upstream.headers.get("content-length")
+        del response.headers["content-length"]
+        if length is not None and "content-length" not in connection_nominated(upstream.headers):
+            response.headers["content-length"] = length
+    return response
+
+
 def request_model(request: Request, body: bytes) -> str | None:
     if body and request.method == "POST":
         try:
@@ -1793,7 +1810,8 @@ async def provider_proxy(request: Request, prov):
     body = await bounded_body(request)
     fwd = forward_headers(request)
     fwd.pop("authorization", None)
-    path = upstream_path(request, drop=1)
+    path = upstream_path(request, drop=1, confined=prov.kind == "static-bearer"
+                         and httpx.URL(prov.upstream).raw_path.strip(b"/") != b"")
     url = upstream_url(prov.upstream, path, upstream_query(request))
     rec = {"device": device, "provider": prov.name, "path": prov.prefix + path,
            "method": request.method, "model": request_model(request, body)}
@@ -1821,7 +1839,7 @@ async def provider_proxy(request: Request, prov):
     resp_headers["content-security-policy"] = "default-src 'none'; sandbox; frame-ancestors 'none'"
     resp_headers["x-rotate-provider"] = prov.name
 
-    if "text/event-stream" in upstream.headers.get("content-type", ""):
+    if request.method != "HEAD" and "text/event-stream" in upstream.headers.get("content-type", ""):
         meter = providers.SseUsage()
 
         async def relay():
@@ -1832,7 +1850,10 @@ async def provider_proxy(request: Request, prov):
                     yield chunk
                 done = True
             except httpx.HTTPError as exc:
+                # Headers are out, so no 502 can follow: the client must see the stream break,
+                # not a clean end it would take for a complete answer.
                 rec["interrupted"] = f"upstream {type(exc).__name__}"
+                raise
             finally:
                 if not done and "interrupted" not in rec:
                     rec["interrupted"] = "client"
@@ -1840,8 +1861,7 @@ async def provider_proxy(request: Request, prov):
                 rec["usage"] = meter.usage
                 audit(rec)
 
-        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers,
-                                 media_type=upstream.headers.get("content-type"))
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
     try:
         content = await bounded_response(upstream)
@@ -1856,10 +1876,9 @@ async def provider_proxy(request: Request, prov):
         rec["usage"] = providers.usage_of(json.loads(content))
     except (ValueError, RecursionError):
         pass
-    if request.method == "HEAD" and "content-length" in upstream.headers:
-        resp_headers["content-length"] = upstream.headers["content-length"]
     audit(rec)
-    return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
+    return head_length(Response(content=content, status_code=upstream.status_code, headers=resp_headers),
+                       request, upstream)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
@@ -1909,9 +1928,7 @@ async def proxy(request: Request, path: str):
                 audit(rec)
                 await note_response(account, upstream.headers, upstream.status_code)
 
-        return StreamingResponse(relay(), status_code=upstream.status_code,
-                                 headers=resp_headers,
-                                 media_type=upstream.headers.get("content-type"))
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
     content = await bounded_response(upstream)
     try:

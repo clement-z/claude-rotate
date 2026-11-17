@@ -104,7 +104,14 @@ credential. What that changes:
   on this origin, where device keys and the dashboard live. The upstream URL is
   built from the raw request path; a segment that decodes to `.` or `..` or hides a
   separator is refused, and the result must stay under the configured base URL.
-  Other request headers and the body pass through unchanged.
+  For a static upstream mounted under a base path (`https://host/api`), segments
+  that would become a dot segment or a separator after more decoding, or once a
+  server strips `;` parameters, are refused too. That covers the common ways a
+  server behind the upstream re-reads a path, not every one: if the provider's
+  bearer is also valid for other applications on that origin, prefer an upstream
+  at the root of an origin of its own. Other request headers and the body pass
+  through unchanged; a stream the upstream breaks off reaches the client as a
+  broken connection, not a clean end.
 - Static bearer tokens sit with the account tokens under `/etc/claude-rotate/tokens`
   (read-only to the service). The ChatGPT credential sits in
   `/var/lib/claude-rotate/credentials`, owned by the service with mode 0600,
