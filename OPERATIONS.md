@@ -188,16 +188,36 @@ installation failed. It reports the installation and the restart separately. Del
 refreshes it kills it for both.
 
 `status` (and `status --json`) lists each provider with its state (`ok`,
-`unsaved`, `unavailable` or `down`), the access token's remaining minutes and the
-client and host ids. A provider that is down or unavailable answers 503 with the
-reason. `unsaved` means a refreshed credential could not be written: it keeps
-serving, the save is retried every minute, and a restart before it succeeds needs
-a new sign-in. Fix the disk first.
+`unavailable` or `down`), whether its credential is on disk, the access token's
+remaining minutes and the client and host ids. A provider that is down or
+unavailable answers 503 with the reason. "NOT ON DISK" (`unsaved` in JSON) means
+the credential in memory could not be written: the access token in hand keeps
+serving, no further refresh is made until the save, retried every minute, works,
+and a restart before then needs a new sign-in. Fix the disk first and do not
+restart the service until the flag is gone.
 A refused refresh needs a new sign-in: run `siwc_login.py login --client-id ID
 --host-id ID` with the ids from `status` to reuse the registration, then
 `install-credential` again. A failing refresh that was not refused (OpenAI
 unreachable, a 5xx) is retried every minute and shown as a panel alert; requests
 keep working while the access token in hand lasts.
+
+### Moving a credential from an earlier build
+
+Builds of the `multi-provider` branch before this one kept the credential at
+`<state dir>/<provider>-credential.json` (or at a `credential_file` set in the
+provider entry) and wrote `openai-credential.json` from `siwc_login.py`. The
+proxy now reads only `<state dir>/credentials/<provider>.json` and refuses to
+start while a provider entry still has `credential_file`. To move: remove
+`credential_file` from the entry, stop the service, and install the file the
+server last wrote, not the one from the sign-in machine (the server's refreshes
+have spent that one):
+
+```sh
+sudo systemctl stop claude-rotate
+sudo cp /var/lib/claude-rotate/openai-credential.json /tmp/openai.json
+sudo claude-rotate-admin install-credential openai --file /tmp/openai.json
+sudo rm /tmp/openai.json /var/lib/claude-rotate/openai-credential.json*
+```
 
 ## Tailscale and dashboard
 

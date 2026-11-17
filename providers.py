@@ -4,8 +4,9 @@ static-bearer   a base URL and a token file: the device key is replaced by
                 Authorization: Bearer <token>.
 openai-siwc     one "Sign in with ChatGPT" credential (plan usage) forwarded to
                 api.openai.com. One refresh at a time; new tokens are written to
-                disk before they are used; a refused refresh takes the provider
-                down until a new sign-in is installed.
+                disk before they are used, and no further refresh is made until
+                they are; a refused refresh takes the provider down until a new
+                sign-in is installed.
 
 Protocol: https://developers.openai.com/siwc/token-sharing-open-source (read 2026-11-17).
 Tokens never leave this module except in the upstream Authorization header: not in
@@ -13,10 +14,8 @@ logs, audit records, status or error messages.
 """
 import asyncio
 import codecs
-import hashlib
 import http.cookiejar
 import json
-import math
 import os
 import re
 import shutil
@@ -74,6 +73,10 @@ def load_providers(cfg: dict, config_dir: Path, state_dir: Path) -> dict:
         if not isinstance(spec, dict) or spec.get("kind") not in KEYS:
             raise SystemExit(f"provider '{name}': kind must be static-bearer or openai-siwc")
         unknown = set(spec) - KEYS[spec["kind"]]
+        if spec["kind"] == "openai-siwc" and "credential_file" in unknown:
+            raise SystemExit(f"provider '{name}': credential_file is gone; the credential lives at "
+                             f"credentials/{name}.json in the state directory (see OPERATIONS.md, "
+                             "\"Moving a credential from an earlier build\")")
         if unknown:
             raise SystemExit(f"provider '{name}': unknown key(s) {', '.join(sorted(unknown))} for "
                              f"{spec['kind']}" + (" (it talks to OpenAI only)" if spec["kind"] == "openai-siwc" else ""))
@@ -85,9 +88,10 @@ def load_providers(cfg: dict, config_dir: Path, state_dir: Path) -> dict:
         seen.add(segment)
         spec = dict(spec, prefix="/" + segment)
         if spec["kind"] == "static-bearer":
-            if not (isinstance(spec.get("upstream"), str) and URL_RE.match(spec["upstream"])):
-                raise SystemExit(f"provider '{name}': upstream must be an http(s) URL without "
-                                 "user info, query or fragment")
+            if not (isinstance(spec.get("upstream"), str) and URL_RE.match(spec["upstream"])
+                    and usable_origin(spec["upstream"])):
+                raise SystemExit(f"provider '{name}': upstream must be an http(s) URL with a host, "
+                                 "an optional port from 1 to 65535, and no user info, query or fragment")
             if not isinstance(spec.get("token_file"), str) or not spec["token_file"].strip():
                 raise SystemExit(f"provider '{name}': static-bearer needs a token_file")
             table[name] = StaticBearer(name, spec, config_dir)
@@ -106,6 +110,14 @@ async def maintain_loop(table: dict) -> None:
                 print(f"warning: provider {provider.name}: maintenance failed "
                       f"({type(exc).__name__})", file=sys.stderr)
         await asyncio.sleep(60)
+
+
+def usable_origin(url: str) -> bool:
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL:
+        return False
+    return bool(parsed.host) and (parsed.port is None or 0 < parsed.port < 65536)
 
 
 async def _check(alive) -> None:
@@ -151,7 +163,6 @@ class OpenAISiwc:
         # Named after the provider, in a directory of its own: two providers can never
         # hold the same rotating credential, and no other file shares the names.
         self.path = state_dir / "credentials" / f"{name}.json"
-        self.marker = self.path.with_suffix(".down")
         self.client = httpx.AsyncClient(timeout=TIMEOUT, cookies=NO_COOKIES)
         self.auth = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0), cookies=NO_COOKIES)
         self.lock = asyncio.Lock()
@@ -173,16 +184,19 @@ class OpenAISiwc:
         if not usable_record(rec):
             self.down = f"credential credentials/{self.path.name} lacks a token, the client_id or its expiry"
             return {}
-        # A refusal is remembered against this credential, so a restart does not serve
-        # with it again; installing a new credential clears it.
-        try:
-            marker = json.loads(self.marker.read_text())
-        except (OSError, ValueError):
-            marker = None
-        if isinstance(marker, dict) and marker.get("generation") == generation(rec):
-            self.down = str(marker.get("reason") or "refused earlier")
-        elif marker is not None:
-            self.marker.unlink(missing_ok=True)
+        # What the gateway learnt about this credential is saved in the record itself, so
+        # a restart keeps it and installing a new credential clears it.
+        notes = rec.get(NOTES) if isinstance(rec.get(NOTES), dict) else {}
+        if isinstance(notes.get("refused"), str):
+            self.down = notes["refused"]
+        elif notes.get("lost") is True:
+            self.lost = True
+            self.last_error = ("a refresh answer was lost before the last restart; OpenAI may have "
+                               "rotated the token, the next try will tell")
+            if number(notes.get("retry_at")):
+                self.retry_at = float(notes["retry_at"])
+            if type(notes.get("failures")) is int and notes["failures"] > 0:
+                self.failures = notes["failures"]
         return rec
 
     def _remaining(self) -> float:
@@ -199,6 +213,9 @@ class OpenAISiwc:
         return self.rec["access_token"]
 
     def _unavailable(self) -> str:
+        if self.unsaved:
+            return ("the access token expired and no refresh is made until the last one is on disk: "
+                    + self.unsaved)
         wait = earliest_refresh(self.rec) - time.time()
         return ("the access token expired and " + (
             f"OpenAI allows the next refresh in {round(wait)} s" if wait > 0 else
@@ -221,8 +238,8 @@ class OpenAISiwc:
         if self.rec.get("access_token") == token:
             return upstream, 0  # no replacement: the caller gets OpenAI's 401
         await upstream.aclose()
-        await _check(alive)
         token = await self.token()
+        await _check(alive)  # last, after every wait
         return await self.client.send(self.client.build_request(
             method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True), 1
 
@@ -234,23 +251,28 @@ class OpenAISiwc:
         async with self.lock:
             if self.down or not self.rec or self.rec.get("access_token") != seen:
                 return
+            if self.unsaved:
+                # Another rotation would spend the refresh token in memory while the disk
+                # still holds a spent one: retry the save, rotate only once it is on disk.
+                self._save(self.rec)
+                if self.unsaved:
+                    return
             now = time.time()
             if now < self.retry_at or (not force and now < earliest_refresh(self.rec)):
                 return
-            if self.unsaved:
-                self._save(self.rec)
             try:
                 r = await self.auth.post(SIWC_AUTH + "/api/accounts/oauth/token",
                                          headers={"accept": "application/json"}, data={
                     "grant_type": "refresh_token", "client_id": self.rec["client_id"],
                     "refresh_token": self.rec["refresh_token"], "resource": SIWC_RESOURCE})
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
                 return self._failed(f"token endpoint unreachable ({type(exc).__name__})")
             except httpx.HTTPError as exc:
-                # The request may have arrived: OpenAI may have rotated the token.
-                self.lost = True
+                # The request may have arrived and rotated the token. The next try sends the
+                # same refresh token once more: if OpenAI did rotate it, that try is refused
+                # as reused and the provider goes down, where a new sign-in is needed anyway.
                 return self._failed(f"the refresh answer was lost ({type(exc).__name__}); "
-                                    "OpenAI may have rotated the token, the next try will tell")
+                                    "OpenAI may have rotated the token, the next try will tell", lost=True)
             try:
                 data = r.json()
             except ValueError:
@@ -258,35 +280,40 @@ class OpenAISiwc:
             if r.status_code != 200:
                 code = error_code(data)
                 if r.status_code in (400, 401, 403) and code in FATAL:
-                    return self._refused(code)
+                    return self._refused(f"the refresh was refused ({code})" + (
+                        " after a lost refresh answer, so OpenAI had rotated it" if self.lost else ""))
                 return self._failed(f"token endpoint answered {r.status_code}" + (f" ({code})" if code else ""))
             rec = record_from(data, self.rec) if isinstance(data, dict) else None
-            if rec is None or not usable_record(rec):
-                self.lost = True  # a 200 rotates the token even when its body is unusable
-                return self._failed("the refresh answer was malformed; OpenAI may have rotated the token")
+            if rec is None:
+                # A 200 means the old refresh token is spent; its replacement is unusable.
+                return self._refused("OpenAI accepted the refresh but its answer lacks a usable access "
+                                     "token, refresh token or expiry, so the credential on disk is spent")
             # The old refresh token is dead from here on. A crash before the file is
             # renamed in place loses the new one too and needs a new sign-in; that
             # window is a single write and rename. If the write fails, the new tokens
             # still serve from memory, because refusing would not bring the old token
-            # back; status says "unsaved" and the save, not the refresh, is retried.
+            # back; status says "unsaved", the save is retried and nothing else rotates.
             self._save(rec)
             self.rec, self.last_error, self.lost = rec, None, False
             self.refreshes, self.failures, self.retry_at = self.refreshes + 1, 0, 0.0
 
-    def _failed(self, message: str) -> None:
+    def _failed(self, message: str, lost: bool = False) -> None:
         self.last_error = message
         self.failures += 1
-        self.retry_at = time.time() + min(RETRY_MAX_S, RETRY_S * 2 ** (self.failures - 1))
+        self.retry_at = time.time() + min(RETRY_MAX_S, RETRY_S * 2 ** min(self.failures - 1, 10))
+        if lost or self.lost:
+            # Kept across a restart, with the backoff: a restart neither forgets that the
+            # token may be spent nor tries again at once.
+            self.lost = True
+            self._note(lost=True, retry_at=self.retry_at, failures=self.failures)
 
-    def _refused(self, code: str) -> None:
-        self.down = (f"the refresh was refused ({code})"
-                     + (" after a lost refresh answer, so OpenAI had rotated it" if self.lost else "")
-                     + ": sign in again with siwc_login.py and install the new credential")
-        try:
-            write_private(self.marker, json.dumps({"generation": generation(self.rec), "reason": self.down}))
-        except OSError as exc:
-            print(f"warning: provider {self.name}: could not record the refusal ({type(exc).__name__})",
-                  file=sys.stderr)
+    def _refused(self, reason: str) -> None:
+        self.down = reason + ": sign in again with siwc_login.py and install the new credential"
+        self._note(refused=self.down)
+
+    def _note(self, **notes) -> None:
+        self.rec = dict(self.rec, **{NOTES: notes})
+        self._save(self.rec)
 
     def _save(self, rec: dict) -> None:
         try:
@@ -294,47 +321,44 @@ class OpenAISiwc:
             write_private(self.path, json.dumps(rec, indent=2) + "\n")
             self.unsaved = None
         except OSError as exc:
-            self.unsaved = (f"the refreshed credential could not be saved ({type(exc).__name__}); "
-                            "it serves from memory, and a restart now would need a new sign-in")
+            self.unsaved = (f"the credential in memory could not be written to disk ({type(exc).__name__}); "
+                            "a restart now would need a new sign-in")
 
     async def maintain(self) -> None:
-        if self.down or not self.rec:
+        if not self.rec:
             return
-        if self.unsaved:
+        if self.unsaved:  # also a refusal or a lost answer that is not on disk yet
             self._save(self.rec)
-        if self._remaining() < REFRESH_AHEAD_S:
+        if not self.down and self._remaining() < REFRESH_AHEAD_S:
             await self.refresh(self.rec["access_token"])
 
     def status(self) -> dict:
         now = time.time()
         saved = self.rec.get("refresh_saved_at")
-        state = ("down" if self.down else "unavailable" if self._remaining() <= 0
-                 else "unsaved" if self.unsaved else "ok")
+        state = "down" if self.down else "unavailable" if self._remaining() <= 0 else "ok"
         return {"kind": self.kind, "prefix": self.prefix, "upstream": self.upstream, "state": state,
-                "reason": self.down or (self._unavailable() if state == "unavailable" else self.unsaved),
-                "last_error": self.last_error,
+                "reason": self.down or (self._unavailable() if state == "unavailable" else None),
+                # Durability, apart from availability: whether disk holds what memory holds.
+                "unsaved": self.unsaved, "last_error": self.last_error,
                 "access_token_min": round(self._remaining() / 60) if self.rec else None,
                 # Refresh tokens live 30 days from their last rotation.
-                "refresh_token_days": round(30 - (now - saved) / 86400, 1)
-                if type(saved) in (int, float) else None,
+                "refresh_token_days": round(30 - (now - saved) / 86400, 1) if number(saved) else None,
                 "refreshes": self.refreshes, "client_id": self.rec.get("client_id"),
                 "host_id": self.rec.get("ext_agent_host_id"), "scopes": self.rec.get("scopes")}
 
 
-def finite(value) -> bool:
-    """A JSON number Python can do arithmetic with: not a bool, NaN or Infinity."""
-    return type(value) in (int, float) and math.isfinite(value)
+NOTES = "gateway"  # the record's field for what the gateway learnt: a refusal or a lost answer
+
+
+def number(value) -> bool:
+    """A JSON number usable as seconds: not a bool, NaN, Infinity or beyond any date."""
+    return type(value) in (int, float) and -1e15 < value < 1e15
 
 
 def usable_record(rec) -> bool:
-    return (isinstance(rec, dict) and finite(rec.get("expires_at"))
+    return (isinstance(rec, dict) and number(rec.get("expires_at"))
             and all(isinstance(rec.get(k), str) and rec[k].strip()
                     for k in ("access_token", "refresh_token", "client_id")))
-
-
-def generation(rec: dict) -> str:
-    """Identifies one credential without storing anything that could be replayed."""
-    return hashlib.sha256(str(rec.get("refresh_token")).encode()).hexdigest()[:16]
 
 
 def error_code(data) -> str | None:
@@ -345,15 +369,18 @@ def error_code(data) -> str | None:
 
 
 def record_from(resp: dict, previous: dict) -> dict | None:
-    """Credential record from a token response, fields a refresh omits kept; None when
-    the answer has no access token or an unusable expiry. Same shape as siwc_login.py
-    writes."""
+    """Credential record from a refresh answer, or None when the answer is unusable.
+    OpenAI rotates both tokens at every refresh, so the answer must carry both; the
+    identity fields a refresh omits (client_id, account, scopes) are kept, the
+    gateway's notes and the old earliest_refresh_at are not. Same shape as
+    siwc_login.py writes."""
+    if not all(isinstance(resp.get(k), str) and resp[k].strip() for k in ("access_token", "refresh_token")):
+        return None
     expires_in = resp.get("expires_in", 3600)
-    if not finite(expires_in) or expires_in <= 0 or not isinstance(resp.get("access_token"), str):
+    if not number(expires_in) or not 1 <= expires_in <= 30 * 86400:
         return None
     now = int(time.time())
-    rec = dict(previous)
-    rec.pop("earliest_refresh_at", None)  # it belongs to the token it came with
+    rec = {k: v for k, v in previous.items() if k not in (NOTES, "earliest_refresh_at", "expires_in")}
     for key in ("access_token", "refresh_token", "id_token", "token_type", "expires_in", "earliest_refresh_at"):
         if resp.get(key) is not None:
             rec[key] = resp[key]
@@ -362,23 +389,21 @@ def record_from(resp: dict, previous: dict) -> dict | None:
     rec["expires_at"] = now + int(expires_in)
     rec["saved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rec["refresh_saved_at"] = now
-    return rec
+    return rec if usable_record(rec) else None
 
 
 def earliest_refresh(rec: dict) -> int:
     """earliest_refresh_at as Unix seconds, or 0 when absent or unreadable."""
     value = rec.get("earliest_refresh_at")
-    if type(value) in (int, float):
-        return int(value) if math.isfinite(value) else 0
     if isinstance(value, str):
         try:
-            return int(value)
+            value = int(value)
         except ValueError:
             try:
-                return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+                value = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
             except ValueError:
                 return 0
-    return 0
+    return int(value) if number(value) else 0
 
 
 def write_private(path: Path, text: str) -> None:
@@ -395,6 +420,8 @@ def write_private(path: Path, text: str) -> None:
             prev = path.with_name(path.name + ".prev")
             prev.unlink(missing_ok=True)
             try:
+                if not path.is_symlink():
+                    os.chmod(path, 0o600)  # the backup shares its mode
                 os.link(path, prev)  # the live name never goes missing
             except OSError:
                 shutil.copyfile(path, prev)

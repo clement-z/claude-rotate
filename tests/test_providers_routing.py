@@ -425,12 +425,18 @@ cases = [("a provider named anthropic", {"anthropic": {"kind": "openai-siwc"}}, 
          ("upstream with a query", {"lan": LAN_SPEC | {"upstream": "https://lan.example/api?x=1"}}, "upstream"),
          ("upstream with a fragment", {"lan": LAN_SPEC | {"upstream": "https://lan.example/api#x"}}, "upstream"),
          ("upstream not http(s)", {"lan": LAN_SPEC | {"upstream": "ftp://lan.example/api"}}, "upstream"),
+         ("upstream without a host", {"lan": LAN_SPEC | {"upstream": "https://:8080/api"}}, "upstream"),
+         ("upstream with a nonnumeric port", {"lan": LAN_SPEC | {"upstream": "https://lan.example:abc/api"}}, "upstream"),
+         ("upstream with port 0", {"lan": LAN_SPEC | {"upstream": "https://lan.example:0/api"}}, "upstream"),
+         ("upstream with port 65536", {"lan": LAN_SPEC | {"upstream": "https://lan.example:65536/api"}}, "upstream"),
          ("static-bearer without token_file", {"lan": without_token}, "token_file"),
          ("static-bearer with a blank token_file", {"lan": LAN_SPEC | {"token_file": " "}}, "token_file")]
 cases += [(f"reserved prefix {p}", {"lan": LAN_SPEC | {"prefix": p}}, "prefix")
           for p in ("/v1", "/api", "/rotate", "/docs", "/redoc", "/anthropic")]
 cases += [(f"openai-siwc with {k}", {"openai": {"kind": "openai-siwc", k: "https://evil.example"}}, "unknown key")
-          for k in ("upstream", "auth_url", "credential_file")]
+          for k in ("upstream", "auth_url")]
+cases += [("openai-siwc with credential_file, from an earlier build",
+           {"openai": {"kind": "openai-siwc", "credential_file": "tokens/openai.json"}}, "credentials/openai.json")]
 for label, specs, word in cases:
     check(f"provider refused: {label}", refuses(providers_with, specs, word))
 

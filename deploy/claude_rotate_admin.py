@@ -1040,7 +1040,7 @@ def collect_status():
             report["live"] = {"active_account": live.get("active_account"),
                               "storage_errors": live.get("storage_errors"),
                               "providers": {n: {k: p.get(k) for k in (
-                                  "kind", "prefix", "state", "reason", "last_error", "client_id", "host_id",
+                                  "kind", "prefix", "state", "reason", "unsaved", "last_error", "client_id", "host_id",
                                   "access_token_min", "refresh_token_days")}
                                   for n, p in (live.get("providers") or {}).items() if isinstance(p, dict)},
                               "accounts": {n: {k: a.get(k) for k in ("effective_util_5h", "effective_util_7d",
@@ -1113,6 +1113,7 @@ def cmd_status(args) -> int:
             if isinstance(p, dict):
                 out(f"  provider {name} ({p.get('kind')}, {p.get('prefix')}): {p.get('state')}"
                     + (f": {p['reason']}" if p.get("reason") else "")
+                    + (f"; NOT ON DISK: {p['unsaved']}" if p.get("unsaved") else "")
                     + (f"; client_id {p['client_id']}, host id {p.get('host_id')}" if p.get("client_id") else "")
                     + (f"; access token {p['access_token_min']} min" if p.get("access_token_min") is not None else ""))
     elif report.get("live_error"):

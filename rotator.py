@@ -1284,6 +1284,8 @@ async def rotate_stats(request: Request):
     out["alerts"] = out["alerts"] + [{"level": "warn", "text": f"billing ignored: {e}"} for e in BILLING_ERRORS]
     for name, p in PROVIDERS.items():
         s = p.status()
+        if s.get("unsaved"):
+            out["alerts"].append({"level": "warn", "text": f"provider {name}: credential not on disk: {s['unsaved']}"})
         if s["reason"]:
             out["alerts"].append({"level": "warn", "text": f"provider {name} is {s['state']}: {s['reason']}"})
         elif s.get("last_error"):
@@ -1481,7 +1483,7 @@ async function refresh(){
   const names=accts.map(([n])=>n), i=names.indexOf(st.active_account), nxt=names.slice(i+1).concat(names.slice(0,i+1)).find(n=>n!==st.active_account&&usable(st.accounts[n]));
   $('host').textContent=location.host||'';
   $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is under its switch thresholds"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`
-    +Object.entries(st.providers||{}).map(([n,p])=>`<span class="pill" title="${esc(p.reason||p.last_error||p.kind)}"><span class="dot" style="background:var(--${['down','unavailable'].includes(p.state)?'crit':p.state!=='ok'||p.last_error?'warn':'good'})"></span>${esc(n)}</span>`).join('');
+    +Object.entries(st.providers||{}).map(([n,p])=>`<span class="pill" title="${esc(p.reason||p.unsaved||p.last_error||p.kind)}"><span class="dot" style="background:var(--${['down','unavailable'].includes(p.state)?'crit':p.state!=='ok'||p.unsaved||p.last_error?'warn':'good'})"></span>${esc(n)}</span>`).join('');
   $('alerts').innerHTML=(stats.alerts||[]).map(a=>`<div class="banner ${a.level==='warn'?'warn':''}">&#9888; <span><b>${a.level==='warn'?'Warning':'Note'}</b> ${esc(a.text)}</span></div>`).join('');
   // headline figures
   const last=(wk.series||[]).slice(-1)[0], now=last?last[0]:Date.now()/1000;

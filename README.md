@@ -445,15 +445,30 @@ path prefix; the bare root stays the rotated Claude accounts, unchanged.
   401, replaying the request only with a new token. Failed refreshes back off from
   30 s to 5 min. A refused refresh (`invalid_grant`, `invalid_client`,
   `refresh_token_reused`, `_expired` or `_invalidated`) takes the provider down,
-  across restarts until a new credential is installed: requests get 503 with the
-  reason, the panel shows an alert.
-- **Status.** `/rotate/status` gives each provider a state: `ok`; `unsaved` when a
-  refreshed credential could not be written (it keeps serving from memory, since
-  the spent refresh token cannot come back, and the save is retried every minute;
-  a restart in that state needs a new sign-in); `unavailable` when the access
-  token has expired and no refresh has worked yet; `down` after a refusal or
-  without a credential. A crash between OpenAI's answer to a refresh and the
-  rename of the new file also needs a new sign-in; that window is one write.
+  and so does a 200 that lacks either token or a usable expiry, since OpenAI has
+  rotated the token by then: requests get 503 with the reason, the panel shows an
+  alert, and a new sign-in is needed. The refusal is noted in the credential file
+  itself, so a restart stays down and installing a new credential clears it.
+- **Lost refresh answers.** When a refresh was sent but its answer never came
+  (a timeout or a dropped connection), OpenAI may or may not have rotated the
+  token. The proxy notes this in the credential file, backs off, and then sends
+  the same refresh token once more. If OpenAI had rotated it, that try is refused
+  as reused and the provider goes down: the state that requiring a new sign-in at
+  once would have reached, without the sign-in when the first request never took
+  effect. The cost is that OpenAI sees a reused refresh token for that sign-in,
+  which its reuse detection may answer by revoking the sign-in's tokens; the
+  proxy holds none of them by then. This does not rely on any grace period for a
+  rotated token: OpenAI does not document one for this flow.
+- **Status.** `/rotate/status` gives each provider a state: `ok`; `unavailable`
+  when the access token has expired and no refresh can be made yet; `down` after
+  a refusal or without a credential. Apart from the state, `unsaved` is set when
+  the credential in memory is not on disk: a refreshed credential, a refusal or a
+  lost answer that could not be written. The access token in memory keeps
+  serving, since the spent refresh token cannot come back, but no further refresh
+  is made until the save, retried every minute, works; once that token expires,
+  requests get 503. A restart while `unsaved` is set needs a new sign-in. A crash
+  between OpenAI's answer to a refresh and the rename of the new file also needs
+  a new sign-in; that window is one write.
 - **`prefix`** defaults to `/<name>`. It is one path segment and takes that
   segment away from the Claude passthrough; `/v1`, `/api`, `/rotate`, `/docs`,
   `/redoc` and `/anthropic` are refused.
