@@ -526,11 +526,18 @@ wire_api = "responses"
 env_key = "CLAUDE_ROTATE_KEY"        # export CLAUDE_ROTATE_KEY=<device key>
 requires_openai_auth = false
 supports_websockets = false
+model_catalog_url = "https://YOUR-TAILSCALE-HOST/openai/v1/models"
 ```
 
 Codex then sends `POST /openai/v1/responses` with `store: false` and
-`stream: true`, which the plan route requires, and `GET /openai/v1/models`. In
-this mode Codex shows no plan usage in `/status`. OpenAI lists request fields and
+`stream: true`, which the plan route requires. Without `model_catalog_url`, Codex
+(0.169.0) fetches no model catalog for a provider of its own: a model its release
+does not know gets "Model metadata for ... not found", a generic prompt, generic
+tools without `apply_patch` and a default context window. With it, Codex fetches
+`GET /openai/v1/models?client_version=...` through the proxy with the device key.
+To work from a saved copy of that catalog instead, set `model_catalog_json =
+"<file>"` at the top level of `config.toml`. In this mode Codex shows no plan
+usage in `/status`. OpenAI lists request fields and
 tools this route refuses (`max_output_tokens`, `temperature`, image generation,
 file search, hosted MCP, `tool_search` among them); the proxy passes such errors
 through unchanged.
