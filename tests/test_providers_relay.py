@@ -288,7 +288,8 @@ async def main():
           and one(new).get("status") == 502 and one(new).get("provider") == "lan")
 
     stream = Body(b'{"partial": ', httpx.ReadError("connection reset"))
-    lan.answer = lambda request: httpx.Response(200, headers={"content-type": "application/json"}, stream=stream)
+    lan.answer = lambda request: httpx.Response(
+        200, headers={"content-type": "application/json", "content-length": "40"}, stream=stream)
     r, new = await call("POST", "/lan/v1/messages", content=js({"model": "m"}))
     check("a buffered body that breaks off gives 502 'broke off', audited with the upstream status",
           r.status_code == 502 and "provider 'lan' broke off its answer (ReadError)" in r.text
@@ -300,12 +301,12 @@ async def main():
     try:
         await direct("POST", "/openai/v1/responses", js({"model": "gpt-5.1-codex", "stream": True}), sent=sent)
         raised = None
-    except Exception as exc:  # what Uvicorn sees: it then drops the connection without a last chunk
+    except Exception as exc:
         raised = exc
     chunks, new = [m for m in sent if m["type"] == "http.response.body"], rows()[before:]
     check("a stream that breaks off reaches the client broken: the bytes relayed, then no clean end",
-          "ReadError" in repr(raised) and b"".join(m.get("body", b"") for m in chunks) == created + delta
-          and all(m.get("more_body") for m in chunks))
+          b"".join(m.get("body", b"") for m in chunks) == created + delta and all(m.get("more_body") for m in chunks))
+    check("the app returns without raising, so Uvicorn logs one line and closes, no traceback", raised is None)
     check("and it is audited as interrupted by the upstream error, the upstream closed",
           one(new).get("interrupted") == "upstream ReadError" and one(new).get("status") == 200 and stream.closed)
 
@@ -340,13 +341,74 @@ async def main():
         R.MAX_REQUEST_BYTES = saved[0]
         R.MAX_RESPONSE_BYTES = 1024
         stream = Body(*[b"y" * 512] * 4)
-        lan.answer = lambda request: httpx.Response(200, headers={"content-type": "application/json"}, stream=stream)
+        lan.answer = lambda request: httpx.Response(
+            200, headers={"content-type": "application/json", "content-length": "2048"}, stream=stream)
         r, new = await call("POST", "/lan/v1/messages", content=js({"model": "m"}))
-        check("a buffered answer over max_response_bytes gets 502, audited with the upstream status, upstream closed",
+        check("a sized answer over max_response_bytes gets 502, audited with the upstream status, upstream closed",
               r.status_code == 502 and "upstream response too large" in r.text and one(new).get("status") == 502
               and one(new).get("upstream_status") == 200 and stream.closed)
+        stream = Body(*[b"y" * 512] * 4)
+        lan.answer = lambda request: httpx.Response(200, headers={"content-type": "application/json"}, stream=stream)
+        r, new = await call("POST", "/lan/v1/messages", content=js({"model": "m"}))
+        check("an unsized answer is relayed as it comes, so max_response_bytes does not cut it",
+              r.status_code == 200 and r.content == b"y" * 2048 and one(new).get("status") == 200)
     finally:
         R.MAX_REQUEST_BYTES, R.MAX_RESPONSE_BYTES = saved
+
+    # 3b. What OpenAI's /v1/responses really sends: an SSE stream with no Content-Type
+    # and no Content-Length, usage with cache writes, sequence numbers, a metadata event.
+    real_usage = {"input_tokens": 1200, "input_tokens_details": {
+        "cached_tokens": 1000, "cache_write_tokens": 150,
+        "cache_write_tokens_details": {"ttl_30m_tokens": 150, "ttl_12h_tokens": 0}},
+        "output_tokens": 7, "output_tokens_details": {"reasoning_tokens": 4}, "total_tokens": 1207,
+        "attribution": {"items": [{"id": "msg_1", "input_tokens": 1200, "output_tokens": 7}]}}
+    events = [("response.created", {"response": {"id": "resp_2", "status": "in_progress"}}),
+              ("response.metadata", {"metadata": {"turn": "1"}}),
+              ("response.output_text.delta", {"delta": "Hi"}),
+              ("response.completed", {"response": {"id": "resp_2", "status": "completed", "usage": real_usage}})]
+    wire = [f"event: {t}\ndata: {json.dumps(dict(e, type=t, sequence_number=i))}\n\n".encode()
+            for i, (t, e) in enumerate(events)]
+    held = asyncio.Event()
+    stream = Body(wire[0], held, *wire[1:])
+    openai.answer = lambda request: httpx.Response(200, headers={"date": "Tue, 17 Nov 2026 22:00:00 GMT",
+                                                                 "server": "cloudflare"}, stream=stream)
+    sent, before = [], len(rows())
+    task = asyncio.create_task(direct("POST", "/openai/v1/responses",
+                                      js({"model": "gpt-5.1-codex", "stream": True}), sent=sent))
+    first = await until(lambda: any(m.get("body") for m in sent if m["type"] == "http.response.body"))
+    check("a stream without Content-Type reaches the client as it comes: the first event before the upstream ends",
+          first and not task.done() and b"".join(m.get("body", b"") for m in sent[1:]) == wire[0])
+    held.set()
+    head, body = await task
+    hdrs = [(k.decode(), v.decode()) for k, v in head.get("headers", [])]
+    check("the whole stream arrives byte for byte, with no Content-Type invented and no Content-Length",
+          body == b"".join(wire) and not any(k in ("content-type", "content-length") for k, _ in hdrs))
+    check("the upstream's Date and Server are not relayed next to Uvicorn's",
+          not any(k in ("date", "server") for k, _ in hdrs))
+    check("its usage is audited: cached reads and cache writes taken out of input_tokens",
+          one(rows()[before:]).get("usage") == usage(50, 7, 1000, 150) and stream.closed)
+
+    stream = Body(wire[0], httpx.RemoteProtocolError("peer closed connection"))
+    openai.answer = lambda request: httpx.Response(200, stream=stream)
+    sent, before = [], len(rows())
+    await direct("POST", "/openai/v1/responses", js({"model": "gpt-5.1-codex", "stream": True}), sent=sent)
+    chunks = [m for m in sent if m["type"] == "http.response.body"]
+    check("such a stream broken off reaches the client unfinished and is audited as interrupted",
+          b"".join(m.get("body", b"") for m in chunks) == wire[0] and all(m.get("more_body") for m in chunks)
+          and one(rows()[before:]).get("interrupted") == "upstream RemoteProtocolError" and stream.closed)
+    check("admission slot released after a broken stream", gate().active == 0)
+
+    answer = js({"id": "resp_3", "usage": real_usage})
+    openai.answer = lambda request: httpx.Response(200, content=answer)
+    r, new = await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
+    check("a sized JSON answer without Content-Type is buffered, relayed and its usage audited",
+          r.status_code == 200 and r.content == answer and r.headers.get("content-length") == str(len(answer))
+          and "content-type" not in r.headers and one(new).get("usage") == usage(50, 7, 1000, 150))
+    openai.answer = lambda request: httpx.Response(200, stream=Body(answer[:30], answer[30:]))
+    r, new = await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
+    check("an unsized JSON answer without Content-Type is relayed as it comes and its usage still audited",
+          r.status_code == 200 and r.content == answer and one(new).get("usage") == usage(50, 7, 1000, 150))
+    openai.answer = lambda request: httpx.Response(200, json={"ok": True})
 
     # 4. HEAD and OPTIONS
     lan.answer = lambda request: httpx.Response(

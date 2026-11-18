@@ -1703,6 +1703,29 @@ async def openai_chat(request: Request):
     return JSONResponse(anthropic_to_oai(data), headers=resp_headers)
 
 
+class StreamBroken(Exception):
+    """An upstream stream broke off after the response headers went out."""
+
+
+class QuietBreaks:
+    """A broken stream must reach the client as a broken connection, so the response
+    is left unfinished; Uvicorn then closes the connection and logs one line
+    ("ASGI callable returned without completing response") instead of a traceback.
+    The audit record already names the upstream error."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        except StreamBroken:
+            pass
+
+
+app.add_middleware(QuietBreaks)
+
+
 def connection_nominated(headers) -> set:
     """Headers a Connection header names are hop-by-hop too (RFC 9110, section 7.6.1),
     on every Connection line: Starlette's get() returns only the first."""
@@ -1835,12 +1858,17 @@ async def provider_proxy(request: Request, prov):
         rec["retries"] = retries
     # Upstream cookies belong to the upstream. A provider page opened in a browser must
     # not run script on this origin, where the panel and device keys are used.
-    resp_headers = response_headers(upstream, "set-cookie", "content-security-policy")
+    # Uvicorn adds its own Date and Server; the upstream's would make a second of each.
+    resp_headers = response_headers(upstream, "set-cookie", "content-security-policy", "date", "server")
     resp_headers["content-security-policy"] = "default-src 'none'; sandbox; frame-ancestors 'none'"
     resp_headers["x-rotate-provider"] = prov.name
 
-    if request.method != "HEAD" and "text/event-stream" in upstream.headers.get("content-type", ""):
-        meter = providers.SseUsage()
+    # Relayed as it arrives unless the upstream sent a sized answer, which is complete
+    # once read: OpenAI's /v1/responses streams carry no Content-Type, so that header
+    # cannot decide. Only a sized answer is buffered, so only it meets max_response_bytes.
+    if request.method != "HEAD" and ("text/event-stream" in upstream.headers.get("content-type", "")
+                                     or "content-length" not in upstream.headers):
+        meter = providers.StreamUsage()
 
         async def relay():
             done = False
@@ -1853,7 +1881,7 @@ async def provider_proxy(request: Request, prov):
                 # Headers are out, so no 502 can follow: the client must see the stream break,
                 # not a clean end it would take for a complete answer.
                 rec["interrupted"] = f"upstream {type(exc).__name__}"
-                raise
+                raise StreamBroken() from exc
             finally:
                 if not done and "interrupted" not in rec:
                     rec["interrupted"] = "client"

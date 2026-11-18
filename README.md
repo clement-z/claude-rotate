@@ -487,9 +487,14 @@ from the provider cannot run script on the proxy's origin. A path segment that
 decodes to `.` or `..` or hides a `/` or `\` gets 400, here and on the Claude
 passthrough.
 Nothing there is paced or rotated: a 429 from another provider goes back to the
-client and never touches a Claude account. Usage from Responses (`response.completed`),
-Chat Completions and Anthropic-format answers is recorded in the audit log with a
-`provider` field and counted per device. Costs come from `prices_per_mtok`; a model
+client and never touches a Claude account. An answer is relayed as it arrives
+unless the upstream gives its length (OpenAI's `/v1/responses` streams carry no
+Content-Type, so that header does not decide); only a sized answer is buffered and
+held to `max_response_bytes`. Usage from Responses (`response.completed`), Chat
+Completions and Anthropic-format answers, streamed or not, is recorded in the audit
+log with a `provider` field and counted per device; OpenAI's cache reads and cache
+writes are taken out of its `input_tokens` and recorded as cache read and cache
+write, as for Claude. Costs come from `prices_per_mtok`; a model
 it does not name counts as $0 rather than at a made-up Claude price.
 
 **Signing in.** On a machine with a browser:

@@ -462,9 +462,41 @@ def usage_of(event) -> dict | None:
     if type(prompt) is not int and type(output) is not int:
         return None
     details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
-    cached = n(details.get("cached_tokens")) if isinstance(details, dict) else 0
-    return {"input_tokens": max(0, n(prompt) - cached), "output_tokens": n(output),
-            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}
+    details = details if isinstance(details, dict) else {}
+    # Both are parts of input_tokens: what the prompt cache served and what it stored.
+    # Taken out of input_tokens, the four fields stay disjoint, as in Anthropic's usage.
+    cached, written = n(details.get("cached_tokens")), n(details.get("cache_write_tokens"))
+    return {"input_tokens": max(0, n(prompt) - cached - written), "output_tokens": n(output),
+            "cache_read_input_tokens": cached, "cache_creation_input_tokens": written}
+
+
+class StreamUsage:
+    """Usage from a body relayed as it arrives, whatever its Content-Type says (OpenAI
+    sends none on /v1/responses streams): SSE events as they pass, or a JSON document
+    kept up to SSE_LINE_MAX and read at the end. The first bytes tell which."""
+
+    def __init__(self):
+        self.sse, self.doc, self.kind = SseUsage(), bytearray(), None
+
+    def feed(self, chunk: bytes) -> None:
+        if self.kind is None:
+            head = chunk.lstrip()
+            if not head:
+                return
+            self.kind = "json" if head[:1] in (b"{", b"[") else "sse"
+        if self.kind == "sse":
+            self.sse.feed(chunk)
+        elif self.doc is not None:
+            self.doc = None if len(self.doc) + len(chunk) > SSE_LINE_MAX else self.doc + chunk
+
+    @property
+    def usage(self) -> dict | None:
+        if self.kind == "sse":
+            return self.sse.usage
+        try:
+            return usage_of(json.loads(self.doc)) if self.kind == "json" and self.doc else None
+        except (ValueError, RecursionError):
+            return None
 
 
 class SseUsage:
