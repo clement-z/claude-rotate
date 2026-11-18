@@ -1871,19 +1871,22 @@ async def provider_proxy(request: Request, prov):
         meter = providers.StreamUsage()
 
         async def relay():
-            done = False
+            done = ended = False
             try:
                 async for chunk in upstream.aiter_bytes():
                     meter.feed(chunk)
                     yield chunk
+                    ended = meter.ended  # set only once the client has been handed it
                 done = True
             except httpx.HTTPError as exc:
-                # Headers are out, so no 502 can follow: the client must see the stream break,
-                # not a clean end it would take for a complete answer.
-                rec["interrupted"] = f"upstream {type(exc).__name__}"
-                raise StreamBroken() from exc
+                if not ended:
+                    # Headers are out, so no 502 can follow: the client must see the stream
+                    # break, not a clean end it would take for a complete answer.
+                    rec["interrupted"] = f"upstream {type(exc).__name__}"
+                    raise StreamBroken() from exc
             finally:
-                if not done and "interrupted" not in rec:
+                # A client that hangs up after the terminal event has the whole answer.
+                if not done and not ended and "interrupted" not in rec:
                     rec["interrupted"] = "client"
                 await upstream.aclose()
                 rec["usage"] = meter.usage

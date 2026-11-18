@@ -57,6 +57,7 @@ os.environ.update(CLAUDE_ROTATE_CONFIG=str(tmp / "config.json"),
                   CLAUDE_ROTATE_AUDIT=str(tmp / "audit.jsonl"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import providers as P  # noqa: E402
 import rotator as R  # noqa: E402
 
 
@@ -146,10 +147,11 @@ async def call(method, path, key=DESK, content=None):
     return r, rows()[before:]
 
 
-async def direct(method, path, body=b"", key=DESK, gone=None, cut_after_body=False, sent=None):
+async def direct(method, path, body=b"", key=DESK, gone=None, cut_after_body=False, sent=None, cut_after=None):
     """Run the app with a hand-made receive and send, as Uvicorn would (ASGI spec 2.3).
     receive hands over the body, then blocks until `gone` is set and reports a
-    disconnect; cut_after_body sets `gone` at the first nonempty response chunk.
+    disconnect; cut_after_body sets `gone` at the first nonempty response chunk,
+    cut_after once the bytes sent so far contain it.
     Returns (response start message, response body); `sent` collects the messages,
     for a caller that expects the app to raise."""
     gone = gone or asyncio.Event()
@@ -166,6 +168,8 @@ async def direct(method, path, body=b"", key=DESK, gone=None, cut_after_body=Fal
     async def send(message):
         sent.append(message)
         if cut_after_body and message["type"] == "http.response.body" and message.get("body"):
+            gone.set()
+        if cut_after is not None and cut_after in b"".join(m.get("body", b"") for m in sent):
             gone.set()
 
     headers = [(b"host", b"proxy"), (b"authorization", f"Bearer {key}".encode())]
@@ -465,6 +469,50 @@ async def main():
           head.get("status") == 200 and body.startswith(created) and b"response.completed" not in body
           and one(new).get("interrupted") == "client" and one(new).get("provider") == "openai" and stream.closed)
     check("admission slot released after a stream cut by the client", gate().active == 0)
+
+    # A client that hangs up once it has the terminal event (Codex does, after
+    # response.completed) got the whole answer: not interrupted.
+    failed = (b'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_1",'
+              b'"status":"failed","error":{"code":"server_error"}}}\n\n')
+    incomplete = (b'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_1",'
+                  b'"status":"incomplete"}}\n\n')
+    chat = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+    for label, up, path, events, marker in (
+            ("response.completed", openai, "/openai/v1/responses", [created, delta, done], b"response.completed"),
+            ("response.failed", openai, "/openai/v1/responses", [created, failed], b"response.failed"),
+            ("response.incomplete", openai, "/openai/v1/responses", [created, incomplete], b"response.incomplete"),
+            ("Anthropic message_stop", lan, "/lan/v1/messages", [start, text, final, stop], b"message_stop"),
+            ("Chat Completions data: [DONE]", lan, "/lan/v1/chat/completions", [chat, b"data: [DONE]\n\n"],
+             b"[DONE]")):
+        stream = Body(*events, asyncio.Event())  # the upstream keeps the stream open afterwards
+        up.answer = lambda request, stream=stream: sse(stream)
+        before = len(rows())
+        head, body = await direct("POST", path, js({"model": "m", "stream": True}), cut_after=marker)
+        rec = one(rows()[before:])
+        check(f"a client that hangs up after {label} is not audited as interrupted",
+              head.get("status") == 200 and body == b"".join(events) and rec.get("status") == 200
+              and "interrupted" not in rec and stream.closed)
+        if label == "response.completed":
+            check("and its usage is recorded", rec.get("usage") == usage(200, 50, 1000, 0))
+
+    stream = Body(created, done, httpx.ReadError("connection reset"))
+    openai.answer = lambda request: sse(stream)
+    sent, before = [], len(rows())
+    await direct("POST", "/openai/v1/responses", js({"model": "m", "stream": True}), sent=sent)
+    check("an upstream that breaks off after the terminal event ends the answer cleanly, not interrupted",
+          sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+          and "interrupted" not in one(rows()[before:]))
+
+    meter = P.SseUsage()
+    meter.feed(b'data: {"type":"response.output_text.delta","delta":"error"}\n\nevent: response.completed\n')
+    meter.feed(b'data: {"type":"response.completed","response":{}}\n')
+    half = meter.ended
+    meter.feed(b"\n")
+    check("a terminal event counts once its closing blank line is in, and a delta saying error does not end",
+          half is False and meter.ended is True)
+    meter = P.SseUsage()
+    meter.feed(b"event: response.output_text.delta\r\ndata: {}\r\n\r\nevent: message_stop\r\ndata: {}\r\n\r\n")
+    check("CRLF line ends are read too", meter.ended is True)
 
     entered, release, gone = asyncio.Event(), asyncio.Event(), asyncio.Event()
 

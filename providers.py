@@ -46,6 +46,11 @@ REFRESH_AHEAD_S = 600  # the background loop refreshes this long before expiry
 REFRESH_INLINE_S = 60  # below this a request refreshes first
 RETRY_S, RETRY_MAX_S = 30, 300  # backoff after a failed refresh, shared by every caller
 SSE_LINE_MAX = 8 * 1024 * 1024  # a longer SSE line is skipped for usage, still relayed
+# Events after which a stream has nothing more to say: a client may hang up once it
+# has one (Codex does, after response.completed) without having cut the answer short.
+# Responses: completed, failed, incomplete, error; Anthropic: message_stop, error;
+# Chat Completions: data: [DONE].
+TERMINAL = {"response.completed", "response.failed", "response.incomplete", "message_stop", "error"}
 # A cookie one device's call receives must not ride along on another device's call.
 NO_COOKIES = http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
 
@@ -478,6 +483,11 @@ class StreamUsage:
     def __init__(self):
         self.sse, self.doc, self.kind = SseUsage(), bytearray(), None
 
+    @property
+    def ended(self) -> bool:
+        """A terminal SSE event has passed. A JSON body has none: it ends with its bytes."""
+        return self.kind == "sse" and self.sse.ended
+
     def feed(self, chunk: bytes) -> None:
         if self.kind is None:
             head = chunk.lstrip()
@@ -502,11 +512,13 @@ class StreamUsage:
 class SseUsage:
     """Usage from an SSE stream fed chunk by chunk; lines may span chunks. Counters
     are cumulative, and Anthropic's arrive split (input in message_start, output in
-    message_delta), so each keeps the largest value seen."""
+    message_delta), so each keeps the largest value seen. `ended` turns true once a
+    terminal event is complete, at the blank line that closes it."""
 
     def __init__(self):
         self.decode = codecs.getincrementaldecoder("utf-8")(errors="replace").decode
         self.buf, self.skip, self.usage = "", False, None
+        self.terminal, self.ended = False, False
 
     def feed(self, chunk: bytes) -> None:
         lines = (self.buf + self.decode(chunk)).split("\n")
@@ -515,11 +527,25 @@ class SseUsage:
             if self.skip:  # the tail of an oversized line
                 self.skip = False
                 continue
-            if line.startswith("data:") and '"usage"' in line:
+            line = line.rstrip("\r")
+            if not line:
+                self.ended, self.terminal = self.ended or self.terminal, False
+            elif line.startswith("event:"):
+                self.terminal = self.terminal or line[6:].strip() in TERMINAL
+            elif line.startswith("data:"):
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    self.terminal = True
+                    continue
+                if '"usage"' not in data and not any(name in data for name in TERMINAL):
+                    continue
                 try:
-                    usage = usage_of(json.loads(line[5:]))
+                    event = json.loads(data)
                 except (ValueError, RecursionError):
                     continue
+                if isinstance(event, dict) and event.get("type") in TERMINAL:
+                    self.terminal = True
+                usage = usage_of(event)
                 if usage:
                     self.usage = {k: max(v, (self.usage or {}).get(k, 0)) for k, v in usage.items()}
         if len(self.buf) > SSE_LINE_MAX:
