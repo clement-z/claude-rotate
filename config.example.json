@@ -24,28 +24,7 @@
     "my-laptop": "dev-my-laptop-REPLACE-WITH-RANDOM-HEX"
   },
   "providers": {},
-  "prices_per_mtok": {
-    "fable": [
-      10.0,
-      50.0
-    ],
-    "mythos": [
-      10.0,
-      50.0
-    ],
-    "opus": [
-      5.0,
-      25.0
-    ],
-    "sonnet": [
-      3.0,
-      15.0
-    ],
-    "haiku": [
-      1.0,
-      5.0
-    ]
-  },
+  "prices_per_mtok": {},
   "alerts": {
     "device_tokens_per_hour": 5000000,
     "util_warn": 0.8

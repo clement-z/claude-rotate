@@ -822,15 +822,50 @@ async def bounded_response(upstream: httpx.Response) -> bytes:
     return bytes(body)
 
 
-# API list prices per MTok (input, output), matched by substring of the model id.
-# Cost columns are *API-equivalent* dollars: what this usage would cost pay-per-token.
-# Override in config.json under "prices_per_mtok".
-PRICES = CFG.get("prices_per_mtok", {
+# API list prices per MTok, [input, output] or [input, output, cached input], matched
+# by the longest pattern found in the model id. Without a cached-input price a cache
+# read costs 0.1x input; a cache write costs 1.25x input. Cost columns are
+# *API-equivalent* dollars: what this usage would cost pay-per-token.
+BUILTIN_PRICES = {
     "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
     "opus": [5.0, 25.0],
     "sonnet": [3.0, 15.0],
     "haiku": [1.0, 5.0],
-})
+    # OpenAI Standard tier, short context (up to 272K input tokens), read 2026-11-19 from
+    # https://developers.openai.com/api/docs/pricing. gpt-5.6-sol is a promotional
+    # price until 2026-11-30. The -pro and -nano rows keep those models from taking
+    # the price of the shorter name they contain.
+    "gpt-6.2-astra": [8.0, 40.0, 0.4], "gpt-6.2-sol": [2.0, 10.0, 0.1],
+    "gpt-6.1-sol": [2.0, 10.0, 0.1], "gpt-6.1-terra": [1.0, 5.0, 0.05],
+    "gpt-6-astra": [10.0, 50.0, 1.0], "gpt-6-sol": [2.0, 10.0, 0.2], "gpt-6-luna": [0.1, 0.5, 0.01],
+    "gpt-5.6-sol": [4.0, 20.0, 0.4], "gpt-5.6-terra": [2.0, 12.0, 0.2], "gpt-5.6-luna": [0.2, 1.2, 0.02],
+    "gpt-5.5": [5.0, 30.0, 0.5], "gpt-5.5-pro": [30.0, 180.0],
+    "gpt-5.4": [2.5, 15.0, 0.25], "gpt-5.4-mini": [0.75, 4.5, 0.075], "gpt-5.4-nano": [0.2, 1.25, 0.02],
+    "gpt-5.4-pro": [30.0, 180.0],
+    "gpt-5.3-codex": [1.75, 14.0, 0.175],
+}
+
+
+def load_prices() -> dict:
+    """The built-in table with config.json's prices_per_mtok laid over it entry by
+    entry, so an install whose config holds an older copy still gets new entries. A
+    malformed entry is reported and skipped: costs are analytics, never a reason to
+    stop the proxy."""
+    table = dict(BUILTIN_PRICES)
+    extra = CFG.get("prices_per_mtok", {})
+    for pattern, price in (extra.items() if isinstance(extra, dict) else []):
+        if (isinstance(pattern, str) and pattern and isinstance(price, list) and len(price) in (2, 3)
+                and all(type(v) in (int, float) and 0 <= v < 1e6 for v in price)):
+            table[pattern] = price
+        else:
+            print(f"warning: prices_per_mtok entry {pattern!r} ignored: it needs [input, output] or "
+                  "[input, output, cached input], in $ per MTok", file=sys.stderr)
+    if not isinstance(extra, dict):
+        print("warning: prices_per_mtok ignored: it must map model patterns to prices", file=sys.stderr)
+    return table
+
+
+PRICES = load_prices()
 DEFAULT_PRICE = [5.0, 25.0]
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
@@ -839,25 +874,25 @@ ALERT_CFG = CFG.get("alerts", {
 
 
 def price_for(model: str | None, default=DEFAULT_PRICE) -> list[float] | None:
-    model = model if isinstance(model, str) else None
-    for pat, p in PRICES.items():
-        if model and pat in model:
-            return p
-    return default
+    """The entry of the longest pattern found in the model id, so gpt-5.4-mini is not
+    priced as gpt-5.4 whatever the order of the table."""
+    matches = [pat for pat in PRICES if isinstance(model, str) and pat in model]
+    return PRICES[max(matches, key=len)] if matches else default
 
 
 def api_cost(model: str | None, usage: dict, provider=None) -> float:
-    """API-equivalent $ for one request: in + out + cache read (0.1x) + cache write (1.25x).
+    """API-equivalent $ for one request: in + out + cache read (the cached-input price,
+    or 0.1x input) + cache write (1.25x input).
     Another provider's model costs 0 unless prices_per_mtok names it: the Claude
     default price would be invented."""
     price = price_for(model, None if provider else DEFAULT_PRICE)
     if price is None:
         return 0.0
-    p_in, p_out = price
+    p_in, p_out, *cached = price
     return (
         usage.get("input_tokens", 0) * p_in
         + usage.get("output_tokens", 0) * p_out
-        + usage.get("cache_read_input_tokens", 0) * p_in * 0.1
+        + usage.get("cache_read_input_tokens", 0) * (cached[0] if cached else p_in * 0.1)
         + usage.get("cache_creation_input_tokens", 0) * p_in * 1.25
     ) / 1_000_000
 
