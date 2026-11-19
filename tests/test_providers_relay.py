@@ -288,7 +288,7 @@ async def main():
     lan.answer = refused
     r, new = await call("POST", "/lan/v1/messages", content=js({"model": "m"}))
     check("a transport error before headers gives 502 naming the provider, and an audit record",
-          r.status_code == 502 and "provider 'lan' is unreachable (ConnectError)" in r.text
+          r.status_code == 502 and "provider 'lan' is unreachable: ConnectError" in r.text
           and one(new).get("status") == 502 and one(new).get("provider") == "lan")
 
     stream = Body(b'{"partial": ', httpx.ReadError("connection reset"))

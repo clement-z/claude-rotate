@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -123,6 +124,20 @@ def usable_origin(url: str) -> bool:
     except httpx.InvalidURL:
         return False
     return bool(parsed.host) and (parsed.port is None or 0 < parsed.port < 65536)
+
+
+def connect_failure(exc: Exception) -> str:
+    """What a connect error says: a name that did not resolve shows as a gaierror
+    under httpx's ConnectError. A timeout covers the lookup and the TCP connect
+    together, so it cannot say which of them hung."""
+    cause, depth = exc, 0
+    while cause is not None and depth < 8:
+        if isinstance(cause, socket.gaierror):
+            return f"its name did not resolve ({cause.strerror or 'gaierror'})"
+        cause, depth = cause.__cause__ or cause.__context__, depth + 1
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "no connection in time (ConnectTimeout: the name lookup or the TCP connect hung)"
+    return type(exc).__name__
 
 
 async def _check(alive) -> None:
@@ -271,7 +286,7 @@ class OpenAISiwc:
                     "grant_type": "refresh_token", "client_id": self.rec["client_id"],
                     "refresh_token": self.rec["refresh_token"], "resource": SIWC_RESOURCE})
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
-                return self._failed(f"token endpoint unreachable ({type(exc).__name__})")
+                return self._failed(f"token endpoint unreachable: {connect_failure(exc)}")
             except httpx.HTTPError as exc:
                 # The request may have arrived and rotated the token. The next try sends the
                 # same refresh token once more: if OpenAI did rotate it, that try is refused

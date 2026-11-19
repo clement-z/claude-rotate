@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import sys
 import tempfile
@@ -102,6 +103,13 @@ class Stand:
             raise httpx.ConnectError("fake: connection refused", request=req)
         if action == "pool":
             raise httpx.PoolTimeout("fake: no free connection")
+        if action == "dns":
+            try:
+                raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+            except socket.gaierror as exc:
+                raise httpx.ConnectError("fake: lookup failed", request=req) from exc
+        if action == "connect-timeout":
+            raise httpx.ConnectTimeout("fake: timed out", request=req)
         if action == "timeout-before":
             raise httpx.ReadTimeout("fake: timed out", request=req)
         if action == "500":
@@ -482,7 +490,7 @@ async def lost_answer():
     t0 = time.time()
     await prov.maintain()
     check("a ConnectError is a failure with lost staying False",
-          prov.lost is False and prov.last_error == "token endpoint unreachable (ConnectError)"
+          prov.lost is False and prov.last_error == "token endpoint unreachable: ConnectError"
           and prov.rec == rec and round(prov.retry_at - t0) == 30 and prov.down is None and stand.n == 2
           and P.NOTES not in disk(prov))
     observe(prov)
@@ -491,8 +499,18 @@ async def lost_answer():
     stand.script = ["pool"]
     await prov.maintain()
     check("a PoolTimeout (the request never left) is a failure with lost staying False",
-          prov.lost is False and prov.last_error == "token endpoint unreachable (PoolTimeout)"
+          prov.lost is False and prov.last_error == "token endpoint unreachable: PoolTimeout"
           and P.NOTES not in disk(prov))
+
+    for action, expected in (
+            ("dns", "token endpoint unreachable: its name did not resolve (Temporary failure in name resolution)"),
+            ("connect-timeout", "token endpoint unreachable: no connection in time (ConnectTimeout: "
+                                "the name lookup or the TCP connect hung)")):
+        stand, state, prov = fresh(expires_in=300)
+        stand.script = [action]
+        await prov.maintain()
+        check(f"a {action} failure says so, lost staying False", prov.lost is False and prov.last_error == expected)
+        observe(prov)
 
 
 async def malformed(variants):

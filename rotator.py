@@ -1852,7 +1852,7 @@ async def provider_proxy(request: Request, prov):
         return refuse(503, f"provider '{prov.name}' is unavailable: {exc}", "provider_unavailable")
     except httpx.HTTPError as exc:
         audit(rec | {"status": 502})
-        return refuse(502, f"provider '{prov.name}' is unreachable ({type(exc).__name__})", "api_error")
+        return refuse(502, f"provider '{prov.name}' is unreachable: {providers.connect_failure(exc)}", "api_error")
     rec["status"] = upstream.status_code
     if retries:
         rec["retries"] = retries
