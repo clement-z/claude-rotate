@@ -1878,7 +1878,7 @@ async def provider_proxy(request: Request, prov):
         return not await request.is_disconnected()
 
     try:
-        upstream, retries = await prov.send(request.method, url, fwd, body, alive)
+        upstream, retries, notes = await prov.send(request.method, url, fwd, body, alive)
     except providers.ClientGone:
         audit(rec | {"status": 499})
         raise HTTPException(status_code=499, detail="client disconnected")
@@ -1891,6 +1891,7 @@ async def provider_proxy(request: Request, prov):
     rec["status"] = upstream.status_code
     if retries:
         rec["retries"] = retries
+    rec.update(notes)
     # Upstream cookies belong to the upstream. A provider page opened in a browser must
     # not run script on this origin, where the panel and device keys are used.
     # Uvicorn adds its own Date and Server; the upstream's would make a second of each.

@@ -442,8 +442,10 @@ path prefix; the bare root stays the rotated Claude accounts, unchanged.
   ten minutes before expiry and not before OpenAI's `earliest_refresh_at`, one
   refresh at a time, writes the new tokens to disk before using them (the previous
   file is kept as `.prev`), and refreshes once if OpenAI answers a request with
-  401, replaying the request only with a new token. Failed refreshes back off from
-  30 s to 5 min. A refused refresh (`invalid_grant`, `invalid_client`,
+  401, replaying the request only with a new token. That refresh is made at most
+  once every 10 minutes, counting every refresh, so no run of requests can rotate
+  the credential faster; within that time the caller gets OpenAI's 401. Failed
+  refreshes back off from 30 s to 5 min. A refused refresh (`invalid_grant`, `invalid_client`,
   `refresh_token_reused`, `_expired` or `_invalidated`) takes the provider down,
   and so does a 200 that lacks either token or a usable expiry, since OpenAI has
   rotated the token by then: requests get 503 with the reason, the panel shows an
@@ -547,6 +549,14 @@ usage in `/status`. OpenAI lists request fields and
 tools this route refuses (`max_output_tokens`, `temperature`, image generation,
 file search, hosted MCP, `tool_search` among them); the proxy passes such errors
 through unchanged.
+
+For an operation the route does not allow at all, such as `POST
+/openai/v1/images/generations`, OpenAI answers 401 with error type
+`rejected_by_hardened_oauth_boundary` ("This ChatPass credential is not authorized
+for the requested operation"), although the credential is valid. The proxy hands
+that answer to the client byte for byte, without a refresh or a replay, since a new
+token would get the same answer. The audit record carries `upstream_error` (OpenAI's
+error type) and `refresh_after_401` (skipped, held back, or attempted) for any 401.
 
 ## Configuration (`config.json`)
 

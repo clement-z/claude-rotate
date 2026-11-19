@@ -198,7 +198,7 @@ async def down_msg(awaitable):
 
 
 async def send(prov):
-    r, retries = await prov.send("POST", URL, {"content-type": "application/json"}, b'{"model": "m"}')
+    r, retries, _ = await prov.send("POST", URL, {"content-type": "application/json"}, b'{"model": "m"}')
     await r.aread()
     await r.aclose()
     return r.status_code, retries
@@ -347,6 +347,95 @@ async def after_401():
     tokens = await asyncio.gather(*tasks)
     check("callers queued behind a slow refresh get its token without a second refresh",
           in_flight and stand.calls == 1 and tokens[:3] == [stand.access] * 3)
+    observe(prov)
+
+
+HARDENED = json.dumps({"error": {
+    "message": "This ChatPass credential is not authorized for the requested operation.",
+    "type": "rejected_by_hardened_oauth_boundary", "code": "hardened_oauth_rule_missing", "param": None},
+    "status": 401}).encode()
+IMAGES = httpx.URL("https://api.openai.com/v1/images/generations")
+
+
+def answering(stand, prov, answer):
+    """Inference through answer(request) -> Response or None (None: the stand-in's own)."""
+    async def handler(req):
+        response = answer(req)
+        if response is None:
+            return await stand.inference(req)
+        stand.urls.append(str(req.url))
+        stand.bearers.append(req.headers.get("authorization"))
+        return response
+    prov.client._transport = httpx.MockTransport(handler)
+
+
+async def send_to(prov, url):
+    """(status, retries, notes, body, headers) of one request."""
+    r, retries, notes = await prov.send("POST", url, {"content-type": "application/json"}, b'{"model": "m"}')
+    body = await r.aread()
+    await r.aclose()
+    return r.status_code, retries, notes, body, r.headers
+
+
+async def unauthorized_401s():
+    stand, state, prov = fresh(earliest_refresh_at=int(time.time()) + 1800)
+    answering(stand, prov, lambda req: httpx.Response(
+        401, content=HARDENED, headers={"content-type": "application/json", "x-request-id": "req_1"})
+        if req.url.path == "/v1/images/generations" else None)
+    results = [await send_to(prov, IMAGES) for _ in range(20)]
+    check("20 requests answered 401 'not authorized for the requested operation' cause no refresh and no replay",
+          stand.calls == 0 and len(stand.urls) == 20 and set(stand.bearers) == {f"Bearer {stand.access}"}
+          and all(r[:2] == (401, 0) for r in results))
+    check("the caller gets that 401 byte for byte, with its headers",
+          all(r[3] == HARDENED and r[4].get("content-type") == "application/json" and r[4].get("x-request-id") == "req_1"
+              for r in results))
+    check("the notes name OpenAI's error type and say no refresh was tried",
+          results[0][2] == {"upstream_error": "rejected_by_hardened_oauth_boundary",
+                            "refresh_after_401": "skipped: operation refused"})
+    stand.revoke_access()
+    status, retries, notes, _, _ = await send_to(prov, URL)
+    check("they leave the floor alone: a 401 on a revoked token right after still gets its refresh",
+          (status, retries) == (200, 1) and stand.calls == 1 and notes["refresh_after_401"] == "attempted")
+    observe(prov)
+
+    stand, state, prov = fresh()
+    expired = json.dumps({"error": {"message": "The access token expired.", "type": "invalid_request_error",
+                                    "code": "token_expired"}}).encode()
+    answering(stand, prov, lambda req: httpx.Response(401, content=expired)
+              if req.headers["authorization"] != f"Bearer {stand.access}" else None)
+    stand.revoke_access()
+    status, retries, notes, _, _ = await send_to(prov, URL)
+    check("a 401 saying the token expired gets one refresh and a replay",
+          (status, retries) == (200, 1) and stand.calls == 1
+          and notes == {"upstream_error": "invalid_request_error", "refresh_after_401": "attempted"})
+
+    # Every request is refused with a 401 nobody can classify: one refresh, then the floor.
+    stand, state, prov = fresh()
+    answering(stand, prov, lambda req: httpx.Response(401, content=b"unauthorized"))
+    first = await send_to(prov, URL)
+    rest = [await send_to(prov, URL) for _ in range(10)]
+    check("repeated unknown 401s: one refresh and replay, then none for 10 min, each 401 relayed",
+          first[:2] == (401, 1) and first[2] == {"refresh_after_401": "attempted"} and stand.calls == 1
+          and all(r[:2] == (401, 0) and r[3] == b"unauthorized" for r in rest) and len(stand.urls) == 2 + 10
+          and rest[-1][2] == {"refresh_after_401": "held back: a refresh ran less than 10 min ago"})
+    prov.refreshed_at -= P.FORCED_REFRESH_MIN_S + 1
+    again = await send_to(prov, URL)
+    check("once the floor has passed, the next unknown 401 gets a refresh again",
+          again[:2] == (401, 1) and stand.calls == 2)
+
+    stand, state, prov = fresh(expires_in=300)
+    await prov.maintain()
+    answering(stand, prov, lambda req: httpx.Response(401, content=b"unauthorized"))
+    held = await send_to(prov, URL)
+    check("a 401 within 10 min of a routine refresh is held back as well",
+          stand.calls == 1 and held[:2] == (401, 0) and "held back" in held[2]["refresh_after_401"])
+
+    stand, state, prov = fresh()
+    big = b"x" * (P.PEEK_MAX + 5000)
+    answering(stand, prov, lambda req: httpx.Response(401, content=big, headers={"content-type": "text/plain"}))
+    status, retries, notes, body, _ = await send_to(prov, URL)
+    check("a 401 body larger than the read-ahead is relayed whole and handled as unknown",
+          status == 401 and body == big and notes == {"refresh_after_401": "attempted"} and stand.calls == 1)
     observe(prov)
 
 
@@ -707,6 +796,7 @@ async def main():
     await earliest_refresh()
     await inline_refresh()
     await after_401()
+    await unauthorized_401s()
     await failed_refresh()
     await refusal()
     await lost_answer()

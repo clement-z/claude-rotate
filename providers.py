@@ -46,6 +46,15 @@ FATAL = {"invalid_grant", "invalid_client", "refresh_token_reused",
 REFRESH_AHEAD_S = 600  # the background loop refreshes this long before expiry
 REFRESH_INLINE_S = 60  # below this a request refreshes first
 RETRY_S, RETRY_MAX_S = 30, 300  # backoff after a failed refresh, shared by every caller
+# A 401 on a token believed valid gets a refresh only this long after the last refresh
+# of any kind. A revoked or rotated credential is repaired by the first one; a second
+# 401 soon after is not about the token, and no run of client requests may rotate it
+# more often (each rotation risks a lost answer, and spends a refresh early).
+FORCED_REFRESH_MIN_S = 600
+PEEK_MAX = 64 * 1024  # how much of a 401 body is read to classify it
+# OpenAI's 401 for a valid credential asking for an operation the plan route does not
+# allow (images/generations, for one): a refresh cannot change that answer.
+REFUSED_OPERATION = {"rejected_by_hardened_oauth_boundary"}
 SSE_LINE_MAX = 8 * 1024 * 1024  # a longer SSE line is skipped for usage, still relayed
 # Events after which a stream has nothing more to say: a client may hang up once it
 # has one (Codex does, after response.completed) without having cut the answer short.
@@ -158,13 +167,14 @@ class StaticBearer:
         self.down = None if self._token else f"token file {spec['token_file']} is missing or empty"
 
     async def send(self, method: str, url: httpx.URL, headers: dict, body: bytes, alive=None):
-        """(streamed upstream response, retries)."""
+        """(streamed upstream response, retries, audit notes). A 401 changes nothing here:
+        the token is static."""
         if self.down:
             raise ProviderDown(self.down)
         await _check(alive)
         request = self.client.build_request(
             method, url, headers=headers | {"authorization": f"Bearer {self._token}"}, content=body)
-        return await self.client.send(request, stream=True), 0
+        return await self.client.send(request, stream=True), 0, {}
 
     async def maintain(self) -> None:
         pass
@@ -189,6 +199,7 @@ class OpenAISiwc:
         self.down = self.unsaved = self.last_error = None
         self.lost = False  # a refresh answer went missing: OpenAI may have rotated the token
         self.refreshes, self.failures, self.retry_at = 0, 0, 0.0
+        self.refreshed_at = 0.0  # when the token endpoint was last asked, for any reason
         self.rec = self._load()
 
     def _load(self) -> dict:
@@ -243,31 +254,44 @@ class OpenAISiwc:
             f"{max(0, round(self.retry_at - time.time()))} s"))
 
     async def send(self, method: str, url: httpx.URL, headers: dict, body: bytes, alive=None):
-        """(streamed upstream response, retries). An upstream 401 gets one refresh; the
-        request is replayed only with a new token, and not for a caller that left."""
+        """(streamed upstream response, retries, audit notes). An upstream 401 gets one
+        refresh, unless it says the operation is not allowed or a refresh ran less than
+        FORCED_REFRESH_MIN_S ago; the request is replayed only with a new token, and not
+        for a caller that left. The caller gets any 401 byte for byte."""
         token = await self.token()
         await _check(alive)
         upstream = await self.client.send(self.client.build_request(
             method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True)
         if upstream.status_code != 401:
-            return upstream, 0
-        await self.refresh(token, force=True)
+            return upstream, 0, {}
+        upstream, answer = await peek(upstream)
+        kind = error_type(answer)
+        notes = {"upstream_error": kind} if kind else {}
+        if kind in REFUSED_OPERATION:
+            return upstream, 0, notes | {"refresh_after_401": "skipped: operation refused"}
+        asked = self.refreshed_at
+        await self.refresh(token, force=True)  # waits for one in flight, which may be enough
+        notes["refresh_after_401"] = (
+            "attempted" if self.refreshed_at != asked
+            else "held back: a refresh ran less than 10 min ago" if time.time() - asked < FORCED_REFRESH_MIN_S
+            else "not attempted: the refresh is backing off or the credential is not on disk")
         if self.down:
             await upstream.aclose()
             raise ProviderDown(self.down)
         if self.rec.get("access_token") == token:
-            return upstream, 0  # no replacement: the caller gets OpenAI's 401
+            return upstream, 0, notes  # no replacement: the caller gets OpenAI's 401
         await upstream.aclose()
         token = await self.token()
         await _check(alive)  # last, after every wait
         return await self.client.send(self.client.build_request(
-            method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True), 1
+            method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True), 1, notes
 
     async def refresh(self, seen: str | None, force: bool = False) -> None:
         """Serialized. A caller that waited on the lock finds the token it saw already
         replaced and returns, so a rotating refresh token is never sent twice. Failed
         attempts set one retry time that every caller honours; routine refreshes also
-        wait for OpenAI's earliest_refresh_at, a refresh after a 401 does not."""
+        wait for OpenAI's earliest_refresh_at, a refresh after a 401 does not, but it
+        waits FORCED_REFRESH_MIN_S after the last refresh of any kind."""
         async with self.lock:
             if self.down or not self.rec or self.rec.get("access_token") != seen:
                 return
@@ -280,6 +304,9 @@ class OpenAISiwc:
             now = time.time()
             if now < self.retry_at or (not force and now < earliest_refresh(self.rec)):
                 return
+            if force and now - self.refreshed_at < FORCED_REFRESH_MIN_S:
+                return  # the floor on refreshes that requests can cause
+            self.refreshed_at = now
             try:
                 r = await self.auth.post(SIWC_AUTH + "/api/accounts/oauth/token",
                                          headers={"accept": "application/json"}, data={
@@ -379,6 +406,47 @@ def usable_record(rec) -> bool:
     return (isinstance(rec, dict) and number(rec.get("expires_at"))
             and all(isinstance(rec.get(k), str) and rec[k].strip()
                     for k in ("access_token", "refresh_token", "client_id")))
+
+
+class Peeked(httpx.AsyncByteStream):
+    """A response body whose first bytes were read ahead, handed on whole."""
+
+    def __init__(self, head: bytes, rest, upstream: httpx.Response):
+        self.head, self.rest, self.upstream = head, rest, upstream
+
+    async def __aiter__(self):
+        if self.head:
+            yield self.head
+        async for chunk in self.rest:
+            yield chunk
+
+    async def aclose(self):
+        await self.upstream.aclose()
+
+
+async def peek(upstream: httpx.Response) -> tuple[httpx.Response, bytes | None]:
+    """(the same answer, to relay unchanged; its body if it is at most PEEK_MAX bytes)."""
+    rest, head, whole = upstream.aiter_bytes(), b"", True
+    try:
+        while len(head) <= PEEK_MAX:
+            head += await rest.__anext__()
+        whole = False
+    except StopAsyncIteration:
+        pass
+    # The bytes are decoded already: the copy must not decode them again.
+    headers = [(k, v) for k, v in upstream.headers.multi_items() if k.lower() != "content-encoding"]
+    return (httpx.Response(upstream.status_code, headers=headers, request=upstream.request,
+                           stream=Peeked(head, rest, upstream)), head if whole else None)
+
+
+def error_type(body: bytes | None) -> str | None:
+    """error.type of an OpenAI error answer, only if it looks like one."""
+    try:
+        err = json.loads(body).get("error") if body else None
+    except (ValueError, RecursionError, AttributeError):
+        return None
+    kind = err.get("type") if isinstance(err, dict) else None
+    return kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", kind) else None
 
 
 def error_code(data) -> str | None:

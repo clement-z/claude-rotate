@@ -314,6 +314,21 @@ async def main():
     check("and it is audited as interrupted by the upstream error, the upstream closed",
           one(new).get("interrupted") == "upstream ReadError" and one(new).get("status") == 200 and stream.closed)
 
+    hardened = js({"error": {"message": "This ChatPass credential is not authorized for the requested operation.",
+                             "type": "rejected_by_hardened_oauth_boundary", "code": "hardened_oauth_rule_missing",
+                             "param": None}, "status": 401})
+    openai.answer = lambda request: httpx.Response(401, content=hardened, headers={"content-type": "application/json"})
+    n, n_auth = len(openai.calls), len(auth.calls)
+    for _ in range(3):
+        r, new = await call("POST", "/openai/v1/images/generations", content=js({"model": "gpt-image-2", "prompt": "x"}))
+    check("OpenAI's 401 for an operation the plan route refuses reaches the client byte for byte",
+          r.status_code == 401 and r.content == hardened and r.headers.get("content-type") == "application/json")
+    check("and causes neither a refresh nor a replay", len(auth.calls) == n_auth and len(openai.calls) == n + 3)
+    check("the audit record names OpenAI's error type and that no refresh was tried",
+          one(new).get("status") == 401 and one(new).get("upstream_error") == "rejected_by_hardened_oauth_boundary"
+          and one(new).get("refresh_after_401") == "skipped: operation refused" and "retries" not in one(new))
+    openai.answer = lambda request: httpx.Response(200, json={"ok": True})
+
     oai = R.PROVIDERS["openai"]
     n = len(openai.calls)
     oai.down = ("the refresh was refused (invalid_grant): sign in again with siwc_login.py "
