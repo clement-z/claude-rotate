@@ -322,4 +322,12 @@ it first. Keep the previous release and unit until verification passes. Roll
 back by stopping, switching `current` to the previous release, restoring the
 compatible unit/config if needed, daemon-reloading after unit changes, and
 starting again. State/config format compatibility must be checked for each
-release. These procedures interrupt connections; clients must tolerate reconnects.
+release.
+
+Rolling back to a release from before provider support: such a release refuses
+object-form device entries (`{"key": ..., "providers": [...]}`) and stays in
+`activating` with "devices must map names to nonempty device keys". It ignores a
+`providers` table next to string device keys, and the `credentials/` directory in
+the state directory does not disturb it. So copy `/etc/claude-rotate/config.json`
+before adding the first object-form device, and put that copy back, as root and
+with the service stopped, when rolling back to such a release. These procedures interrupt connections; clients must tolerate reconnects.

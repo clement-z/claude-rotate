@@ -70,12 +70,22 @@ class Refused(Exception):
     """Nothing was changed; the message explains why."""
 
 
+def _print(stream, parts):
+    try:
+        print(*parts, file=stream, flush=True)
+    except BrokenPipeError:
+        # The reader left (`| head`): finish the work, send the rest of the output nowhere.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stream.fileno())
+        os.close(devnull)
+
+
 def out(*parts):
-    print(*parts, flush=True)
+    _print(sys.stdout, parts)
 
 
 def err(*parts):
-    print(*parts, file=sys.stderr, flush=True)
+    _print(sys.stderr, parts)
 
 
 # ---------------------------------------------------------------- identity, paths
@@ -693,8 +703,11 @@ def cmd_remove_user(args) -> int:
 def read_credential(args) -> str:
     if args.file:
         refuse_symlink(Path(args.file), "credential file")
-        with open(args.file, "rb") as handle:
-            data = handle.read(CRED_MAX_BYTES + 1)
+        try:
+            with open(args.file, "rb") as handle:
+                data = handle.read(CRED_MAX_BYTES + 1)
+        except OSError as exc:
+            raise Refused(f"cannot read {args.file} ({exc.strerror or type(exc).__name__}); nothing changed")
     elif sys.stdin.isatty():
         raise Refused("pass --file FILE or pipe the credential file in; nothing changed")
     else:
@@ -829,6 +842,10 @@ def cmd_install_credential(args) -> int:
                                   + (f": {detail}" if detail else "") + "); credential not installed")
                 stopped_by_us = True
         live = CREDENTIALS / (args.provider + ".json")
+        try:  # for the message only: install_credential_file decides as the service user
+            replacing = stat.S_ISREG(os.lstat(live).st_mode)
+        except OSError:
+            replacing = False
         try:
             as_service(lambda: install_credential_file(f"{args.provider}.json",
                                                        data if data.endswith("\n") else data + "\n"))
@@ -844,8 +861,8 @@ def cmd_install_credential(args) -> int:
         except BaseException:
             err(f"error: install-credential interrupted; {restore()}")
             raise
-        out(f"credential for '{args.provider}' installed as {live} "
-            f"(owner {SERVICE_USER}, mode 600; the previous one kept as .prev). "
+        out(f"credential for '{args.provider}' installed as {live} (owner {SERVICE_USER}, mode 600"
+            + ("; the previous one kept as .prev" if replacing else "") + "). "
             "Delete the file you installed from.")
         return activate(cfg, what=f"credential for '{args.provider}'")
 

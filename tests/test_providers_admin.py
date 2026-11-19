@@ -141,6 +141,17 @@ def test_install_refusals():
         check(f"install-credential refuses {label} before the unit is touched",
               r.returncode == 1 and "nothing changed" in r.stderr
               and f"stop {UNIT}" not in f.calls() and not f.state_dir.exists(), (r, f.calls()))
+    unreadable = source(f, "unreadable.json", json.dumps(credential(1)))
+    unreadable.chmod(0)
+    for label, path in (("a missing --file", f.tmp / "upload" / "missing.json"),
+                        ("a directory as --file", f.tmp / "upload"), ("an unreadable --file", unreadable)):
+        reset(f)
+        r = install(f, path)
+        check(f"install-credential refuses {label} with one error line and no traceback",
+              r.returncode == 1 and r.stderr.startswith(f"error: cannot read {path} (") and "nothing changed" in r.stderr
+              and r.stderr.count("\n") == 1 and "Traceback" not in r.stderr
+              and f"stop {UNIT}" not in f.calls() and not f.state_dir.exists(), (r, f.calls()))
+    unreadable.chmod(0o600)
 
 
 def test_install_success_and_prev():
@@ -153,6 +164,7 @@ def test_install_success_and_prev():
     r = install(f, src)
     calls = f.calls()
     check("install-credential succeeds and the service is live again", r.returncode == 0 and "is live" in r.stdout, r)
+    check("a first install does not claim a .prev was kept", ".prev" not in r.stdout, r.stdout)
     check("the credential lands at <state dir>/credentials/openai.json", f.live.read_text() == first + "\n")
     # Not root: as_service forks without changing uid, so the owner is the caller.
     # The root path (setgid/setuid to the service user) is not exercised here.
@@ -174,6 +186,7 @@ def test_install_success_and_prev():
     reset(f)
     r = f.run("install-credential", "openai", input=second)  # from stdin this time
     prev = f.creds / "openai.json.prev"
+    check("a second install says the previous one was kept as .prev", "the previous one kept as .prev" in r.stdout, r)
     check("a second install (from stdin) keeps the first as .prev",
           r.returncode == 0 and f.live.read_text() == second and prev.read_text() == first + "\n"
           and mode(prev) == 0o600, r)
@@ -446,8 +459,21 @@ def test_install_partial_failures():
           and stop_then_start(f.calls()) and f.live.read_text() == two, (r, f.calls()))
 
 
+def test_closed_stdout():
+    # `claude-rotate-admin status | head -1`: the reader leaves after one line.
+    f = make()
+    p = subprocess.Popen([sys.executable, "-I", str(ADMIN), "status"], env=f.env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    p.stdout.close()
+    stderr = p.stderr.read().decode()
+    p.wait(timeout=60)
+    check("a command whose stdout closes early ends without a BrokenPipeError traceback",
+          p.returncode == 0 and "Traceback" not in stderr and "BrokenPipe" not in stderr, (p.returncode, stderr))
+
+
 test_install_refusals()
 test_install_success_and_prev()
+test_closed_stdout()
 test_install_partial_failures()
 test_install_unit_states_and_failures()
 test_add_user_providers()

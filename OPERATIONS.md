@@ -262,6 +262,9 @@ release. Check real client traffic after switching. Dependency upgrades,
 especially uvicorn, require the runner tests and service acceptance checks.
 
 To roll back, follow the [manual rollback procedure](deploy/README.md#immutable-upgrades-and-rollback)
-with a previous release directory.
+with a previous release directory. A release from before provider support does not
+start on a config with object-form device entries (`{"key", "providers"}`): keep a
+copy of `config.json` from before the first such entry and restore it when rolling
+back to one. Its `credentials/` directory in the state directory can stay.
 The [Debian systemctl reference](https://manpages.debian.org/bookworm/systemd/systemctl.1.en.html)
 documents service-control commands.
