@@ -19,7 +19,7 @@ Environment=CLAUDE_ROTATE_STATE=/var/lib/claude-rotate/state.json
 Environment=CLAUDE_ROTATE_AUDIT=/var/log/claude-rotate/audit.jsonl
 Environment=CLAUDE_ROTATE_MAX_REQUEST_BYTES=4194304
 Environment=CLAUDE_ROTATE_MAX_RESPONSE_BYTES=8388608
-Environment=CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=8
+Environment=CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=48
 Environment=CLAUDE_ROTATE_AUDIT_CACHE_RECORDS=10000
 Environment=CLAUDE_ROTATE_AUDIT_CACHE_BYTES=8388608
 Environment=CLAUDE_ROTATE_AUDIT_MAX_BYTES=8388608
@@ -48,8 +48,8 @@ LockPersonality=true
 # AF_UNIX for notify/local resolvers; IPv4/IPv6 for DNS and upstream TLS.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-MemoryHigh=384M
-MemoryMax=512M
+MemoryHigh=512M
+MemoryMax=768M
 MemorySwapMax=128M
 TasksMax=64
 LimitNOFILE=4096

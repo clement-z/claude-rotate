@@ -128,22 +128,27 @@ root to work around an installation mistake.
 | Audit | `CLAUDE_ROTATE_AUDIT=/var/log/claude-rotate/audit.jsonl` |
 | Request body | `CLAUDE_ROTATE_MAX_REQUEST_BYTES=4194304` (4 MiB) |
 | Non-streaming upstream response | `CLAUDE_ROTATE_MAX_RESPONSE_BYTES=8388608` (8 MiB) |
-| Active proxy requests | `CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=8` |
+| Active proxy requests | `CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=48` |
 | Audit cache | `CLAUDE_ROTATE_AUDIT_CACHE_RECORDS=10000`, `CLAUDE_ROTATE_AUDIT_CACHE_BYTES=8388608` |
 | Audit rotation | `CLAUDE_ROTATE_AUDIT_MAX_BYTES=8388608`, `CLAUDE_ROTATE_AUDIT_BACKUPS=4` |
-| Memory | `MemoryHigh=384M`, `MemoryMax=512M`, `MemorySwapMax=128M` |
+| Memory | `MemoryHigh=512M`, `MemoryMax=768M`, `MemorySwapMax=128M` |
 | Process/thread and FD limits | `TasksMax=64`, `LimitNOFILE=4096` |
 
-On a VPS with 2 GiB RAM and roughly 1.4 GiB available, keep these conservative
-limits initially; they leave room for Tailscale and other services. Existing swap
+These are sized for a VPS with 2 GiB RAM and roughly 1.4 GiB available, leaving
+room for Tailscale and other services. Each request in flight keeps its request
+body (up to the 4 MiB limit) until its stream ends, so 48 requests can hold up to
+192 MiB of bodies on top of the process; typical Claude Code bodies are much
+smaller. Existing swap
 is sufficient as an emergency buffer, but heavy swapping makes streaming and the
 watchdog less reliable. Check RSS and restart counts under your actual workload
 before raising limits. The CPU limit is often the tighter constraint on a one-vCPU host.
 
-The eight-request admission limit covers the whole proxy request lifetime,
+The 48-request admission limit covers the whole proxy request lifetime,
 including body receive, holding, and SSE streaming; admin routes are excluded.
-The runner's independent uvicorn `limit_concurrency=32` guard also covers
-connections and can reject admin traffic when saturated. These are overload
+Every running agent holds about one request at a time. The runner's independent
+uvicorn `limit_concurrency=96` guard also counts open connections, idle keep-alive
+ones included, and can reject admin traffic when saturated; it leaves room for a
+drop-in that raises the admission limit to 64. These are overload
 rejections, not a durable queue. There is no CPU quota. The memory ceiling may
 terminate an oversized workload; it cannot guarantee the VPS's total memory
 budget alongside other services. Swap allowance only has effect when host swap
@@ -204,17 +209,17 @@ for example this drop-in on a larger host:
 
 ```ini
 [Service]
-MemoryHigh=512M
-MemoryMax=768M
+MemoryHigh=768M
+MemoryMax=1G
 MemorySwapMax=128M
 Environment=CLAUDE_ROTATE_MAX_REQUEST_BYTES=8388608
-Environment=CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=12
+Environment=CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=64
 ```
 
 After saving, run `systemctl daemon-reload` and
 `systemctl restart claude-rotate.service`. Keep memory, concurrency, and body
-size in balance; raising request concurrency does not change the runner's
-32-connection/task guard. For alternate state/log paths, provision ownership and
+size in balance. Above 64 requests, the runner's 96-connection guard answers
+first; raising it means changing `LIMIT_CONCURRENCY` in `deploy/systemd_runner.py`. For alternate state/log paths, provision ownership and
 explicit sandbox write allowances in the drop-in; changing an environment path
 alone does not grant write permission. Do not put tokens in unit environment
 variables or drop-ins.

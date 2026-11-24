@@ -69,6 +69,13 @@ class SystemdServer(uvicorn.Server):
         await super().shutdown(sockets=sockets)
 
 
+# Uvicorn's own guard counts open connections, idle keep-alive ones included, and
+# answers 503 above it. It sits above the proxy's admission limit (48 by default,
+# 64 at most without raising this) so that limit is the one that applies, with room
+# left for keep-alive, the panel and the admin routes.
+LIMIT_CONCURRENCY = 96
+
+
 async def run():
     # An absolute script path puts deploy/, not the application root, on sys.path.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -81,7 +88,7 @@ async def run():
         loop="asyncio",
         http="h11",
         workers=1,
-        limit_concurrency=32,
+        limit_concurrency=LIMIT_CONCURRENCY,
         access_log=False,
         log_level="warning",
         timeout_graceful_shutdown=30,

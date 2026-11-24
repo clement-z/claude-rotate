@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -70,6 +71,30 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(notifier.watchdog_interval())
                 notifier.notify('READY=1')
             self.assertEqual(receiver.recv(1024), b'READY=1')
+
+
+class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uvicorn_guard_leaves_room_above_admission_limit(self):
+        # Uvicorn counts connections, idle keep-alive ones included: its guard must sit
+        # above the proxy's admission limit, or its plain 503s come first.
+        unit = (Path(__file__).resolve().parent.parent / 'deploy/claude-rotate.service').read_text()
+        admission = int(unit.split('CLAUDE_ROTATE_MAX_CONCURRENT_REQUESTS=')[1].split()[0])
+        seen = {}
+
+        class FakeServer:
+            def __init__(self, config, notifier):
+                seen['config'] = config
+
+            async def serve(self):
+                pass
+
+        fake = type(sys)('rotator')
+        fake.CFG, fake.app = {}, object()
+        with patch.dict(sys.modules, {'rotator': fake}), patch.object(runner, 'SystemdServer', FakeServer):
+            await runner.run()
+        self.assertEqual(seen['config'].limit_concurrency, runner.LIMIT_CONCURRENCY)
+        self.assertEqual(admission, 48)
+        self.assertGreaterEqual(runner.LIMIT_CONCURRENCY, 64 + 32)
 
 
 if __name__ == '__main__':
