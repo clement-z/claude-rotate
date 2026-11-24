@@ -71,7 +71,7 @@ private state/log directories, but cannot modify installed code or credentials.
   default 32 MiB); larger responses return 502 and close the upstream response.
   SSE is relayed incrementally; under a provider prefix, so is any answer whose
   length the upstream does not give. The Debian unit overrides request/response limits
-  to 4/8 MiB and permits eight concurrent proxy requests, including their streams
+  to 4/8 MiB and permits 48 concurrent proxy requests, including their streams
   and quota waits. Overload returns 503 with `Retry-After`; this is a global
   admission limit, not per-device fairness or a durable queue.
 - Quota holds and burst pacing poll for client disconnects at one-second intervals

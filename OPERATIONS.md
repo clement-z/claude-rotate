@@ -67,8 +67,8 @@ sudo systemctl show claude-rotate \
 df -h /var/lib/claude-rotate /var/log/claude-rotate
 ```
 
-Shipped defaults: memory pressure threshold 384 MiB, memory ceiling 512 MiB,
-swap allowance 128 MiB, eight active proxy requests, 4 MiB request bodies and
+Shipped defaults: memory pressure threshold 512 MiB, memory ceiling 768 MiB,
+swap allowance 128 MiB, 48 active proxy requests, 4 MiB request bodies and
 8 MiB buffered responses. SSE responses remain streamed. Overload returns 503;
 oversized bodies return 413 and oversized buffered responses return 502.
 

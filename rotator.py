@@ -75,7 +75,10 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+# Keep up to 64 idle upstream connections, one per admission slot, so streams that
+# start together reuse connections instead of each opening a new TLS session.
 client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, connect=15.0),
+                           limits=httpx.Limits(max_connections=128, max_keepalive_connections=64),
                            cookies=providers.NO_COOKIES)
 state_lock = asyncio.Lock()
 
