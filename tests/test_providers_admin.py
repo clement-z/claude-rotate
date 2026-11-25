@@ -1,11 +1,13 @@
-"""claude-rotate-admin's provider side: install-credential, add-user --providers, the
-readiness of object device entries and the providers in status. Each group runs the
+"""claude-rotate-admin's provider side: install-credential (with --images, a Codex
+login), add-user --providers, the readiness of object device entries and the
+providers in status, their images login and quotas included. Each group runs the
 real entry point under a temporary CLAUDE_ROTATE_PREFIX with the recording systemctl
 stub from test_admin.py; every secret is a dummy.
 
   python3 tests/test_providers_admin.py
 """
 import atexit
+import base64
 import http.server
 import json
 import os
@@ -384,6 +386,166 @@ def test_status_reports_providers():
           not any(s in r.stdout + r.stderr + human.stdout + human.stderr for s in secrets))
 
 
+def fake_jwt(**claims):
+    """JWT-shaped, unsigned: the admin reads only the exp claim, unverified."""
+    def part(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{part({'alg': 'RS256', 'typ': 'JWT'})}.{part(claims)}.fake-signature"
+
+
+def codex_auth(n, exp=None, issuer="https://auth.openai.com", client_id="app_fake_codex_client", **token_changes):
+    """The auth.json a `codex login` writes, with an API key it may also hold."""
+    claims = {"sub": f"fake-user-{n}"} | ({"exp": exp} if exp is not None else {})
+    provenance = {"issuer": issuer, "client_id": client_id}
+    tokens = {"id_token": fake_jwt(sub=f"fake-user-{n}", email="fake@example.com"),
+              "access_token": fake_jwt(**claims), "refresh_token": f"rt-CODEX-FAKE-{n}-zzzzzzzzzzzz",
+              "account_id": f"acct-CODEX-fake-{n}", "oauth_provenance": provenance}
+    tokens.update(token_changes)
+    return {"OPENAI_API_KEY": f"sk-FAKE-{n}-api-key-not-for-storage", "last_refresh": "2026-11-25T10:00:00Z",
+            "tokens": {k: v for k, v in tokens.items() if v is not DROP}}
+
+
+def codex_secrets(auth):
+    return [auth["OPENAI_API_KEY"], *(auth["tokens"][k] for k in ("id_token", "access_token", "refresh_token"))]
+
+
+def test_install_codex_images():
+    f = make()
+    codex = f.creds / "openai.codex.json"
+    exp = int(time.time()) + 3600
+    good = source(f, "auth.json", json.dumps(codex_auth(1, exp)))
+    f.set_active(True)
+    refusals = (
+        ("an SIWC record given with --images", ("openai", "--images"), credential(1),
+         "not the auth.json of a ChatGPT `codex login`"),
+        ("a codex auth.json given without --images", ("openai",), codex_auth(1, exp), "install it with --images"),
+        ("a foreign issuer", ("openai", "--images"), codex_auth(1, exp, issuer="https://auth.example.invalid"),
+         "issued by 'https://auth.example.invalid', not https://auth.openai.com"),
+        ("an access token without exp", ("openai", "--images"), codex_auth(1), "no readable expiry"),
+        ("an access token that is not a JWT", ("openai", "--images"), codex_auth(1, access_token="opaque-FAKE-1"),
+         "no readable expiry"),
+        ("a login without account_id", ("openai", "--images"), codex_auth(1, exp, account_id=DROP),
+         "lacks tokens.access_token, refresh_token or account_id"),
+        ("a static-bearer provider", ("glm", "--images"), codex_auth(1, exp), "not an openai-siwc provider"),
+        ("an unknown provider", ("nope", "--images"), codex_auth(1, exp), "not an openai-siwc provider"))
+    for label, args, content, word in refusals:
+        reset(f)
+        r = f.run("install-credential", *args, "--file", str(source(f, "refused.json", json.dumps(content))))
+        check(f"install-credential refuses {label}, with nothing written and the unit not stopped",
+              r.returncode == 1 and word in r.stderr and "nothing changed" in r.stderr
+              and f"stop {UNIT}" not in f.calls() and not f.state_dir.exists(), (r, f.calls()))
+
+    auth = codex_auth(1, exp)
+    reset(f)
+    r = f.run("install-credential", "openai", "--images", "--file", str(good))
+    rec = json.loads(codex.read_text()) if codex.exists() else {}
+    check("install-credential --images installs and the service is live again",
+          r.returncode == 0 and "is live" in r.stdout and stop_then_start(f.calls()), (r, f.calls()))
+    check("it writes credentials/openai.codex.json, mode 600, and leaves the SIWC credential alone",
+          codex.exists() and mode(codex) == 0o600 and not f.live.exists(), list(f.creds.iterdir()))
+    check("holding exactly the two tokens, the client and account ids, the expiry from the JWT, source and save times",
+          set(rec) == {"access_token", "refresh_token", "client_id", "account_id", "expires_at", "source", "saved_at",
+                       "refresh_saved_at"}
+          and rec["access_token"] == auth["tokens"]["access_token"] and rec["refresh_token"] == auth["tokens"]["refresh_token"]
+          and rec["client_id"] == "app_fake_codex_client" and rec["account_id"] == "acct-CODEX-fake-1"
+          and rec["expires_at"] == exp and rec["source"] == "codex login"
+          and abs(rec["refresh_saved_at"] - time.time()) < 120 and rec["saved_at"].endswith("+00:00"), rec)
+    check("neither the id token nor the API key is stored",
+          auth["tokens"]["id_token"] not in codex.read_text() and auth["OPENAI_API_KEY"] not in codex.read_text())
+    check("the output names the images login and prints no token",
+          "images login for 'openai' installed as" in r.stdout and str(codex) in r.stdout
+          and not any(s in r.stdout + r.stderr for s in codex_secrets(auth)), r)
+    check("a note says image generation stays off while the provider entry lacks \"images\": true",
+          'note: image generation stays off until the provider entry has "images": true' in r.stdout, r.stdout)
+
+    providers = f.cfg()["providers"]
+    providers["openai"]["images"] = True
+    set_cfg(f, providers=providers)
+    auth = codex_auth(2, exp + 60)
+    del auth["tokens"]["oauth_provenance"]
+    reset(f)
+    r = f.run("install-credential", "openai", "--images", "--file", str(source(f, "auth2.json", json.dumps(auth))))
+    rec = json.loads(codex.read_text())
+    check("with \"images\": true there is no note; the previous login is kept as .prev",
+          r.returncode == 0 and "stays off" not in r.stdout and "the previous one kept as .prev" in r.stdout
+          and json.loads((f.creds / "openai.codex.json.prev").read_text())["account_id"] == "acct-CODEX-fake-1"
+          and mode(f.creds / "openai.codex.json.prev") == 0o600, r)
+    check("a login without oauth_provenance gets Codex's own client id",
+          rec["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann" and rec["expires_at"] == exp + 60
+          and rec["account_id"] == "acct-CODEX-fake-2", rec)
+    check("and that output prints no token either", not any(s in r.stdout + r.stderr for s in codex_secrets(auth)), r)
+
+
+def test_status_reports_images():
+    f = make()
+    at, resets = int(time.time()) - 120, int(time.time()) + 7200
+    leaked = "acc-CODEX-LIVE-should-not-print"
+    down = ("the refresh was refused (invalid_grant): make a new login with `codex login` and install it "
+            "with claude-rotate-admin install-credential PROVIDER --images")
+    images_ok = {"state": "ok", "reason": None, "unsaved": None, "last_error": None, "access_token_min": 55,
+                 "refreshes": 1, "last_answer": {"status": 200, "at": at}}
+    quotas = {"imagegen_premium": {"primary": {"used_percent": 95.0, "window_minutes": 10080, "resets_at": resets},
+                                   "secondary": None, "plan": "plus", "route": "images", "seen_at": at},
+              "codex": {"primary": {"used_percent": 40.0, "window_minutes": 300, "resets_at": resets},
+                        "secondary": {"used_percent": 20.0, "window_minutes": 10080, "resets_at": resets + 86400},
+                        "route": "inference", "seen_at": at}}
+    live = {"active_account": "acct-1", "storage_errors": {}, "accounts": {"acct-1": {"effective_util_5h": 0.2}},
+            "providers": {
+                "openai": {"kind": "openai-siwc", "prefix": "/openai", "state": "ok", "reason": None,
+                           "client_id": "oaiapp_fakeA", "host_id": "urn:uuid:fake-host-a", "access_token_min": 42,
+                           "images": dict(images_ok, access_token=leaked), "quotas": quotas},
+                "openai-team": {"kind": "openai-siwc", "prefix": "/team", "state": "ok", "reason": None,
+                                "access_token_min": 30, "quotas": {},
+                                "images": {"state": "down", "reason": down, "unsaved": None, "last_error": None,
+                                           "access_token_min": 3, "refreshes": 0, "last_answer": None}},
+                "glm": {"kind": "static-bearer", "prefix": "/glm", "state": "ok", "reason": None}}}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(live).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        set_cfg(f, port=server.server_address[1])
+        f.set_active(True)
+        r = f.run("status", "--json")
+        report = json.loads(r.stdout) if r.returncode == 0 else {}
+        human = f.run("status")
+    finally:
+        server.shutdown()
+        server.server_close()
+    shown = ((report.get("live") or {}).get("providers") or {}).get("openai") or {}
+    check("status --json carries the images object and the quotas",
+          r.returncode == 0 and shown.get("quotas") == quotas
+          and {k: v for k, v in (shown.get("images") or {}).items() if k != "access_token"} == images_ok, shown)
+    lines = human.stdout.splitlines()
+    clock = lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))  # noqa: E731
+    want = [f"    images: ok; access token 55 min; last answer 200 at {clock(at)}",
+            f"    quota imagegen_premium (primary, 10080 min window): 95.0% used, resets {clock(resets)}; plan plus",
+            f"    quota codex (primary, 300 min window): 40.0% used, resets {clock(resets)}",
+            f"    quota codex (secondary, 10080 min window): 20.0% used, resets {clock(resets + 86400)}",
+            f"    images: down: {down}; access token 3 min"]
+    check("status text prints an images line and one line per quota window under its provider",
+          human.returncode == 0 and all(line in lines for line in want)
+          and not any("imagegen_premium (secondary" in x for x in lines), human.stdout)
+    at_line = {x: i for i, x in enumerate(lines)}
+    first = next((i for i, x in enumerate(lines) if x.startswith("  provider openai (")), -1)
+    team = next((i for i, x in enumerate(lines) if x.startswith("  provider openai-team (")), -1)
+    check("the images and quota lines follow their own provider's line",
+          0 <= first < at_line.get(want[0], -1) < at_line.get(want[1], -1) < team < at_line.get(want[4], len(lines)),
+          human.stdout)
+    check("the status text prints no token, even one the live status carried by mistake",
+          leaked not in human.stdout + human.stderr, human.stdout)
+
+
 def test_readiness_of_object_devices():
     f = make()
     obj_key = "dev-obj-0011223344556677"
@@ -536,6 +698,8 @@ test_install_partial_failures()
 test_install_unit_states_and_failures()
 test_add_user_providers()
 test_status_reports_providers()
+test_install_codex_images()
+test_status_reports_images()
 test_readiness_of_object_devices()
 test_grant_revoke()
 print(f"\nall {PASS} checks passed")
