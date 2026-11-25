@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import time
+import weakref
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -64,7 +65,9 @@ HOP = {
     "te", "trailer", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
 }
 # These belong to the local browser or reverse-proxy trust boundary.
-PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip"}
+# x-openai-actor-authorization is a switch between Codex and this gateway (it turns on
+# Codex's image tool for a custom provider); an upstream could read it as a credential.
+PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip", "x-openai-actor-authorization"}
 
 @asynccontextmanager
 async def lifespan(app):
@@ -173,6 +176,14 @@ def resource_limit(name: str, default: int, *, allow_zero=False, minimum=1) -> i
 MAX_REQUEST_BYTES = resource_limit("max_request_bytes", 32 * 1024 * 1024)
 MAX_RESPONSE_BYTES = resource_limit("max_response_bytes", 32 * 1024 * 1024)
 MAX_CONCURRENT_REQUESTS = resource_limit("max_concurrent_requests", 0, allow_zero=True)
+# Under a provider with "images": true, request bodies may reach max_image_request_bytes:
+# an edit carries reference images, and every request after a generation carries the
+# image back to the model. Bodies above max_request_bytes share max_image_bytes_in_flight,
+# since each stays in memory until its answer ends.
+MAX_IMAGE_REQUEST_BYTES = resource_limit("max_image_request_bytes", 32 * 1024 * 1024)
+MAX_IMAGE_BYTES_IN_FLIGHT = resource_limit("max_image_bytes_in_flight", 256 * 1024 * 1024)
+MAX_CONCURRENT_IMAGES = resource_limit("max_concurrent_images", 2)
+IMAGE_LINE_MAX = 8  # image requests that may wait for one of those slots
 AUDIT_CACHE_RECORDS = resource_limit("audit_cache_records", 100_000)
 AUDIT_CACHE_BYTES = resource_limit("audit_cache_bytes", 32 * 1024 * 1024)
 AUDIT_MAX_BYTES = resource_limit("audit_max_bytes", 16 * 1024 * 1024, minimum=4096)
@@ -802,11 +813,11 @@ def device_from_request(request: Request) -> str | None:
     return DEVICE_BY_KEY.get(key)
 
 
-async def bounded_body(request: Request) -> bytes:
+async def bounded_body(request: Request, limit: int | None = None) -> bytes:
     """Bound actual bytes, including bodies without a Content-Length header."""
-    body = bytearray()
+    body, limit = bytearray(), limit or MAX_REQUEST_BYTES
     async for chunk in request.stream():
-        if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+        if len(body) + len(chunk) > limit:
             raise HTTPException(status_code=413, detail="request body too large")
         body.extend(chunk)
     return bytes(body)
@@ -1329,6 +1340,21 @@ async def rotate_stats(request: Request):
         elif s.get("last_error"):
             out["alerts"].append({"level": "warn", "text": f"provider {name}: token refresh failing "
                                   f"({s['last_error']}); the access token in hand lasts {s['access_token_min']} min"})
+        im = s.get("images") or {}
+        if im.get("unsaved"):
+            out["alerts"].append({"level": "warn", "text": f"provider {name}: images login not on disk: {im['unsaved']}"})
+        if im.get("reason"):
+            out["alerts"].append({"level": "warn", "text": f"provider {name}: image generation is {im['state']}: {im['reason']}"})
+        elif im.get("last_error"):
+            out["alerts"].append({"level": "warn", "text": f"provider {name}: images login refresh failing "
+                                  f"({im['last_error']}); its access token lasts {im['access_token_min']} min"})
+        for limit, q in (s.get("quotas") or {}).items():
+            for which in ("primary", "secondary"):
+                w = q.get(which) or {}
+                if (w.get("used_percent") or 0) >= 90:
+                    left = w.get("resets_at") and max(0, w["resets_at"] - time.time())
+                    out["alerts"].append({"level": "warn", "text": f"provider {name}: quota {limit} at "
+                                          f"{w['used_percent']:.0f}%" + (f", resets in {left / 3600:.1f} h" if left else "")})
     return out
 
 
@@ -1396,6 +1422,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <div class="card tile"><div class="label">Cost-equivalent, 7 d</div><div class="v" id="k-cost">–</div><div class="muted small" id="k-cost-sub"></div></div>
 </section>
 <section class="accounts" id="accounts"></section>
+<section class="accounts" id="oai"></section>
 <section class="card"><h2>Weekly quota, all accounts <span class="muted" style="font-weight:400">summed weekly usage &middot; 14 days + 7.5-day projection</span>
  <span class="legend"><span><span class="key" style="border-color:var(--s1)"></span>Usage</span><span><span class="key" style="border-color:var(--s2)"></span>Limit</span>
  <span><span class="key dash" style="border-color:var(--muted)"></span>Projected</span><span><span class="key band"></span>&#9940; Every account at its limit</span></span>
@@ -1432,6 +1459,18 @@ function meter(label,u,thr,reset){
   const sev=u>=1?['var(--crit)',' &#10005; limit reached']:u>=thr?['var(--warn)',' &#9888; past switch point']:['var(--s1)',''];
   return `<div class="meter-row"><span class="muted">${label}</span><div class="meter"><i style="width:${Math.min(100,u*100)}%;background:${sev[0]}"></i><span class="tick" style="left:${thr*100}%"></span></div>`
     +`<span><b>${Math.round(u*100)}%</b> <span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
+function wlabel(m){return m==null?'':m%10080===0?(m/10080===1?'7d':m/10080+'w'):m%1440===0?(m/1440===1?'24h':m/1440+'d'):m%60===0?m/60+'h':m+'min'}
+function quotas(name,p){const now=Date.now()/1000, q=Object.entries(p.quotas||{}), im=p.images;
+  const what=id=>id==='codex'?'model':/^image/.test(id)?'images':id;
+  const plan=(q.find(([,f])=>f.plan)||[,{}])[1].plan;
+  const rows=q.flatMap(([id,f])=>['primary','secondary'].filter(k=>f[k]).map(k=>{const w=f[k];
+    return meter(esc(what(id)+' '+wlabel(w.window_minutes)),(w.used_percent||0)/100,0.9,
+      esc((w.resets_at?'resets in '+dur(Math.max(0,w.resets_at-now))+' · ':'')+'seen '+ago(Math.round((now-f.seen_at)/60))))})).join('');
+  const st=s=>['down','unavailable'].includes(s)?'crit':s==='ok'?'good':'warn';
+  return `<div class="card"><div class="acct-head"><b>${esc(name)}</b><span class="badge">OpenAI quota</span>`
+    +(plan?`<span class="badge">plan ${esc(plan)}</span>`:'')
+    +(im?`<span class="badge" title="${esc(im.reason||im.unsaved||im.last_error||'')}"><span class="dot" style="background:var(--${st(im.unsaved&&im.state==='ok'?'warn':im.state)})"></span>images ${esc(im.state)}</span>`:'')+'</div>'
+    +(rows||'<div class="muted small">no quota figures yet: OpenAI sends them with its answers</div>')+'</div>'}
 function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
   return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
 function billing(b){
@@ -1541,6 +1580,7 @@ async function refresh(){
       +(name!==st.active_account?`<button class="linkbtn" data-sw="${esc(name)}"${usable(a)?'':' disabled title="disabled or at a switch threshold"'}>Select</button>`:st.pinned===name?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
       +meter('5h',u5,st.switch_threshold,a.reset_5h_in_min>0?'resets in '+dur(a.reset_5h_in_min*60):'window idle')
       +meter('7d',u7,st.switch_threshold_7d,a.reset_7d_in_h>0?'resets in '+dur(a.reset_7d_in_h*H):'window idle')+'</div>'}).join('');
+  $('oai').innerHTML=Object.entries(st.providers||{}).filter(([,p])=>p.kind==='openai-siwc').map(([n,p])=>quotas(n,p)).join('');
   const sc=$('wk-scroll'), keep=sc&&sc.scrollWidth?sc.scrollWidth-sc.clientWidth-sc.scrollLeft:null;  // keep the view across redraws
   $('weekly').innerHTML=weekly(wk);
   $('billing').innerHTML=billing(stats.billing);
@@ -1846,6 +1886,67 @@ def head_length(response: Response, request: Request, upstream: httpx.Response) 
     return response
 
 
+class Hold:
+    """Something a request holds until its answer is over. Released once, by release()
+    or, for a stream that never started, when the response is dropped."""
+
+    def __init__(self, release):
+        self._finalizer = weakref.finalize(self, release)
+
+    def release(self) -> None:
+        self._finalizer()
+
+
+class LargeBodies:
+    """Bytes of request bodies above max_request_bytes in memory, under the providers
+    with images; each stays until its answer ends."""
+
+    def __init__(self):
+        self.held = 0
+
+    def take(self, size: int) -> Hold:
+        if size <= MAX_REQUEST_BYTES:
+            return Hold(lambda: None)
+        if self.held + size > MAX_IMAGE_BYTES_IN_FLIGHT:
+            raise HTTPException(status_code=503, headers={"Retry-After": "5"},
+                                detail="too many large requests in flight; retry later")
+        self.held += size
+        return Hold(lambda: self.give(size))
+
+    def give(self, size: int) -> None:
+        self.held -= size
+
+
+class ImageLine:
+    """At most max_concurrent_images image requests at the backend, up to IMAGE_LINE_MAX
+    more waiting; a waiter whose client leaves gives up its place."""
+
+    def __init__(self):
+        self.active = self.waiting = 0
+
+    async def enter(self, alive) -> Hold | None:
+        if self.active >= MAX_CONCURRENT_IMAGES:
+            if self.waiting >= IMAGE_LINE_MAX:
+                return None
+            self.waiting += 1
+            try:
+                while self.active >= MAX_CONCURRENT_IMAGES:
+                    if not await alive():
+                        raise providers.ClientGone()
+                    await asyncio.sleep(0.25)
+            finally:
+                self.waiting -= 1
+        self.active += 1  # no await since the check: one event loop
+        return Hold(self.leave)
+
+    def leave(self) -> None:
+        self.active -= 1
+
+
+LARGE_BODIES = LargeBodies()
+IMAGE_LINE = ImageLine()
+
+
 def request_model(request: Request, body: bytes) -> str | None:
     if body and request.method == "POST":
         try:
@@ -1868,11 +1969,29 @@ async def provider_proxy(request: Request, prov):
         return refuse(401, "unknown device key", "authentication_error")
     if not granted(device, prov.name):
         return refuse(403, f"device '{device}' may not use provider '{prov.name}'", "permission_error")
-    body = await bounded_body(request)
-    fwd = forward_headers(request)
-    fwd.pop("authorization", None)
+    images = getattr(prov, "images", None)
     path = upstream_path(request, drop=1, confined=prov.kind == "static-bearer"
                          and httpx.URL(prov.upstream).raw_path.strip(b"/") != b"")
+    body = await bounded_body(request, MAX_IMAGE_REQUEST_BYTES if images else None)
+    hold = LARGE_BODIES.take(len(body))
+    streaming = False
+    try:
+        endpoint = providers.IMAGE_PATHS.get(path) if images and request.method == "POST" else None
+        if endpoint:
+            response = await image_proxy(request, prov, device, endpoint, path, body, hold, refuse)
+        else:
+            response = await forward(request, prov, device, path, body, hold, refuse)
+        streaming = isinstance(response, StreamingResponse)
+        return response
+    finally:
+        if not streaming:
+            hold.release()
+
+
+async def forward(request: Request, prov, device: str, path: str, body: bytes, hold: Hold, refuse):
+    """The provider's own route: its upstream and its credential."""
+    fwd = forward_headers(request)
+    fwd.pop("authorization", None)
     url = upstream_url(prov.upstream, path, upstream_query(request))
     rec = {"device": device, "provider": prov.name, "path": prov.prefix + path,
            "method": request.method, "model": request_model(request, body)}
@@ -1895,6 +2014,8 @@ async def provider_proxy(request: Request, prov):
     if retries:
         rec["retries"] = retries
     rec.update(notes)
+    if hasattr(prov, "record_quotas"):
+        prov.record_quotas(upstream.headers, "inference")
     # Upstream cookies belong to the upstream. A provider page opened in a browser must
     # not run script on this origin, where the panel and device keys are used.
     # Uvicorn adds its own Date and Server; the upstream's would make a second of each.
@@ -1928,6 +2049,7 @@ async def provider_proxy(request: Request, prov):
                 if not done and not ended and "interrupted" not in rec:
                     rec["interrupted"] = "client"
                 await upstream.aclose()
+                hold.release()
                 rec["usage"] = meter.usage
                 audit(rec)
 
@@ -1949,6 +2071,87 @@ async def provider_proxy(request: Request, prov):
     audit(rec)
     return head_length(Response(content=content, status_code=upstream.status_code, headers=resp_headers),
                        request, upstream)
+
+
+async def image_proxy(request: Request, prov, device: str, endpoint: str, path: str, body: bytes,
+                      hold: Hold, refuse):
+    """Codex's image requests under a provider with "images": true: to the ChatGPT
+    backend with the provider's Codex login, body unchanged. The answer is relayed as it
+    arrives, never cut to a size: Codex retries a 5xx, and each retry is a new image."""
+    login = prov.images
+    rec = {"device": device, "provider": prov.name, "path": prov.prefix + path, "method": "POST",
+           "route": "codex-images", "model": request_model(request, body) if len(body) <= 65536 else None}
+    started = time.monotonic()
+
+    async def alive():
+        return not await request.is_disconnected()
+
+    def unavailable(status, message, kind):
+        audit(rec | {"status": status, "duration_s": round(time.monotonic() - started, 1)})
+        return refuse(status, f"image generation is unavailable: {message}", kind)
+
+    try:
+        slot = await IMAGE_LINE.enter(alive)
+    except providers.ClientGone:
+        audit(rec | {"status": 499})
+        raise HTTPException(status_code=499, detail="client disconnected")
+    if slot is None:
+        return unavailable(429, f"{IMAGE_LINE_MAX} image requests are already waiting; retry later",
+                           "rate_limit_error")
+    streaming = False
+    try:
+        try:
+            upstream, retries, notes = await login.send(
+                "POST", providers.image_url(endpoint), providers.image_headers(dict(request.headers)),
+                body, alive)
+        except providers.ClientGone:
+            audit(rec | {"status": 499})
+            raise HTTPException(status_code=499, detail="client disconnected")
+        except providers.ProviderDown as exc:
+            return unavailable(503, str(exc), "provider_unavailable")
+        except httpx.HTTPError as exc:
+            return unavailable(502, f"the ChatGPT backend is unreachable: {providers.connect_failure(exc)}",
+                               "api_error")
+        login.note_answer(upstream.status_code)
+        prov.record_quotas(upstream.headers, "images")
+        rec["status"] = upstream.status_code
+        if retries:
+            rec["retries"] = retries
+        rec.update(notes)
+        ctype = upstream.headers.get("content-type", "")
+        if upstream.status_code >= 400 and "json" not in ctype.lower():
+            # A Cloudflare challenge page or the like: Codex hands the body to the model.
+            await upstream.aclose()
+            audit(rec | {"upstream_content_type": ctype[:64], "duration_s": round(time.monotonic() - started, 1)})
+            return refuse(upstream.status_code, f"image generation failed: the ChatGPT backend answered "
+                          f"{upstream.status_code} with {ctype or 'no content type'}", "api_error")
+        resp_headers = response_headers(upstream, "set-cookie", "content-security-policy", "date", "server")
+        resp_headers["content-security-policy"] = "default-src 'none'; sandbox; frame-ancestors 'none'"
+        resp_headers["x-rotate-provider"] = prov.name
+
+        async def relay():
+            sent, done = 0, False
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    sent += len(chunk)
+                    yield chunk
+                done = True
+            except httpx.HTTPError as exc:
+                rec["interrupted"] = f"upstream {type(exc).__name__}"
+                raise StreamBroken() from exc
+            finally:
+                if not done and "interrupted" not in rec:
+                    rec["interrupted"] = "client"
+                await upstream.aclose()
+                slot.release()
+                hold.release()
+                audit(rec | {"bytes": sent, "duration_s": round(time.monotonic() - started, 1)})
+
+        streaming = True
+        return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
+    finally:
+        if not streaming:
+            slot.release()
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])

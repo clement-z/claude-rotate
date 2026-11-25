@@ -6,13 +6,16 @@ openai-siwc     one "Sign in with ChatGPT" credential (plan usage) forwarded to
                 api.openai.com. One refresh at a time; new tokens are written to
                 disk before they are used, and no further refresh is made until
                 they are; a refused refresh takes the provider down until a new
-                sign-in is installed.
+                sign-in is installed. With "images": true, Codex's two image
+                requests go to the ChatGPT backend instead, with a Codex login
+                (CodexLogin), since the Sign in with ChatGPT route refuses images.
 
 Protocol: https://developers.openai.com/siwc/token-sharing-open-source (read 2026-11-17).
 Tokens never leave this module except in the upstream Authorization header: not in
 logs, audit records, status or error messages.
 """
 import asyncio
+import base64
 import codecs
 import http.cookiejar
 import json
@@ -34,12 +37,24 @@ RESERVED = {"v1", "api", "rotate", "docs", "redoc", ANTHROPIC}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 URL_RE = re.compile(r"^https?://[^/?#\s@]+(/[^?#\s]*)?$")  # no userinfo, query or fragment
 KEYS = {"static-bearer": {"kind", "prefix", "upstream", "token_file"},
-        "openai-siwc": {"kind", "prefix"}}
+        "openai-siwc": {"kind", "prefix", "images"}}
 TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 # Pinned: a refresh sends the rotating refresh token, so no config may redirect it.
 SIWC_API = "https://api.openai.com"
 SIWC_AUTH = "https://auth.openai.com"
 SIWC_RESOURCE = "https://api.openai.com/v1"  # the token's audience, fixed by the flow
+# The ChatGPT backend Codex itself uses with a ChatGPT login, for its two image routes
+# only. Pinned like the rest: the Codex login's token goes to these URLs and nowhere else.
+CODEX_BACKEND = "https://chatgpt.com/backend-api/codex"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI's public OAuth client
+IMAGE_PATHS = {"/v1/images/generations": "/images/generations", "/v1/images/edits": "/images/edits"}
+# What the backend gets from the client besides the body; the gateway adds the
+# login's bearer and account id. Codex's turn metadata can name the team's repository.
+IMAGE_HEADERS = ("content-type", "originator", "user-agent", "x-codex-image-turn-id")
+# Refresh refusals Codex treats as permanent for its login (and any 401).
+CODEX_PERMANENT = {"invalid_grant", "refresh_token_expired", "refresh_token_reused",
+                   "refresh_token_invalidated"}
+CODEX_REFRESH_FALLBACK_S = 8 * 86400  # Codex's age rule, for a token without a readable exp
 # Refresh errors that only a new sign-in repairs.
 FATAL = {"invalid_grant", "invalid_client", "refresh_token_reused",
          "refresh_token_expired", "refresh_token_invalidated"}
@@ -101,6 +116,8 @@ def load_providers(cfg: dict, config_dir: Path, state_dir: Path) -> dict:
             raise SystemExit(f"provider '{name}': prefix must be one unique path segment such as "
                              f"/{name}, and not one of /{', /'.join(sorted(RESERVED))}")
         seen.add(segment)
+        if "images" in spec and type(spec["images"]) is not bool:
+            raise SystemExit(f"provider '{name}': images must be true or false")
         spec = dict(spec, prefix="/" + segment)
         if spec["kind"] == "static-bearer":
             if not (isinstance(spec.get("upstream"), str) and URL_RE.match(spec["upstream"])
@@ -187,12 +204,15 @@ class StaticBearer:
 class OpenAISiwc:
     kind = "openai-siwc"
     upstream = SIWC_API
+    suffix = ".json"
+    how_to_get = "sign in with siwc_login.py and install it with claude-rotate-admin"
+    how_to_renew = "sign in again with siwc_login.py and install the new credential"
 
     def __init__(self, name: str, spec: dict, state_dir: Path):
         self.name, self.prefix = name, spec["prefix"]
         # Named after the provider, in a directory of its own: two providers can never
         # hold the same rotating credential, and no other file shares the names.
-        self.path = state_dir / "credentials" / f"{name}.json"
+        self.path = state_dir / "credentials" / f"{name}{self.suffix}"
         self.client = httpx.AsyncClient(timeout=TIMEOUT, cookies=NO_COOKIES)
         self.auth = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0), cookies=NO_COOKIES)
         self.lock = asyncio.Lock()
@@ -200,19 +220,23 @@ class OpenAISiwc:
         self.lost = False  # a refresh answer went missing: OpenAI may have rotated the token
         self.refreshes, self.failures, self.retry_at = 0, 0, 0.0
         self.refreshed_at = 0.0  # when the token endpoint was last asked, for any reason
+        self.quotas: dict = {}  # quota headers last seen on its answers, by limit id
         self.rec = self._load()
+        self.images = CodexLogin(name, state_dir) if spec.get("images") is True else None
+
+    def _usable(self, rec) -> bool:
+        return usable_record(rec)
 
     def _load(self) -> dict:
         try:
             rec = json.loads(self.path.read_text())
         except FileNotFoundError:
-            self.down = (f"no credential credentials/{self.path.name} in the state directory: "
-                         "sign in with siwc_login.py and install it with claude-rotate-admin")
+            self.down = f"no credential credentials/{self.path.name} in the state directory: {self.how_to_get}"
             return {}
         except (OSError, ValueError) as exc:
             self.down = f"credential credentials/{self.path.name} is unreadable ({type(exc).__name__})"
             return {}
-        if not usable_record(rec):
+        if not self._usable(rec):
             self.down = f"credential credentials/{self.path.name} lacks a token, the client_id or its expiry"
             return {}
         # What the gateway learnt about this credential is saved in the record itself, so
@@ -261,7 +285,7 @@ class OpenAISiwc:
         token = await self.token()
         await _check(alive)
         upstream = await self.client.send(self.client.build_request(
-            method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True)
+            method, url, headers=headers | self._auth(token), content=body), stream=True)
         if upstream.status_code != 401:
             return upstream, 0, {}
         upstream, answer = await peek(upstream)
@@ -284,7 +308,10 @@ class OpenAISiwc:
         token = await self.token()
         await _check(alive)  # last, after every wait
         return await self.client.send(self.client.build_request(
-            method, url, headers=headers | {"authorization": f"Bearer {token}"}, content=body), stream=True), 1, notes
+            method, url, headers=headers | self._auth(token), content=body), stream=True), 1, notes
+
+    def _auth(self, token: str) -> dict:
+        return {"authorization": f"Bearer {token}"}
 
     async def refresh(self, seen: str | None, force: bool = False) -> None:
         """Serialized. A caller that waited on the lock finds the token it saw already
@@ -308,10 +335,7 @@ class OpenAISiwc:
                 return  # the floor on refreshes that requests can cause
             self.refreshed_at = now
             try:
-                r = await self.auth.post(SIWC_AUTH + "/api/accounts/oauth/token",
-                                         headers={"accept": "application/json"}, data={
-                    "grant_type": "refresh_token", "client_id": self.rec["client_id"],
-                    "refresh_token": self.rec["refresh_token"], "resource": SIWC_RESOURCE})
+                r = await self._token_request(force)
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
                 return self._failed(f"token endpoint unreachable: {connect_failure(exc)}")
             except httpx.HTTPError as exc:
@@ -326,11 +350,11 @@ class OpenAISiwc:
                 data = None
             if r.status_code != 200:
                 code = error_code(data)
-                if r.status_code in (400, 401, 403) and code in FATAL:
-                    return self._refused(f"the refresh was refused ({code})" + (
+                if self._permanent(r.status_code, code):
+                    return self._refused(f"the refresh was refused ({code or r.status_code})" + (
                         " after a lost refresh answer, so OpenAI had rotated it" if self.lost else ""))
                 return self._failed(f"token endpoint answered {r.status_code}" + (f" ({code})" if code else ""))
-            rec = record_from(data, self.rec) if isinstance(data, dict) else None
+            rec = self._record_from(data) if isinstance(data, dict) else None
             if rec is None:
                 # A 200 means the old refresh token is spent; its replacement is unusable.
                 return self._refused("OpenAI accepted the refresh but its answer lacks a usable access "
@@ -340,9 +364,24 @@ class OpenAISiwc:
             # window is a single write and rename. If the write fails, the new tokens
             # still serve from memory, because refusing would not bring the old token
             # back; status says "unsaved", the save is retried and nothing else rotates.
+            same = rec["access_token"] == self.rec.get("access_token")
             self._save(rec)
             self.rec, self.last_error, self.lost = rec, None, False
+            if same:  # kept, since the refresh token may have rotated, but not a success
+                return self._failed("the refresh answer kept the same access token")
             self.refreshes, self.failures, self.retry_at = self.refreshes + 1, 0, 0.0
+
+    async def _token_request(self, force: bool) -> httpx.Response:
+        return await self.auth.post(SIWC_AUTH + "/api/accounts/oauth/token",
+                                    headers={"accept": "application/json"}, data={
+            "grant_type": "refresh_token", "client_id": self.rec["client_id"],
+            "refresh_token": self.rec["refresh_token"], "resource": SIWC_RESOURCE})
+
+    def _permanent(self, status: int, code: str | None) -> bool:
+        return status in (400, 401, 403) and code in FATAL
+
+    def _record_from(self, data: dict) -> dict | None:
+        return record_from(data, self.rec)
 
     def _failed(self, message: str, lost: bool = False) -> None:
         self.last_error = message
@@ -355,7 +394,7 @@ class OpenAISiwc:
             self._note(lost=True, retry_at=self.retry_at, failures=self.failures)
 
     def _refused(self, reason: str) -> None:
-        self.down = reason + ": sign in again with siwc_login.py and install the new credential"
+        self.down = f"{reason}: {self.how_to_renew}"
         self._note(refused=self.down)
 
     def _note(self, **notes) -> None:
@@ -372,6 +411,12 @@ class OpenAISiwc:
                             "a restart now would need a new sign-in")
 
     async def maintain(self) -> None:
+        if self.images:
+            try:
+                await self.images.maintain()
+            except Exception as exc:  # the provider's own credential must still be kept
+                print(f"warning: provider {self.name}: images login maintenance failed "
+                      f"({type(exc).__name__})", file=sys.stderr)
         if not self.rec:
             return
         if self.unsaved:  # also a refusal or a lost answer that is not on disk yet
@@ -379,11 +424,19 @@ class OpenAISiwc:
         if not self.down and self._remaining() < REFRESH_AHEAD_S:
             await self.refresh(self.rec["access_token"])
 
+    def record_quotas(self, headers: httpx.Headers, route: str) -> None:
+        """Keep the latest quota figures the answer carries, by limit id."""
+        for limit, figures in quota_snapshots(headers).items():
+            self.quotas[limit] = figures | {"route": route, "seen_at": int(time.time())}
+
     def status(self) -> dict:
         now = time.time()
         saved = self.rec.get("refresh_saved_at")
         state = "down" if self.down else "unavailable" if self._remaining() <= 0 else "ok"
-        return {"kind": self.kind, "prefix": self.prefix, "upstream": self.upstream, "state": state,
+        extra = {"quotas": self.quotas}
+        if self.images:
+            extra["images"] = self.images.login_status()
+        return extra | {"kind": self.kind, "prefix": self.prefix, "upstream": self.upstream, "state": state,
                 "reason": self.down or (self._unavailable() if state == "unavailable" else None),
                 # Durability, apart from availability: whether disk holds what memory holds.
                 "unsaved": self.unsaved, "last_error": self.last_error,
@@ -392,6 +445,130 @@ class OpenAISiwc:
                 "refresh_token_days": round(30 - (now - saved) / 86400, 1) if number(saved) else None,
                 "refreshes": self.refreshes, "client_id": self.rec.get("client_id"),
                 "host_id": self.rec.get("ext_agent_host_id"), "scopes": self.rec.get("scopes")}
+
+
+class CodexLogin(OpenAISiwc):
+    """The Codex ChatGPT login behind an openai-siwc provider's image requests: what
+    `codex login` writes, converted by `claude-rotate-admin install-credential --images`
+    to the record shape above plus account_id. It refreshes like the provider's own
+    credential, with Codex's parameters, and is sent only to the two image routes of the
+    ChatGPT backend."""
+    kind = "codex-login"
+    upstream = CODEX_BACKEND
+    suffix = ".codex.json"
+    how_to_get = ("make a login with `codex login` in an empty CODEX_HOME and install it with "
+                  "claude-rotate-admin install-credential PROVIDER --images")
+    how_to_renew = ("make a new login with `codex login` and install it with "
+                    "claude-rotate-admin install-credential PROVIDER --images")
+
+    def __init__(self, name: str, state_dir: Path):
+        super().__init__(name, {"prefix": ""}, state_dir)
+        self.last_answer = None  # status and time of the backend's last answer
+
+    def _usable(self, rec) -> bool:
+        return usable_record(rec) and isinstance(rec.get("account_id"), str) and bool(rec["account_id"].strip())
+
+    def _auth(self, token: str) -> dict:
+        return {"authorization": f"Bearer {token}", "chatgpt-account-id": self.rec["account_id"]}
+
+    async def _token_request(self, force: bool) -> httpx.Response:
+        return await self.auth.post(SIWC_AUTH + "/oauth/token", headers={"accept": "application/json"}, json={
+            "grant_type": "refresh_token", "client_id": self.rec["client_id"],
+            "refresh_token": self.rec["refresh_token"],
+            "refresh_reason": "unauthorized_recovery" if force else "proactive_expiry"})
+
+    def _permanent(self, status: int, code: str | None) -> bool:
+        return status == 401 or (status in (400, 403) and code in CODEX_PERMANENT)
+
+    def _record_from(self, data: dict) -> dict | None:
+        """Each token in the answer is optional and replaces the stored one, as in Codex.
+        The expiry comes from the access token's exp, else expires_in, else Codex's 8 days."""
+        rec = {k: v for k, v in self.rec.items() if k not in (NOTES, "earliest_refresh_at")}
+        for key in ("access_token", "refresh_token"):
+            if data.get(key) is not None:
+                if not isinstance(data[key], str) or not data[key].strip():
+                    return None
+                rec[key] = data[key]
+        now = int(time.time())
+        exp, expires_in = jwt_exp(rec["access_token"]), data.get("expires_in")
+        rec["expires_at"] = (exp if exp else now + int(expires_in)
+                             if number(expires_in) and 1 <= expires_in <= 30 * 86400
+                             else now + CODEX_REFRESH_FALLBACK_S)
+        if data.get("earliest_refresh_at") is not None:
+            rec["earliest_refresh_at"] = data["earliest_refresh_at"]
+        rec["saved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        rec["refresh_saved_at"] = now
+        return rec if self._usable(rec) else None
+
+    def note_answer(self, status: int) -> None:
+        self.last_answer = {"status": status, "at": int(time.time())}
+
+    def login_status(self) -> dict:
+        state = "down" if self.down else "unavailable" if self._remaining() <= 0 else "ok"
+        return {"state": state, "reason": self.down or (self._unavailable() if state == "unavailable" else None),
+                "unsaved": self.unsaved, "last_error": self.last_error,
+                "access_token_min": round(self._remaining() / 60) if self.rec else None,
+                "refreshes": self.refreshes, "last_answer": self.last_answer}
+
+
+def image_url(endpoint: str) -> httpx.URL:
+    """The backend URL for one of IMAGE_PATHS' values; nothing of the client's path or query."""
+    return httpx.URL(CODEX_BACKEND + endpoint)
+
+
+def image_headers(client: dict) -> dict:
+    """The client headers the image routes get (lower-case names)."""
+    return {k: v for k, v in client.items() if k in IMAGE_HEADERS} | {"accept-encoding": "identity"}
+
+
+def jwt_exp(token: str) -> int | None:
+    """The exp claim of a JWT, read without checking the signature: scheduling only."""
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (IndexError, ValueError, RecursionError):
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return int(exp) if number(exp) and exp > 0 else None
+
+
+QUOTA_RE = re.compile(r"x-([a-z0-9-]{1,48})-primary-used-percent")
+
+
+def quota_snapshots(headers) -> dict:
+    """Quota figures in Codex's header families (codex-api/src/rate_limits.rs), by limit
+    id. x-codex-* describe the limit x-codex-active-limit names, `codex` without it;
+    x-<limit>-primary-* and -secondary-* describe that limit."""
+    def num(name, kind=float):
+        try:
+            value = kind(headers.get(name, ""))
+        except ValueError:
+            return None
+        return value if number(value) else None
+
+    def window(prefix, which):
+        used = num(f"{prefix}-{which}-used-percent")
+        minutes, reset = num(f"{prefix}-{which}-window-minutes", int), num(f"{prefix}-{which}-reset-at", int)
+        if used is None or not (used or minutes or reset):
+            return None
+        return {"used_percent": used, "window_minutes": minutes, "resets_at": reset}
+
+    def limit_id(text):
+        text = text.strip().lower().replace("-", "_")
+        return text if re.fullmatch(r"[a-z0-9_]{1,48}", text) else None
+
+    out = {}
+    for name in list(headers.keys()):
+        match = QUOTA_RE.fullmatch(name.lower())
+        if not match:
+            continue
+        family = match.group(1)
+        limit = (limit_id(headers.get("x-codex-active-limit", "")) or "codex") if family == "codex" else limit_id(family)
+        figures = {"primary": window(f"x-{family}", "primary"), "secondary": window(f"x-{family}", "secondary")}
+        if limit and (figures["primary"] or figures["secondary"]):
+            plan = headers.get("x-codex-plan-type", "").strip()
+            out[limit] = figures | ({"plan": plan[:32]} if plan else {})
+    return out
 
 
 NOTES = "gateway"  # the record's field for what the gateway learnt: a refusal or a lost answer

@@ -11,6 +11,7 @@ empty on a real host.
 """
 
 import argparse
+import base64
 import fcntl
 import getpass
 import grp
@@ -835,8 +836,47 @@ def as_service(action):
         raise Refused(message or "the child process failed")
 
 
+CODEX_ISSUER = "https://auth.openai.com"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI's public OAuth client
+
+
+def jwt_exp(token: str):
+    """The exp claim of a JWT, read without checking the signature, or None."""
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (IndexError, ValueError, RecursionError):
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return int(exp) if type(exp) in (int, float) and math.isfinite(exp) and 0 < exp < 1e12 else None
+
+
+def codex_record(auth) -> dict:
+    """The record the gateway keeps from the auth.json of a `codex login`: the two tokens,
+    the client and account ids and the expiry, nothing else (not the id token, not an
+    API key the file may hold)."""
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    if not isinstance(tokens, dict) or not all(isinstance(tokens.get(k), str) and tokens[k].strip()
+                                               for k in ("access_token", "refresh_token", "account_id")):
+        raise Refused("this is not the auth.json of a ChatGPT `codex login`: it lacks tokens.access_token, "
+                      "refresh_token or account_id; nothing changed")
+    provenance = tokens.get("oauth_provenance") if isinstance(tokens.get("oauth_provenance"), dict) else {}
+    if provenance.get("issuer") not in (None, CODEX_ISSUER):
+        raise Refused(f"the login was issued by {provenance.get('issuer')!r}, not {CODEX_ISSUER}; nothing changed")
+    exp = jwt_exp(tokens["access_token"])
+    if exp is None:
+        raise Refused("the login's access token has no readable expiry; nothing changed")
+    client_id = provenance.get("client_id")
+    now = int(time.time())
+    return {"access_token": tokens["access_token"], "refresh_token": tokens["refresh_token"],
+            "client_id": client_id if isinstance(client_id, str) and client_id.strip() else CODEX_CLIENT_ID,
+            "account_id": tokens["account_id"], "expires_at": exp, "source": "codex login",
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)), "refresh_saved_at": now}
+
+
 def cmd_install_credential(args) -> int:
-    """Install a Sign in with ChatGPT credential made by siwc_login.py. It goes to the
+    """Install a Sign in with ChatGPT credential made by siwc_login.py, or with --images
+    the auth.json of a `codex login` for the provider's image requests. It goes to the
     state directory, written as the service user, because the service rewrites it at
     every refresh. The service is brought to a stopped state first so it cannot
     overwrite the new file with a refresh of the old one, and is started again whether
@@ -853,10 +893,17 @@ def cmd_install_credential(args) -> int:
             rec = json.loads(data)
         except ValueError:
             raise Refused("the credential is not JSON; nothing changed")
-        if not isinstance(rec, dict) or type(rec.get("expires_at")) not in (int, float) \
+        if args.images:
+            data = json.dumps(codex_record(rec), indent=2) + "\n"
+        elif isinstance(rec, dict) and isinstance(rec.get("tokens"), dict):
+            raise Refused("this is the auth.json of a `codex login`; for image generation install it "
+                          "with --images; nothing changed")
+        elif not isinstance(rec, dict) or type(rec.get("expires_at")) not in (int, float) \
                 or not math.isfinite(rec["expires_at"]) or not all(
                 isinstance(rec.get(k), str) and rec[k].strip() for k in ("access_token", "refresh_token", "client_id")):
             raise Refused("the credential lacks access_token, refresh_token, client_id or expires_at; nothing changed")
+        filename = f"{args.provider}{'.codex' if args.images else ''}.json"
+        what = f"images login for '{args.provider}'" if args.images else f"credential for '{args.provider}'"
         refuse_symlink(STATE_DIR, "state directory")
         if not STATE_DIR.exists():
             uid, gid = service_ids()
@@ -885,16 +932,15 @@ def cmd_install_credential(args) -> int:
                     raise Refused(f"could not bring {UNIT_NAME} to a stopped state (was {before}, now {after}"
                                   + (f": {detail}" if detail else "") + "); credential not installed")
                 stopped_by_us = True
-        live = CREDENTIALS / (args.provider + ".json")
+        live = CREDENTIALS / filename
         try:  # for the message only: install_credential_file decides as the service user
             replacing = stat.S_ISREG(os.lstat(live).st_mode)
         except OSError:
             replacing = False
         try:
-            as_service(lambda: install_credential_file(f"{args.provider}.json",
-                                                       data if data.endswith("\n") else data + "\n"))
+            as_service(lambda: install_credential_file(filename, data if data.endswith("\n") else data + "\n"))
         except NotDurable as exc:
-            code = activate(cfg, what=f"credential for '{args.provider}'")
+            code = activate(cfg, what=what)
             err(f"warning: the new credential is in place as {live} and is the one the service reads, "
                 f"but {exc}: a power loss before the disk catches up could bring back the previous "
                 "file. Check the disk, then run install-credential again with the same file.")
@@ -905,10 +951,12 @@ def cmd_install_credential(args) -> int:
         except BaseException:
             err(f"error: install-credential interrupted; {restore()}")
             raise
-        out(f"credential for '{args.provider}' installed as {live} (owner {SERVICE_USER}, mode 600"
+        out(f"{what} installed as {live} (owner {SERVICE_USER}, mode 600"
             + ("; the previous one kept as .prev" if replacing else "") + "). "
             "Delete the file you installed from.")
-        return activate(cfg, what=f"credential for '{args.provider}'")
+        if args.images and spec.get("images") is not True:
+            out(f"note: image generation stays off until the provider entry has \"images\": true")
+        return activate(cfg, what=what)
 
 
 def cmd_remove_token(args) -> int:
@@ -1137,7 +1185,7 @@ def collect_status():
                               "storage_errors": live.get("storage_errors"),
                               "providers": {n: {k: p.get(k) for k in (
                                   "kind", "prefix", "state", "reason", "unsaved", "last_error", "client_id", "host_id",
-                                  "access_token_min", "refresh_token_days")}
+                                  "access_token_min", "refresh_token_days", "images", "quotas")}
                                   for n, p in (live.get("providers") or {}).items() if isinstance(p, dict)},
                               "accounts": {n: {k: a.get(k) for k in ("effective_util_5h", "effective_util_7d",
                                                                     "last_seen", "status")}
@@ -1212,6 +1260,26 @@ def cmd_status(args) -> int:
                     + (f"; NOT ON DISK: {p['unsaved']}" if p.get("unsaved") else "")
                     + (f"; client_id {p['client_id']}, host id {p.get('host_id')}" if p.get("client_id") else "")
                     + (f"; access token {p['access_token_min']} min" if p.get("access_token_min") is not None else ""))
+                im = p.get("images")
+                if isinstance(im, dict):
+                    last = im.get("last_answer") if isinstance(im.get("last_answer"), dict) else {}
+                    out(f"    images: {im.get('state')}" + (f": {im['reason']}" if im.get("reason") else "")
+                        + (f"; NOT ON DISK: {im['unsaved']}" if im.get("unsaved") else "")
+                        + (f"; refresh failing: {im['last_error']}" if im.get("last_error") else "")
+                        + (f"; access token {im['access_token_min']} min" if im.get("access_token_min") is not None else "")
+                        + (f"; last answer {last.get('status')} at "
+                           + time.strftime("%Y-%m-%d %H:%M", time.localtime(last["at"])) if last.get("at") else ""))
+                for limit, q in (p.get("quotas") or {}).items():
+                    if not isinstance(q, dict):
+                        continue
+                    for which in ("primary", "secondary"):
+                        w = q.get(which)
+                        if isinstance(w, dict):
+                            out(f"    quota {limit} ({which}, {w.get('window_minutes')} min window): "
+                                f"{w.get('used_percent')}% used"
+                                + (", resets " + time.strftime("%Y-%m-%d %H:%M", time.localtime(w["resets_at"]))
+                                   if isinstance(w.get("resets_at"), int) else "")
+                                + (f"; plan {q['plan']}" if q.get("plan") else ""))
     elif report.get("live_error"):
         out(f"live /rotate/status: unavailable ({report['live_error']})")
     events = report.get("recent_events") or []
@@ -1267,6 +1335,8 @@ def build_parser():
             "restarts the service")
     p.add_argument("provider", metavar="PROVIDER")
     p.add_argument("--file", help="read the credential from this file instead of stdin")
+    p.add_argument("--images", action="store_true",
+                   help="the file is the auth.json of a `codex login`, for the provider's image requests")
     p = add("remove-user", cmd_remove_user, "revoke a device key", aliases=("remove-device",))
     p.add_argument("name", metavar="NAME")
     p.add_argument("--no-restart", action="store_true")
