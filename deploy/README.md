@@ -138,7 +138,10 @@ These are sized for a VPS with 2 GiB RAM and roughly 1.4 GiB available, leaving
 room for Tailscale and other services. Each request in flight keeps its request
 body (up to the 4 MiB limit) until its stream ends, so 48 requests can hold up to
 192 MiB of bodies on top of the process; typical Claude Code bodies are much
-smaller. Existing swap
+smaller. Under a provider with `"images": true` a body may reach
+`max_image_request_bytes` (32 MiB, set in `config.json`), and the bodies above
+4 MiB held at once are capped by `max_image_bytes_in_flight` (256 MiB), so the
+worst case stays inside the 768M limit. Existing swap
 is sufficient as an emergency buffer, but heavy swapping makes streaming and the
 watchdog less reliable. Check RSS and restart counts under your actual workload
 before raising limits. The CPU limit is often the tighter constraint on a one-vCPU host.

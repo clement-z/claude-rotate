@@ -560,13 +560,61 @@ that answer to the client byte for byte, without a refresh or a replay, since a 
 token would get the same answer. The audit record carries `upstream_error` (OpenAI's
 error type) and `refresh_after_401` (skipped, held back, or attempted) for any 401.
 
+**Image generation.** The Sign in with ChatGPT route refuses images, but Codex's
+`image_gen` tool is one JSON request to `<base_url>/images/generations` (or
+`/images/edits`), which Codex makes itself. With `"images": true` in an `openai-siwc`
+entry, the proxy sends those two requests to the ChatGPT backend Codex uses with its
+own login (`https://chatgpt.com/backend-api/codex`), with a Codex ChatGPT login it
+holds, billed to the same plan. Everything else stays on the Sign in with ChatGPT
+route. This is a private endpoint, not an OpenAI programme: see SECURITY.md before
+turning it on. To set it up:
+
+1. On the laptop, a login used for nothing else, then on the server:
+   ```sh
+   d=$(mktemp -d); CODEX_HOME=$d codex login; scp $d/auth.json server:; rm -r $d
+   sudo claude-rotate-admin install-credential openai --images --file auth.json; rm auth.json
+   ```
+   Do not run `codex logout` in that directory: it revokes the login. The installer
+   keeps the two tokens, the client and account ids and the expiry, nothing else.
+2. Add `"images": true` to the provider entry and run `claude-rotate-admin activate`.
+3. In each Codex that should make images, two more lines in `config.toml`:
+   ```toml
+   web_search = "disabled"              # top level
+
+   [model_providers.gateway]
+   # ... as above, plus:
+   http_headers = { "x-openai-actor-authorization" = "claude-rotate" }
+   ```
+   Codex offers `image_gen` to a provider of its own only when that header is set
+   (any value; the proxy drops it before any upstream). The header also turns on
+   Codex's web search tool, which posts to `/alpha/search`; that route is not known
+   to work on the Sign in with ChatGPT route, so web search stays off.
+
+Codex resends each generated image (about 1.3 MB of base64 for a 1536x1024 PNG) with
+every later request of its thread, so under a provider with images the request
+limit is `max_image_request_bytes` (32 MiB) instead of `max_request_bytes`; bodies
+above `max_request_bytes` share `max_image_bytes_in_flight` (256 MiB, then 503), and
+`max_concurrent_images` (2) image requests run at once, 8 more waiting, then 429. A
+generation takes about 8 s. Answers are relayed as they come; an HTML error page
+from the backend becomes a short JSON error, since Codex shows the model the body.
+The audit record carries `route: "codex-images"`, the duration and the bytes.
+
+**Quota.** OpenAI's answers carry the plan's quota in Codex's headers
+(`x-codex-primary-used-percent` and the like, `x-codex-active-limit` naming the
+limit). The proxy keeps the last figures it saw per limit, on both routes:
+`/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`
+show them, and the panel warns at 90 %. Images have their own limit
+(`imagegen_premium`, a 24-hour window); model use is `codex`. Figures appear once an
+answer carried them.
+
 ## Configuration (`config.json`)
 
 | Field | Meaning |
 |---|---|
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN`. Or `name → {"key": …, "providers": [...]}` to grant other providers; see [Other providers](#other-providers) |
-| `providers{}` | other upstreams under their own path prefix: `name → {"kind": "static-bearer", "upstream", "token_file"}` or `{"kind": "openai-siwc"}`, each with an optional `prefix`. See [Other providers](#other-providers) |
+| `providers{}` | other upstreams under their own path prefix: `name → {"kind": "static-bearer", "upstream", "token_file"}` or `{"kind": "openai-siwc"}` (optional `"images": true`), each with an optional `prefix`. See [Other providers](#other-providers) |
+| `max_image_request_bytes`, `max_image_bytes_in_flight`, `max_concurrent_images` | limits for a provider with `"images": true`: request body (default 32 MiB), bytes of bodies above `max_request_bytes` held at once (256 MiB), image requests at the backend at once (2; 8 more wait) |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `accounts[].billing` | the account's plans over time, for the panel's Subscriptions card and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra"}]`. The first date sets the monthly renewal day; a later entry changes plan from its date and keeps the renewal day (Anthropic prorates upgrades). Add `"renews": true` to an entry that restarts the billing cycle, such as Pro to Max. Record a downgrade with the renewal date it takes effect on. A broken entry is ignored and shown as a panel alert. |

@@ -115,6 +115,7 @@ the service active; otherwise it says `NOT live` and exits 2.
 | Add a device that may reach other providers | `sudo claude-rotate-admin add-user NAME --providers anthropic,openai` |
 | Let an existing device reach more providers, or fewer, keeping its key | `sudo claude-rotate-admin grant NAME openai`, `revoke NAME openai` |
 | Install a ChatGPT credential made by `siwc_login.py` | `sudo claude-rotate-admin install-credential PROVIDER --file FILE` |
+| Install the Codex login for a provider's image generation | `sudo claude-rotate-admin install-credential PROVIDER --images --file auth.json` |
 | Revoke a device | `sudo claude-rotate-admin remove-user NAME` |
 | Remove an account and delete its token file | `sudo claude-rotate-admin remove-token NAME` |
 | Set the URL printed for new devices | `sudo claude-rotate-admin set-url https://HOST` |
@@ -210,6 +211,33 @@ A refused refresh needs a new sign-in: run `siwc_login.py login --client-id ID
 unreachable, a 5xx) is retried every minute and shown as a panel alert; requests
 keep working while the access token in hand lasts.
 
+### Image generation
+
+With `"images": true` in the provider entry (see the README's "Image generation"),
+Codex's image requests go to the ChatGPT backend with a separate Codex login:
+
+```sh
+# laptop: a login used for nothing else
+d=$(mktemp -d); CODEX_HOME=$d codex login
+scp $d/auth.json vpn1:; rm -r $d
+# server
+sudo claude-rotate-admin install-credential openai --images --file auth.json; rm auth.json
+```
+
+The login's access token lasts 10 days; the proxy refreshes it 10 minutes before
+expiry, writing the new tokens first, as for the provider's own credential. `status`
+prints an `images:` line under the provider (state, minutes left, the backend's
+last answer) and one `quota` line per limit the answers carried, image quota
+(`imagegen_premium`) and model quota (`codex`) included. A refused refresh takes
+image generation down with a reason naming `codex login`; the provider's other
+requests go on. Make a new login and install it the same way. Image requests get
+503 while the login is missing or down, 429 when 2 run and 8 wait.
+
+To turn image generation off, remove `"images": true` and run `activate`; image
+requests then get OpenAI's 401 again until the teams remove the header. To end the
+login itself, delete `credentials/<provider>.codex.json` and its `.prev`, then revoke
+the session in ChatGPT's settings.
+
 ### Moving a credential from an earlier build
 
 Builds of the `multi-provider` branch before this one kept the credential at
@@ -270,6 +298,9 @@ To roll back, follow the [manual rollback procedure](deploy/README.md#immutable-
 with a previous release directory. A release from before provider support does not
 start on a config with object-form device entries (`{"key", "providers"}`): keep a
 copy of `config.json` from before the first such entry and restore it when rolling
-back to one. Its `credentials/` directory in the state directory can stay.
+back to one. Its `credentials/` directory in the state directory can stay. A release
+from before image generation refuses `"images"` in a provider entry: remove the key
+first, and have the teams remove the `x-openai-actor-authorization` header, which an
+older release would forward to OpenAI.
 The [Debian systemctl reference](https://manpages.debian.org/bookworm/systemd/systemctl.1.en.html)
 documents service-control commands.

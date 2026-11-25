@@ -132,6 +132,29 @@ credential. What that changes:
   about a gateway serving several of one person's agents. Revoking plan access per
   transferred session is not available yet on OpenAI's side; disconnect the agent
   in ChatGPT's settings to cut it off.
+- With `"images": true`, the proxy also holds a Codex ChatGPT login,
+  `credentials/<provider>.codex.json`, and sends Codex's two image requests to
+  `https://chatgpt.com/backend-api/codex/images/...` with it. This is a private
+  endpoint, used here the way the Codex CLI uses it, without any OpenAI programme
+  behind it: OpenAI left image generation out of token sharing. OpenAI's Terms of
+  Use (effective 2026-01-01) forbid to "circumvent any rate limits or restrictions"
+  and to "automatically or programmatically extract data or Output", and this use
+  can be read as either. An action against the account would also end the Sign in
+  with ChatGPT route for every device. The requests come from httpx on the server's
+  address, without Codex's cookies or version header; they do not pass as the Codex
+  CLI and do not try to.
+- That login is broader than the Sign in with ChatGPT token: it runs the plan
+  without the token-sharing limits, reaches Codex cloud tasks and the account's
+  connectors. The proxy keeps only its access and refresh tokens and the account id
+  (not the id token, not an API key `codex login` may have stored), mode 0600 under
+  the service user, and sends it only to the two image URLs, which are fixed in the
+  code. Devices reach those two routes and nothing else with it. Deleting the file
+  does not end the login: revoke it in ChatGPT's settings or with `codex logout` on
+  a copy.
+- Codex turns its image tool on for a provider of its own when the provider sends
+  the header `x-openai-actor-authorization`. The proxy drops that header before any
+  upstream, on every path, so a value meant for the proxy never reaches OpenAI or
+  Anthropic as a credential.
 - Revoking a device is still a config edit and a restart.
 
 ## Remaining limits
