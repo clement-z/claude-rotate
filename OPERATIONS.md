@@ -113,6 +113,7 @@ the service active; otherwise it says `NOT live` and exits 2.
 | Add an account, or replace an existing account's token | `sudo claude-rotate-admin add-token NAME` |
 | Add a device and print its two `export` lines | `sudo claude-rotate-admin add-user NAME` |
 | Add a device that may reach other providers | `sudo claude-rotate-admin add-user NAME --providers anthropic,openai` |
+| Let an existing device reach more providers, or fewer, keeping its key | `sudo claude-rotate-admin grant NAME openai`, `revoke NAME openai` |
 | Install a ChatGPT credential made by `siwc_login.py` | `sudo claude-rotate-admin install-credential PROVIDER --file FILE` |
 | Revoke a device | `sudo claude-rotate-admin remove-user NAME` |
 | Remove an account and delete its token file | `sudo claude-rotate-admin remove-token NAME` |
@@ -169,9 +170,17 @@ upstream traffic does.
 Providers are set in `config.json` under `providers` (see the README's "Other
 providers"); edit it with `sudoedit` and run `activate`. A static bearer token goes
 in `/etc/claude-rotate/tokens/` like an account token; `activate` restores its
-mode. A device reaches a provider only if its entry lists it: `add-user NAME
---providers openai` mints such a key and prints it with the base URL to use. An
-object entry written by hand needs both `key` and a nonempty `providers` list.
+mode. A device reaches a provider only if its entry lists it, or, for a device given
+as a plain string, if `default_providers` lists it (the Claude accounts alone when
+it is not set). `add-user NAME --providers openai` mints a key with its own list
+and prints it with the base URL to use; `add-user NAME` without `--providers`
+writes a plain string that follows `default_providers`. To give an existing team
+OpenAI without handing out a new key, run `grant NAME openai`; `revoke NAME
+openai` takes it away. Both keep the key and leave an object entry, so a later
+change of `default_providers` does not affect that device. An object entry
+written by hand needs both `key` and a nonempty `providers` list; run `check`
+before `activate`, since `activate` stops and disables the service when the
+configuration is not ready.
 
 For an `openai-siwc` provider, sign in on a machine with a browser with
 `python3 siwc_login.py login`, copy the file to the server, then:

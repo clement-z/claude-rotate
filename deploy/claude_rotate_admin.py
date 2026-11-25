@@ -235,10 +235,25 @@ def device_key(entry):
     return entry if isinstance(entry, str) else None
 
 
-def device_providers(entry):
-    """What a devices entry may reach; the string form is the Claude accounts only. An
+def default_providers(cfg: dict):
+    """What a device given as a plain string may reach: default_providers, else the
+    Claude accounts alone."""
+    return cfg.get("default_providers", [ANTHROPIC])
+
+
+def device_providers(cfg: dict, entry):
+    """What a devices entry may reach; the string form follows default_providers. An
     object must list its grants: a missing list grants nothing (and fails readiness)."""
-    return entry.get("providers") if isinstance(entry, dict) else [ANTHROPIC]
+    return entry.get("providers") if isinstance(entry, dict) else default_providers(cfg)
+
+
+def parse_providers(cfg: dict, text: str, what: str, also=()) -> list:
+    """A comma-separated list of distinct provider names, each configured or in `also`."""
+    names = [n.strip() for n in text.split(",")]
+    allowed = known_providers(cfg) | set(also)
+    if not names or "" in names or any(n not in allowed for n in names) or len(set(names)) != len(names):
+        raise Refused(f"{what} must list distinct names from: {', '.join(sorted(allowed))}; nothing changed")
+    return names
 
 
 def known_providers(cfg: dict) -> set:
@@ -383,10 +398,15 @@ def readiness(cfg: dict):
     if len(set(keys)) != len(keys):
         problems.append("device keys are not unique")
     known = known_providers(cfg)
+    default = default_providers(cfg)
+    if not isinstance(default, list) or not default or any(n not in known for n in default):
+        problems.append(f"default_providers must be a nonempty list of names from: {', '.join(sorted(known))}")
     for k, v in devices.items():
-        names = device_providers(v)
+        if not isinstance(v, dict):
+            continue
+        names = v.get("providers")
         if not isinstance(names, list) or not names or any(n not in known for n in names) \
-                or (isinstance(v, dict) and set(v) - {"key", "providers"}):
+                or set(v) - {"key", "providers"}:
             problems.append(f"device '{k}': an object needs \"key\" and a nonempty \"providers\" list "
                             f"of names from: {', '.join(sorted(known))}")
     return not problems, problems, warnings
@@ -668,23 +688,60 @@ def cmd_add_user(args) -> int:
         if args.name in cfg["devices"]:
             raise Refused(f"device '{args.name}' already exists; nothing changed. "
                           "To issue a new key: remove-user then add-user")
-        names = [ANTHROPIC] if args.providers is None else [n.strip() for n in args.providers.split(",")]
-        unknown = [n for n in names if n not in known_providers(cfg)]
-        if not names or "" in names or unknown or len(set(names)) != len(names):
-            raise Refused(f"--providers must list distinct names from: {', '.join(sorted(known_providers(cfg)))}; "
-                          "nothing changed")
+        # Without --providers the entry is a plain string and follows default_providers;
+        # an explicit list is kept as given, so changing the default later does not widen it.
+        names = None if args.providers is None else parse_providers(cfg, args.providers, "--providers")
         removed = [k for k, v in cfg["devices"].items() if PLACEHOLDER in (device_key(v) or "")]
         for name in removed:
             del cfg["devices"][name]
         key = f"dev-{args.name}-{secrets.token_hex(8)}"
         while key in {device_key(v) for v in cfg["devices"].values()}:
             key = f"dev-{args.name}-{secrets.token_hex(8)}"
-        cfg["devices"][args.name] = key if names == [ANTHROPIC] else {"key": key, "providers": names}
+        cfg["devices"][args.name] = key if names is None else {"key": key, "providers": names}
         write_config(cfg)
         for name in removed:
             out(f"removed placeholder device '{name}' from the example config")
-        print_device_block(cfg, args.name, key, names)
+        print_device_block(cfg, args.name, key, device_providers(cfg, cfg["devices"][args.name]))
         return activate(cfg, restart=not args.no_restart, what=f"key for '{args.name}'")
+
+
+def change_grants(args, grant: bool) -> int:
+    """grant/revoke: add or remove providers on an existing device, keeping its key. The
+    result is always the object form, so a later change of default_providers leaves it alone."""
+    validate_name(args.name, "device name")
+    with AdminLock():
+        check_fixed_tree()
+        cfg = load_config()
+        entry = cfg["devices"].get(args.name)
+        key = device_key(entry)
+        if not key or PLACEHOLDER in key:
+            raise Refused(f"no device '{args.name}' with a usable key; nothing changed")
+        before = device_providers(cfg, entry)
+        if not isinstance(before, list) or not all(isinstance(n, str) for n in before):
+            raise Refused(f"device '{args.name}' has a malformed providers list (or default_providers is "
+                          "malformed); fix the config by hand; nothing changed")
+        # A provider no longer configured can still be revoked: that is how such an entry is repaired.
+        names = parse_providers(cfg, args.providers, "PROVIDERS", also=() if grant else before)
+        after = before + [n for n in names if n not in before] if grant else [n for n in before if n not in names]
+        was = ", ".join(before) + ("" if isinstance(entry, dict) else " by default")
+        if after == before:
+            out(f"device '{args.name}' already reaches {was}; nothing changed")
+            return EXIT_OK
+        if not after:
+            raise Refused(f"that would leave '{args.name}' with no grant; to revoke its key use "
+                          "remove-user; nothing changed")
+        cfg["devices"][args.name] = {"key": key, "providers": after}
+        write_config(cfg)
+        out(f"device '{args.name}' now reaches {', '.join(after)} (was {was}); its key is unchanged")
+        return activate(cfg, restart=not args.no_restart, what=f"grants for '{args.name}'")
+
+
+def cmd_grant(args) -> int:
+    return change_grants(args, grant=True)
+
+
+def cmd_revoke(args) -> int:
+    return change_grants(args, grant=False)
 
 
 def cmd_remove_user(args) -> int:
@@ -1015,7 +1072,7 @@ def cmd_rotate(args) -> int:
 def live_status(cfg: dict):
     # The status endpoint needs a key with the Claude grant.
     keys = [device_key(v) for v in cfg["devices"].values() if (device_key(v) or "").strip()
-            and PLACEHOLDER not in device_key(v) and ANTHROPIC in (device_providers(v) or [])]
+            and PLACEHOLDER not in device_key(v) and ANTHROPIC in (device_providers(cfg, v) or [])]
     if not keys:
         return None, "no device key available for an authenticated query"
     host, port = bind_address(cfg)
@@ -1082,7 +1139,8 @@ def collect_status():
     report["accounts"] = accounts
     report["devices"] = [{"name": k, "key_suffix": (device_key(v)[-4:] if len(device_key(v) or "") >= 8 else None),
                           "placeholder": PLACEHOLDER in (device_key(v) or ""),
-                          "providers": device_providers(v) or []}
+                          "providers": (lambda n: n if isinstance(n, list) else [])(device_providers(cfg, v)),
+                          "default": not isinstance(v, dict)}
                          for k, v in cfg["devices"].items()]
     report["recent_events"] = ((state or {}).get("events") or [])[-5:]
     report["live"] = None
@@ -1157,6 +1215,7 @@ def cmd_status(args) -> int:
         out(f"  {device['name']}: key ...{device['key_suffix'] or '????'}"
             + (" PLACEHOLDER" if device["placeholder"] else "")
             + (f"; providers {', '.join(map(str, device['providers']))}"
+               + (" (default)" if device["default"] else "")
                if device["providers"] != [ANTHROPIC] else ""))
     if live:
         errors = live.get("storage_errors") or {}
@@ -1209,9 +1268,15 @@ def build_parser():
     p.add_argument("--no-restart", action="store_true", help="store only; do not touch the service")
     p = add("add-user", cmd_add_user, "mint a device key and print the client settings", aliases=("add-device",))
     p.add_argument("name", metavar="NAME")
-    p.add_argument("--providers", help="comma-separated providers the key may reach "
-                   "(default: anthropic, the Claude accounts)")
+    p.add_argument("--providers", help="comma-separated providers the key may reach, kept as given "
+                   "(default: follow default_providers, else anthropic, the Claude accounts)")
     p.add_argument("--no-restart", action="store_true")
+    for name, func, help_text in (("grant", cmd_grant, "let an existing device key reach more providers"),
+                                  ("revoke", cmd_revoke, "stop an existing device key reaching providers")):
+        p = add(name, func, help_text + "; the key is unchanged")
+        p.add_argument("name", metavar="NAME")
+        p.add_argument("providers", metavar="PROVIDERS", help="comma-separated provider names")
+        p.add_argument("--no-restart", action="store_true")
     p = add("install-credential", cmd_install_credential,
             "install a Sign in with ChatGPT credential made by siwc_login.py (from --file or stdin); "
             "restarts the service")
