@@ -474,15 +474,12 @@ path prefix; the bare root stays the rotated Claude accounts, unchanged.
 - **`prefix`** defaults to `/<name>`. It is one path segment and takes that
   segment away from the Claude passthrough; `/v1`, `/api`, `/rotate`, `/docs`,
   `/redoc` and `/anthropic` are refused.
-- **Grants.** A device given as a string reaches what `default_providers`
-  lists, and the Claude accounts alone when it is not set, as before. The object
-  form must list what the key may reach, `anthropic` being the Claude accounts;
-  an object without the list fails startup. Anything not granted gets 403. A
-  provider added to the table is not granted to any key until a list names it,
-  `default_providers` included. `claude-rotate-admin grant NAME openai` and
-  `revoke NAME openai` change an existing device in place and keep its key; the
-  result is an object entry, which a later change of `default_providers` leaves
-  alone. A key opens the panel and its JSON endpoints only with the
+- **Grants.** A device given as a string reaches the Claude accounts only, as
+  before. The object form must list what the key may reach, `anthropic` being
+  the Claude accounts; an object without the list fails startup. Anything not
+  granted gets 403. `claude-rotate-admin grant NAME openai` and `revoke NAME
+  openai` change an existing device in place and keep its key. A key opens the
+  panel and its JSON endpoints only with the
   `anthropic` grant; with `panel_tailnet`, a tailnet user opens it whatever key,
   if any, the request carries.
 
@@ -569,7 +566,6 @@ error type) and `refresh_after_401` (skipped, held back, or attempted) for any 4
 |---|---|
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN`. Or `name → {"key": …, "providers": [...]}` to grant other providers; see [Other providers](#other-providers) |
-| `default_providers[]` | what a device given as a plain string may reach, `anthropic` being the Claude accounts. Default `["anthropic"]`. For example `["anthropic", "openai"]` gives every string-form key the OpenAI provider too. See [Other providers](#other-providers) |
 | `providers{}` | other upstreams under their own path prefix: `name → {"kind": "static-bearer", "upstream", "token_file"}` or `{"kind": "openai-siwc"}`, each with an optional `prefix`. See [Other providers](#other-providers) |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |

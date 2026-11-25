@@ -191,27 +191,6 @@ async def grants(c):
           r.status_code == 200 and calls(before) == {"lan": 1} and seen["lan"][-1].url.raw_path == b"/api/")
 
 
-async def defaults(c):
-    # A plain-string device follows DEFAULT_GRANTS; an object entry keeps its own list.
-    saved = R.DEFAULT_GRANTS
-    R.DEFAULT_GRANTS = frozenset({"lan"})
-    try:
-        before = snap()
-        r = await ask(c, "/lan/x", "claude")
-        check("with default_providers [lan], a string-key device reaches lan",
-              r.status_code == 200 and calls(before) == {"lan": 1})
-        for method, path in (("GET", "/"), ("POST", "/v1/messages")):
-            before = snap()
-            r = await ask(c, path, "claude", method=method, body=b"{}")
-            check(f"with default_providers [lan], a string-key device gets 403 on {method} {path}",
-                  r.status_code == 403 and calls(before) == {})
-        before = snap()
-        r = await ask(c, "/lan/x", "oaibox")
-        check("an object entry ignores default_providers", r.status_code == 403 and calls(before) == {})
-    finally:
-        R.DEFAULT_GRANTS = saved
-
-
 async def paths(c):
     for path, up, host, raw in (("/lan/a%3Fb%23c?q=1", "lan", "lan.example", b"/api/a%3Fb%23c?q=1"),
                                 ("/openai/v1/a%3Fb%23c", "openai", "api.openai.com", b"/v1/a%3Fb%23c")):
@@ -397,7 +376,6 @@ async def main():
                                  cookies=jar) as c:
         await forwarding(c)
         await grants(c)
-        await defaults(c)
         await paths(c)
         await cookies(c)
         await connection(c)
@@ -408,8 +386,8 @@ async def main():
         await connection_lines(c)
 
 
-def load_with(devices, **extra):
-    d = fixture({"devices": devices} | extra)
+def load_with(devices):
+    d = fixture({"devices": devices})
     old = R.CONFIG_PATH
     R.CONFIG_PATH = d / "config.json"
     try:
@@ -443,21 +421,15 @@ for label, entry, word in (
         ("an extra key", {"key": "fake-key-x", "providers": ["lan"], "note": "x"}, "providers"),
         ("an object without a key", {"providers": ["lan"]}, "device keys")):
     check(f"device entry refused: {label}", refuses(load_with, {"x": entry}, word))
-check("without default_providers, string devices default to the Claude accounts",
-      cfg["default_providers"] == ["anthropic"])
-for label, value in (("an empty list", []), ("a string", "anthropic"), ("a non-string name", ["lan", 1]),
-                     ("an object", {"anthropic": True})):
-    check(f"default_providers refused: {label}",
-          refuses(lambda d: load_with(d, default_providers=value), {"y": "fake-key-y"}, "default_providers"))
 check("device entry refused: a key shared by an object and a string",
       refuses(load_with, {"x": {"key": "fake-key-x", "providers": ["lan"]}, "y": "fake-key-x"}, "unique"))
 
 
-def import_with(devices, code="import rotator", **extra):
-    d = fixture({"devices": devices, "providers": {"lan": LAN_SPEC}} | extra)
+def import_with(devices):
+    d = fixture({"devices": devices, "providers": {"lan": LAN_SPEC}})
     env = {**os.environ, "CLAUDE_ROTATE_CONFIG": str(d / "config.json"),
            "CLAUDE_ROTATE_STATE": str(d / "state.json"), "CLAUDE_ROTATE_AUDIT": str(d / "audit.jsonl")}
-    return subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env,
+    return subprocess.run([sys.executable, "-c", "import rotator"], cwd=HERE, env=env,
                           text=True, capture_output=True, timeout=120)
 
 
@@ -466,18 +438,6 @@ check("a grant naming configured providers starts", child.returncode == 0)
 child = import_with({"x": {"key": "fake-key-x", "providers": ["lan", "nope"]}})
 check("a grant naming an unknown provider refuses startup",
       child.returncode != 0 and "unknown provider(s) nope" in child.stderr)
-child = import_with({"x": "fake-key-x"}, default_providers=["anthropic", "nope"])
-check("default_providers naming an unknown provider refuses startup",
-      child.returncode != 0 and "default_providers: unknown provider(s) nope" in child.stderr)
-probe = ("import rotator as R; print(R.granted('y', 'lan'), R.granted('y', 'anthropic'), "
-         "R.granted('x', 'anthropic'), R.granted('x', 'lan'))")
-child = import_with({"x": {"key": "fake-key-x", "providers": ["lan"]}, "y": "fake-key-y"}, probe,
-                    default_providers=["anthropic", "lan"])
-check("default_providers from config.json reaches string devices only",
-      child.returncode == 0 and child.stdout.split() == ["True", "True", "False", "True"])
-child = import_with({"x": {"key": "fake-key-x", "providers": ["lan"]}, "y": "fake-key-y"}, probe)
-check("without default_providers a string device reaches the Claude accounts alone, as before",
-      child.returncode == 0 and child.stdout.split() == ["False", "True", "False", "True"])
 
 table = providers_with({"lan": LAN_SPEC, "openai": {"kind": "openai-siwc"}})
 check("a valid provider table loads",

@@ -312,9 +312,8 @@ def test_add_user_providers():
     check("without --providers the entry stays a plain string (Claude accounts only)",
           r.returncode == 0 and isinstance(entry, str) and f"export CLAUDE_CODE_OAUTH_TOKEN={entry}" in r.stdout, r)
     r = f.run("add-user", "named-box", "--providers", "anthropic", "--no-restart")
-    check("--providers anthropic is kept as an explicit list, so a later default_providers cannot widen it",
-          r.returncode == 0 and isinstance(f.cfg()["devices"].get("named-box"), dict)
-          and f.cfg()["devices"]["named-box"]["providers"] == ["anthropic"], r)
+    check("--providers anthropic alone is also stored as a plain string",
+          r.returncode == 0 and isinstance(f.cfg()["devices"].get("named-box"), str), r)
     r = f.run("add-user", "both-box", "--providers", "anthropic, openai", "--no-restart")
     entry = f.cfg()["devices"].get("both-box")
     check("--providers anthropic,openai stores both and prints the Claude and provider settings",
@@ -416,47 +415,14 @@ def set_cfg(f, **changes):
     f.config.write_text(json.dumps(cfg))
 
 
-def test_default_providers():
-    f = make()
-    for label, value in (("an empty list", []), ("a string", "openai"), ("an unknown name", ["anthropic", "nope"])):
-        set_cfg(f, default_providers=value)
-        r = f.run("check")
-        check(f"check reports default_providers as {label}",
-              r.returncode == 3 and "default_providers must be" in r.stdout and "device 'laptop'" not in r.stdout, r)
-    set_cfg(f, default_providers=["anthropic", "openai"])
-    r = f.run("check")
-    check("check accepts default_providers naming configured providers", r.returncode == 0, r)
-    r = f.run("add-user", "team-a", "--no-restart")
-    entry = f.cfg()["devices"].get("team-a")
-    check("add-user without --providers writes a plain string and prints the default's settings",
-          r.returncode == 0 and isinstance(entry, str) and f"export CLAUDE_CODE_OAUTH_TOKEN={entry}" in r.stdout
-          and "openai: base URL http://<this-host>:8484/openai/v1" in r.stdout, r)
-    set_cfg(f, default_providers=["openai"])
-    r = f.run("add-user", "team-b", "--no-restart")
-    entry = f.cfg()["devices"].get("team-b")
-    check("with a default without anthropic, add-user prints no Claude settings and no panel link",
-          r.returncode == 0 and isinstance(entry, str) and "CLAUDE_CODE_OAUTH_TOKEN" not in r.stdout
-          and "/rotate/panel" not in r.stdout and "openai: base URL" in r.stdout, r)
-    set_cfg(f, default_providers=["anthropic", "openai"])
-    r = f.run("status", "--json")
-    devices = {d["name"]: d for d in json.loads(r.stdout)["devices"]} if r.returncode == 0 else {}
-    check("status --json resolves string devices through default_providers and marks them",
-          devices.get("laptop", {}).get("providers") == ["anthropic", "openai"]
-          and devices["laptop"].get("default") is True, devices)
-    human = f.run("status")
-    check("status text marks a device that follows the default",
-          any("laptop: key ..." in x and "; providers anthropic, openai (default)" in x
-              for x in human.stdout.splitlines()), human.stdout)
-
-
 def test_grant_revoke():
     f = make()
     f.set_active(True)
     reset(f)
     r = f.run("grant", "laptop", "openai")
-    check("grant turns a string device into an object with the default plus the grant, same key",
+    check("grant turns a string device into an object with anthropic plus the grant, same key",
           r.returncode == 0 and f.cfg()["devices"]["laptop"] == {"key": LAPTOP_KEY, "providers": ["anthropic", "openai"]}
-          and "now reaches anthropic, openai (was anthropic by default); its key is unchanged" in r.stdout
+          and "now reaches anthropic, openai (was anthropic); its key is unchanged" in r.stdout
           and LAPTOP_KEY not in r.stdout + r.stderr and "is live" in r.stdout
           and any(c.split()[0] in ("start", "enable", "restart") for c in f.calls()), (r, f.calls()))
     for args, label in ((("grant", "laptop", "openai"), "a grant it already has"),
@@ -483,22 +449,21 @@ def test_grant_revoke():
     check("revoke removes one grant, keeps the key, and --no-restart leaves the service alone",
           r.returncode == 0 and f.cfg()["devices"]["laptop"] == {"key": LAPTOP_KEY, "providers": ["openai"]}
           and "NOT live" in r.stdout and f.calls() == [], (r, f.calls()))
-    set_cfg(f, devices={"laptop": LAPTOP_KEY}, default_providers=["anthropic", "openai"])
-    reset(f)
+    r = f.run("grant", "laptop", "anthropic", "--no-restart")
+    r2 = f.run("revoke", "laptop", "openai", "--no-restart")
+    check("a device left with the Claude accounts alone goes back to the plain string, same key",
+          r.returncode == 0 and r2.returncode == 0 and f.cfg()["devices"]["laptop"] == LAPTOP_KEY, (r, r2))
     before = f.config.read_bytes()
-    r = f.run("grant", "laptop", "openai")
-    check("grant of what the default already gives changes nothing",
-          r.returncode == 0 and "already reaches anthropic, openai by default; nothing changed" in r.stdout
-          and f.config.read_bytes() == before and f.calls() == [], r)
-    r = f.run("revoke", "laptop", "openai", "--no-restart")
-    check("revoke on a string device pins the default minus the revoked provider",
-          r.returncode == 0 and f.cfg()["devices"]["laptop"] == {"key": LAPTOP_KEY, "providers": ["anthropic"]}, r)
+    r = f.run("grant", "laptop", "anthropic")
+    check("grant anthropic on a plain string changes nothing",
+          r.returncode == 0 and "already reaches anthropic; nothing changed" in r.stdout
+          and f.config.read_bytes() == before, r)
     set_cfg(f, devices={"laptop": LAPTOP_KEY, "old": {"key": "dev-old-0011223344556677",
-                                                       "providers": ["anthropic", "gone"]}})
+                                                       "providers": ["anthropic", "openai", "gone"]}})
     check("a device naming a provider no longer configured fails check", f.run("check").returncode == 3)
     r = f.run("revoke", "old", "gone", "--no-restart")
     check("revoke can remove a provider no longer configured, which repairs the entry",
-          r.returncode == 0 and f.cfg()["devices"]["old"]["providers"] == ["anthropic"]
+          r.returncode == 0 and f.cfg()["devices"]["old"]["providers"] == ["anthropic", "openai"]
           and f.run("check").returncode == 0, r)
 
 
@@ -572,6 +537,5 @@ test_install_unit_states_and_failures()
 test_add_user_providers()
 test_status_reports_providers()
 test_readiness_of_object_devices()
-test_default_providers()
 test_grant_revoke()
 print(f"\nall {PASS} checks passed")

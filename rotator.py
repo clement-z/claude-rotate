@@ -125,14 +125,11 @@ def load_config() -> dict:
     devices = cfg.get("devices")
     if not isinstance(devices, dict):
         raise SystemExit("devices must map names to nonempty device keys")
-    default = cfg.setdefault("default_providers", [ANTHROPIC])
-    if not isinstance(default, list) or not default or not all(isinstance(n, str) for n in default):
-        raise SystemExit("default_providers must be a nonempty list of provider names")
     grants = {}
     for name, entry in devices.items():
-        # A string is a key for default_providers (the Claude accounts unless set); an
-        # object must name what it grants, so a missing or misspelt "providers" cannot
-        # fall back to the default.
+        # A string is a key for the Claude accounts alone; an object must name what it
+        # grants, so a missing or misspelt "providers" cannot fall back to the Claude
+        # accounts and the panel.
         if isinstance(entry, dict):
             names = entry.get("providers")
             if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names) \
@@ -211,17 +208,15 @@ app.add_middleware(PrivateResponseHeaders)
 DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 PROVIDERS = providers.load_providers(CFG, CONFIG_PATH.parent, STATE_PATH.parent)
 PREFIXES = {p.prefix[1:]: p for p in PROVIDERS.values()}
-for _what, _names in [("default_providers", CFG["default_providers"])] + [
-        (f"device '{d}'", n) for d, n in CFG.get("device_grants", {}).items()]:
+for _device, _names in CFG.get("device_grants", {}).items():
     if set(_names) - {ANTHROPIC} - set(PROVIDERS):
-        raise SystemExit(f"{_what}: unknown provider(s) "
+        raise SystemExit(f"device '{_device}': unknown provider(s) "
                          + ", ".join(sorted(set(_names) - {ANTHROPIC} - set(PROVIDERS))))
 DEVICE_GRANTS = {d: frozenset(n) for d, n in CFG.get("device_grants", {}).items()}
-DEFAULT_GRANTS = frozenset(CFG["default_providers"])  # for devices given as a plain string
 
 
 def granted(device: str, provider: str) -> bool:
-    return provider in DEVICE_GRANTS.get(device, DEFAULT_GRANTS)
+    return provider in DEVICE_GRANTS.get(device, (ANTHROPIC,))
 
 
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
@@ -1082,7 +1077,7 @@ def aggregate_audit() -> dict:
             "last_model": meta.get("last_model"),
             "last_account": meta.get("last_account"),
             "last_provider": meta.get("last_provider"),
-            "providers": sorted(DEVICE_GRANTS.get(name, DEFAULT_GRANTS)),
+            "providers": sorted(DEVICE_GRANTS.get(name, (ANTHROPIC,))),
             "req_1h": device_hour_reqs.get(name, 0),
             "tokens_1h": device_hour_tokens.get(name, 0),
         }

@@ -88,11 +88,9 @@ credential. What that changes:
   once, not only the Claude accounts. Keep the existing hardening (dedicated user,
   root-owned code, private directories, loopback bind behind Tailscale Serve) and
   give the host nothing else to do.
-- A device key reaches only what its entry grants. The string form means what
-  `default_providers` lists, the Claude accounts alone unless it is set; a device
-  calling a provider it was not granted gets 403. Adding a provider to the table
-  grants it to no key; adding it to `default_providers` grants it to every
-  string-form key at once. Give a team or agent container a key that lists only what it needs. A key
+- A device key reaches only what its entry grants. The string form keeps meaning
+  the Claude accounts alone; a device calling a provider it was not granted gets
+  403. Give a team or agent container a key that lists only what it needs. A key
   opens the dashboard and its JSON endpoints, including the account switch, only
   with the `anthropic` grant. With `panel_tailnet` the tailnet identity is a
   separate way in: any tailnet user can open the dashboard whatever key the
