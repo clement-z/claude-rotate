@@ -1266,6 +1266,7 @@ def cmd_status(args) -> int:
                     out(f"    images: {im.get('state')}" + (f": {im['reason']}" if im.get("reason") else "")
                         + (f"; NOT ON DISK: {im['unsaved']}" if im.get("unsaved") else "")
                         + (f"; refresh failing: {im['last_error']}" if im.get("last_error") else "")
+                        + (f"; {im['usage_error']}" if im.get("usage_error") else "")
                         + (f"; access token {im['access_token_min']} min" if im.get("access_token_min") is not None else "")
                         + (f"; last answer {last.get('status')} at "
                            + time.strftime("%Y-%m-%d %H:%M", time.localtime(last["at"])) if last.get("at") else ""))

@@ -55,6 +55,10 @@ IMAGE_HEADERS = ("content-type", "originator", "user-agent", "x-codex-image-turn
 CODEX_PERMANENT = {"invalid_grant", "refresh_token_expired", "refresh_token_reused",
                    "refresh_token_invalidated"}
 CODEX_REFRESH_FALLBACK_S = 8 * 86400  # Codex's age rule, for a token without a readable exp
+# Where Codex reads the plan's usage windows (5 h and weekly) with a ChatGPT login: a read,
+# no model call. The Sign in with ChatGPT route carries no quota headers on /responses.
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+USAGE_POLL_S = 300
 # Refresh errors that only a new sign-in repairs.
 FATAL = {"invalid_grant", "invalid_client", "refresh_token_reused",
          "refresh_token_expired", "refresh_token_invalidated"}
@@ -417,6 +421,13 @@ class OpenAISiwc:
             except Exception as exc:  # the provider's own credential must still be kept
                 print(f"warning: provider {self.name}: images login maintenance failed "
                       f"({type(exc).__name__})", file=sys.stderr)
+            try:
+                usage = await self.images.usage()
+            except Exception as exc:
+                print(f"warning: provider {self.name}: usage query failed ({type(exc).__name__})", file=sys.stderr)
+                usage = None
+            for limit, figures in (usage or {}).items():
+                self.quotas[limit] = figures | {"route": "usage", "seen_at": int(time.time())}
         if not self.rec:
             return
         if self.unsaved:  # also a refusal or a lost answer that is not on disk yet
@@ -464,6 +475,7 @@ class CodexLogin(OpenAISiwc):
     def __init__(self, name: str, state_dir: Path):
         super().__init__(name, {"prefix": ""}, state_dir)
         self.last_answer = None  # status and time of the backend's last answer
+        self.usage_at, self.usage_error = 0.0, None  # last poll of the plan's usage
 
     def _usable(self, rec) -> bool:
         return usable_record(rec) and isinstance(rec.get("account_id"), str) and bool(rec["account_id"].strip())
@@ -503,12 +515,30 @@ class CodexLogin(OpenAISiwc):
     def note_answer(self, status: int) -> None:
         self.last_answer = {"status": status, "at": int(time.time())}
 
+    async def usage(self) -> dict | None:
+        """The plan's usage windows by limit id, at most once per USAGE_POLL_S; None
+        when not due or not available (the reason is kept in usage_error)."""
+        if self.down or not self.rec or self._remaining() <= 0 or time.time() - self.usage_at < USAGE_POLL_S:
+            return None
+        self.usage_at = time.time()
+        try:
+            r = await self.client.get(CODEX_USAGE_URL, headers=self._auth(self.rec["access_token"])
+                                      | {"accept": "application/json"})
+            data = r.json() if r.status_code == 200 else None
+        except (httpx.HTTPError, ValueError) as exc:
+            self.usage_error = f"usage query failed ({type(exc).__name__})"
+            return None
+        quotas = usage_quotas(data) if isinstance(data, dict) else {}
+        self.usage_error = None if quotas else (f"usage query answered {r.status_code}" if r.status_code != 200
+                                                else "usage answer without windows")
+        return quotas or None
+
     def login_status(self) -> dict:
         state = "down" if self.down else "unavailable" if self._remaining() <= 0 else "ok"
         return {"state": state, "reason": self.down or (self._unavailable() if state == "unavailable" else None),
                 "unsaved": self.unsaved, "last_error": self.last_error,
                 "access_token_min": round(self._remaining() / 60) if self.rec else None,
-                "refreshes": self.refreshes, "last_answer": self.last_answer}
+                "refreshes": self.refreshes, "last_answer": self.last_answer, "usage_error": self.usage_error}
 
 
 def image_url(endpoint: str) -> httpx.URL:
@@ -530,6 +560,38 @@ def jwt_exp(token: str) -> int | None:
         return None
     exp = claims.get("exp") if isinstance(claims, dict) else None
     return int(exp) if number(exp) and exp > 0 else None
+
+
+def usage_quotas(data: dict) -> dict:
+    """/wham/usage (Codex's RateLimitStatusPayload) in quota_snapshots' shape: the plan's
+    own limit as `codex`, each additional limit under its metered feature or name."""
+    def window(w):
+        if not isinstance(w, dict) or not number(w.get("used_percent")):
+            return None
+        seconds, reset = w.get("limit_window_seconds"), w.get("reset_at")
+        return {"used_percent": float(w["used_percent"]),
+                "window_minutes": int(seconds) // 60 if number(seconds) and seconds > 0 else None,
+                "resets_at": int(reset) if number(reset) and reset > 0 else None}
+
+    def figures(limit):
+        if not isinstance(limit, dict):
+            return None
+        out = {"primary": window(limit.get("primary_window")), "secondary": window(limit.get("secondary_window"))}
+        return out if out["primary"] or out["secondary"] else None
+
+    plan = data.get("plan_type")
+    plan = {"plan": plan[:32]} if isinstance(plan, str) and plan.strip() else {}
+    quotas = {}
+    if found := figures(data.get("rate_limit")):
+        quotas["codex"] = found | plan
+    for extra in data.get("additional_rate_limits") or []:
+        if not isinstance(extra, dict):
+            continue
+        name = next((v for v in (extra.get("metered_feature"), extra.get("limit_name")) if isinstance(v, str)), "")
+        name = name.strip().lower().replace("-", "_")
+        if re.fullmatch(r"[a-z0-9_]{1,48}", name) and (found := figures(extra.get("rate_limit"))):
+            quotas[name] = found | plan
+    return quotas
 
 
 QUOTA_RE = re.compile(r"x-([a-z0-9-]{1,48})-primary-used-percent")

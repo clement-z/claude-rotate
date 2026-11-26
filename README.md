@@ -599,13 +599,16 @@ generation takes about 8 s. Answers are relayed as they come; an HTML error page
 from the backend becomes a short JSON error, since Codex shows the model the body.
 The audit record carries `route: "codex-images"`, the duration and the bytes.
 
-**Quota.** OpenAI's answers carry the plan's quota in Codex's headers
-(`x-codex-primary-used-percent` and the like, `x-codex-active-limit` naming the
-limit). The proxy keeps the last figures it saw per limit, on both routes:
-`/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`
-show them, and the panel warns at 90 %. Images have their own limit
-(`imagegen_premium`, a 24-hour window); model use is `codex`. Figures appear once an
-answer carried them.
+**Quota.** The proxy keeps the plan's latest figures per limit and shows them in
+`/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`;
+the panel warns at 90 %. They come from two places. Image answers carry Codex's quota
+headers (`x-codex-active-limit: imagegen_premium`, a 24-hour window). Model use
+(`codex`, a 5-hour and a weekly window) is not in the Sign in with ChatGPT route's
+answers, so with an images login installed the proxy reads it every 5 minutes from
+`GET https://chatgpt.com/backend-api/wham/usage`, where Codex reads it: a read with
+the Codex login, no model call. These are the account's figures; whether requests on
+the Sign in with ChatGPT route count against the same `codex` limit is not
+documented, so watch the weekly figure move with Codex traffic before relying on it.
 
 ## Configuration (`config.json`)
 

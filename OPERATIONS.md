@@ -227,8 +227,9 @@ sudo claude-rotate-admin install-credential openai --images --file auth.json; rm
 The login's access token lasts 10 days; the proxy refreshes it 10 minutes before
 expiry, writing the new tokens first, as for the provider's own credential. `status`
 prints an `images:` line under the provider (state, minutes left, the backend's
-last answer) and one `quota` line per limit the answers carried, image quota
-(`imagegen_premium`) and model quota (`codex`) included. A refused refresh takes
+last answer, a failing usage query) and one `quota` line per limit and window: image
+quota (`imagegen_premium`) from the image answers, model quota (`codex`, 5 hours and
+weekly) read every 5 minutes from the ChatGPT backend with the same login. A refused refresh takes
 image generation down with a reason naming `codex login`; the provider's other
 requests go on. Make a new login and install it the same way. Image requests get
 503 while the login is missing or down, 429 when 2 run and 8 wait.

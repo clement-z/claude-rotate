@@ -147,8 +147,9 @@ credential. What that changes:
   without the token-sharing limits, reaches Codex cloud tasks and the account's
   connectors. The proxy keeps only its access and refresh tokens and the account id
   (not the id token, not an API key `codex login` may have stored), mode 0600 under
-  the service user, and sends it only to the two image URLs, which are fixed in the
-  code. Devices reach those two routes and nothing else with it. Deleting the file
+  the service user, and sends it only to the two image URLs and, every 5 minutes, a
+  read of the plan's usage (`/wham/usage`), all fixed in the code. Devices reach the
+  two image routes and nothing else with it. Deleting the file
   does not end the login: revoke it in ChatGPT's settings or with `codex logout` on
   a copy.
 - Codex turns its image tool on for a provider of its own when the provider sends

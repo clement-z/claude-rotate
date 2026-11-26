@@ -597,8 +597,9 @@ async def main():
     status = r.json()["providers"] if r.status_code == 200 else {}
     im = status.get("openai", {}).get("images") or {}
     check("the provider's status carries an images object: state, reason, unsaved, last_error, "
-          "access_token_min, refreshes, last_answer (the 401 just relayed)",
-          set(im) == {"state", "reason", "unsaved", "last_error", "access_token_min", "refreshes", "last_answer"}
+          "access_token_min, refreshes, last_answer (the 401 just relayed), usage_error",
+          set(im) == {"state", "reason", "unsaved", "last_error", "access_token_min", "refreshes", "last_answer",
+                      "usage_error"}
           and im["state"] == "ok" and im["reason"] is None and im["last_error"] == login.last_error
           and abs(im["access_token_min"] - 8 * 1440) <= 1 and im["refreshes"] == 4
           and im["last_answer"].get("status") == 401 and abs(im["last_answer"].get("at", 0) - time.time()) < 60)
@@ -795,6 +796,60 @@ async def main():
     alerts = [a["text"] for a in r.json()["alerts"] if "quota" in a["text"]]
     check("/rotate/stats alerts on the quota at 90 % or more, and only on it",
           len(alerts) == 1 and alerts[0].startswith("provider openai: quota imagegen_premium at 95%, resets in 2.0 h"))
+
+    # 6. The plan's usage windows, read from /wham/usage with the Codex login.
+    now = int(time.time())
+    wham = {"plan_type": "prolite", "rate_limit": {
+        "allowed": True, "limit_reached": False,
+        "primary_window": {"used_percent": 12, "limit_window_seconds": 18000, "reset_after_seconds": 600,
+                           "reset_at": now + 600},
+        "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800, "reset_after_seconds": 86400,
+                             "reset_at": now + 86400}},
+        "additional_rate_limits": [{"limit_name": "Images", "metered_feature": "imagegen_premium", "rate_limit": {
+            "primary_window": {"used_percent": 3, "limit_window_seconds": 86400, "reset_after_seconds": 99,
+                               "reset_at": now + 99}}}]}
+    usage_status = [200]
+
+    def usage_answer(request):
+        if request.url.path == "/backend-api/wham/usage":
+            return httpx.Response(usage_status[0], json=wham if usage_status[0] == 200 else {"error": "x"})
+        return image_ok(request)
+
+    login = OAI.images
+    backend.answer, login.usage_at, n = usage_answer, 0.0, len(backend.calls)
+    await OAI.maintain()
+    polls = [req for req in backend.calls[n:] if req.url.path == "/backend-api/wham/usage"]
+    check("maintain() reads the plan's usage: one GET https://chatgpt.com/backend-api/wham/usage with the "
+          "Codex login's bearer and account id",
+          len(polls) == 1 and polls[0].method == "GET" and str(polls[0].url) == P.CODEX_USAGE_URL
+          and polls[0].headers.get("authorization") == f"Bearer {login.rec['access_token']}"
+          and polls[0].headers.get("chatgpt-account-id") == login.rec["account_id"]
+          and not leaks(polls[0], SECRETS - CODEX_SECRETS))
+    q = OAI.status()["quotas"]
+    check("its 5-hour and weekly windows become quota codex, route usage, with the plan",
+          q.get("codex", {}).get("primary") == {"used_percent": 12.0, "window_minutes": 300, "resets_at": now + 600}
+          and q["codex"].get("secondary") == {"used_percent": 34.0, "window_minutes": 10080, "resets_at": now + 86400}
+          and q["codex"].get("route") == "usage" and q["codex"].get("plan") == "prolite")
+    check("an additional limit lands under its metered feature",
+          q.get("imagegen_premium", {}).get("primary") == {"used_percent": 3.0, "window_minutes": 1440,
+                                                            "resets_at": now + 99}
+          and q["imagegen_premium"].get("route") == "usage" and login.usage_error is None)
+    await OAI.maintain()
+    check("the usage is not read again within 5 minutes",
+          len([req for req in backend.calls[n:] if req.url.path == "/backend-api/wham/usage"]) == 1)
+    usage_status[0], login.usage_at = 503, 0.0
+    await OAI.maintain()
+    r = await C.get("/rotate/status", headers={"authorization": f"Bearer {DESK}"})
+    status_text = status_text + r.text
+    check("a failed usage query keeps the last figures and says why in the images status",
+          OAI.status()["quotas"]["codex"]["primary"]["used_percent"] == 12.0
+          and r.json()["providers"]["openai"]["images"]["usage_error"] == "usage query answered 503"
+          and OAI.images.down is None)
+    n = len(backend.calls)
+    DRAW.images.usage_at = 0.0
+    await DRAW.maintain()
+    check("a provider whose images login is missing reads no usage", len(backend.calls) == n)
+    backend.answer = image_ok
 
     audit_text = R.AUDIT_PATH.read_text()
     check("no token or device key appears in /rotate/status, /rotate/stats or the audit log",
