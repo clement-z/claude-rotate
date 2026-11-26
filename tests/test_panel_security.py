@@ -44,10 +44,10 @@ elements.confirm={showModal(){this.open=true},close(){this.open=false}};
     assert(elements[id].innerHTML.includes('&lt;mark'),id+' lost escaped text');
   }
   const oai=elements.oai.innerHTML;
-  assert.equal(oai.split('OpenAI quota').length-1,2,'one quota card per openai-siwc provider, none for static-bearer');
+  assert.equal(oai.split('ChatGPT plan').length-1,2,'one quota card per openai-siwc provider, none for static-bearer');
   assert(!oai.includes(value+'-static')&&!oai.includes('&lt;mark data-audit=&quot;marker&quot;&gt;&amp;&#39;&quot;&lt;/mark&gt;-static'),'static-bearer provider got a quota card');
   assert(oai.includes('images ')&&oai.includes('title="&lt;mark'),'images badge or its escaped title missing');
-  assert(oai.includes('images 7d')&&oai.includes('no quota figures yet'),'quota rows or the empty card missing');
+  assert(oai.includes('>7d<')&&oai.includes('images · ')&&oai.includes('model · read only with an images login'),'quota rows or the empty card missing');
   assert(elements.pills.innerHTML.includes('>Rotate<')&&!elements.pills.innerHTML.includes('disabled'),'rotate button missing');
   assert(elements.accounts.innerHTML.includes('Resume auto')&&elements.accounts.innerHTML.includes('>Select<'),'account buttons missing');
   elements.accounts.onclick({target:{closest:()=>({dataset:{sw:value+'2'}})}});

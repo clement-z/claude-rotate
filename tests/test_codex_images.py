@@ -851,6 +851,25 @@ async def main():
     check("a provider whose images login is missing reads no usage", len(backend.calls) == n)
     backend.answer = image_ok
 
+    # 7. The figures survive a restart.
+    R.save_quotas()
+    saved = json.loads(R.QUOTAS_PATH.read_text())
+    check("save_quotas() writes the providers' figures next to the state file",
+          set(saved) == {"openai"} and saved["openai"]["codex"]["primary"]["used_percent"] == 12.0
+          and "imagegen_premium" in saved["openai"])
+    before, mtime = dict(OAI.quotas), R.QUOTAS_PATH.stat().st_mtime_ns
+    R.save_quotas()
+    check("and does not write again while nothing changed", R.QUOTAS_PATH.stat().st_mtime_ns == mtime)
+    OAI.quotas = {}
+    R.load_quotas()
+    check("load_quotas() at startup gives a provider its last figures back", OAI.quotas == before)
+    R.QUOTAS_PATH.write_text("{not json")
+    OAI.quotas = {}
+    R.load_quotas()
+    check("an unreadable file is ignored", OAI.quotas == {})
+    OAI.quotas = before
+    R.save_quotas()
+
     audit_text = R.AUDIT_PATH.read_text()
     check("no token or device key appears in /rotate/status, /rotate/stats or the audit log",
           not any(s in status_text or s in r.text or s in audit_text for s in SECRETS))

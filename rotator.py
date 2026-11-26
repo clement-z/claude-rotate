@@ -569,9 +569,50 @@ async def refresh_loop() -> None:
             await refresh_idle_accounts()
         record_history(time.time())
         save_rollup()
+        save_quotas()
         await asyncio.sleep(60)
 
 
+QUOTAS_PATH = STATE_PATH.with_name("provider_quotas.json")
+QUOTAS_SAVED = {"text": None}
+
+
+def load_quotas() -> None:
+    """The OpenAI quota figures last seen before a restart: image figures come only with
+    image answers, so without this a restart would clear them until the next image."""
+    try:
+        saved = json.loads(QUOTAS_PATH.read_text())
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        print(f"warning: ignoring {QUOTAS_PATH} ({type(exc).__name__})", file=sys.stderr)
+        return
+    for name, prov in PROVIDERS.items():
+        figures = saved.get(name) if isinstance(saved, dict) else None
+        if hasattr(prov, "quotas") and isinstance(figures, dict):
+            prov.quotas.update({k: v for k, v in figures.items() if isinstance(k, str) and isinstance(v, dict)})
+    QUOTAS_SAVED["text"] = json.dumps(quota_figures())
+
+
+def quota_figures() -> dict:
+    return {name: p.quotas for name, p in PROVIDERS.items() if getattr(p, "quotas", None)}
+
+
+def save_quotas() -> None:
+    """Write the figures when they changed (at most once a minute, from the refresh loop)."""
+    text = json.dumps(quota_figures())
+    if text == QUOTAS_SAVED["text"]:
+        return
+    tmp = QUOTAS_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(text)
+        tmp.replace(QUOTAS_PATH)
+        QUOTAS_SAVED["text"] = text
+    except OSError as exc:
+        storage_error("quotas_write", exc)
+
+
+load_quotas()
 HISTORY_PATH = STATE_PATH.with_name("usage_history.json")
 HISTORY_DAYS, SAMPLE_S, PROJECT_DAYS = 14, 1800, 7.5
 
@@ -1460,17 +1501,22 @@ function meter(label,u,thr,reset){
   return `<div class="meter-row"><span class="muted">${label}</span><div class="meter"><i style="width:${Math.min(100,u*100)}%;background:${sev[0]}"></i><span class="tick" style="left:${thr*100}%"></span></div>`
     +`<span><b>${Math.round(u*100)}%</b> <span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
 function wlabel(m){return m==null?'':m%10080===0?(m/10080===1?'7d':m/10080+'w'):m%1440===0?(m/1440===1?'24h':m/1440+'d'):m%60===0?m/60+'h':m+'min'}
-function quotas(name,p){const now=Date.now()/1000, q=Object.entries(p.quotas||{}), im=p.images;
-  const what=id=>id==='codex'?'model':/^image/.test(id)?'images':id;
-  const plan=(q.find(([,f])=>f.plan)||[,{}])[1].plan;
-  const rows=q.flatMap(([id,f])=>['primary','secondary'].filter(k=>f[k]).map(k=>{const w=f[k];
-    return meter(esc(what(id)+' '+wlabel(w.window_minutes)),(w.used_percent||0)/100,0.9,
-      esc((w.resets_at?'resets in '+dur(Math.max(0,w.resets_at-now))+' · ':'')+'seen '+ago(Math.round((now-f.seen_at)/60))))})).join('');
-  const st=s=>['down','unavailable'].includes(s)?'crit':s==='ok'?'good':'warn';
-  return `<div class="card"><div class="acct-head"><b>${esc(name)}</b><span class="badge">OpenAI quota</span>`
-    +(plan?`<span class="badge">plan ${esc(plan)}</span>`:'')
-    +(im?`<span class="badge" title="${esc(im.reason||im.unsaved||im.last_error||'')}"><span class="dot" style="background:var(--${st(im.unsaved&&im.state==='ok'?'warn':im.state)})"></span>images ${esc(im.state)}</span>`:'')+'</div>'
-    +(rows||'<div class="muted small">no quota figures yet: OpenAI sends them with its answers</div>')+'</div>'}
+function quotas(name,p){const now=Date.now()/1000, q=p.quotas||{}, im=p.images;
+  const plan=(Object.values(q).find(f=>f&&f.plan)||{}).plan;
+  const wins=f=>['primary','secondary'].map(k=>f&&f[k]).filter(Boolean).sort((a,b)=>(a.window_minutes||0)-(b.window_minutes||0));
+  // A window that has reset since the figure counts as 0, as for the Claude accounts.
+  const row=(what,f,w)=>{const past=w.resets_at&&w.resets_at<=now;
+    return meter(esc(wlabel(w.window_minutes)||'–'),past?0:(w.used_percent||0)/100,0.9,
+      esc([what,past?'window reset since':w.resets_at?'resets in '+dur(w.resets_at-now):'','seen '+ago(Math.round((now-(f.seen_at||now))/60))].filter(Boolean).join(' · ')))};
+  const empty=(label,text)=>`<div class="meter-row"><span class="muted">${esc(label)}</span><div class="meter"></div><span class="muted small">${esc(text)}</span></div>`;
+  const ids=Object.keys(q), images=ids.filter(id=>/^image/.test(id));
+  let rows=q.codex?wins(q.codex).map(w=>row('model',q.codex,w)).join(''):empty('–',im?'model · no figure yet: read every 5 min':'model · read only with an images login');
+  if(im)rows+=images.length?images.map(id=>wins(q[id]).map(w=>row('images',q[id],w)).join('')).join(''):empty('24h','images · no figure yet: comes with the next image');
+  rows+=ids.filter(id=>id!=='codex'&&!images.includes(id)).map(id=>wins(q[id]).map(w=>row(id,q[id],w)).join('')).join('');
+  const dot=im?(['down','unavailable'].includes(im.state)?'crit':im.unsaved||im.usage_error||im.last_error?'warn':'good'):'';
+  return `<div class="card"><div class="acct-head"><b>${esc(name)}</b><span class="badge">ChatGPT plan${plan?' '+esc(plan):''}</span>`
+    +(im?`<span class="badge" title="${esc(im.reason||im.unsaved||im.last_error||im.usage_error||'')}"><span class="dot" style="background:var(--${dot})"></span>images ${esc(im.state)}</span>`:'')
+    +`<span class="acct-side"><span class="muted small">upstream: ${esc(p.state)}</span></span></div>`+rows+'</div>'}
 function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
   return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
 function billing(b){
