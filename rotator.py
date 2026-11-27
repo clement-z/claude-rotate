@@ -37,6 +37,7 @@ import asyncio
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -431,6 +432,8 @@ def save_state() -> None:
 
 
 def audit(rec: dict) -> None:
+    if isinstance(model := rec.get("model"), str):
+        rec["model"] = utf8_text(model)
     try:
         _write_audit(rec)
     except (OSError, ValueError) as exc:
@@ -734,11 +737,9 @@ def claim_field(field: str, value: str) -> float | str | None:
 def parse_claims(headers: httpx.Headers, existing: dict) -> dict:
     claims = {}
     learned_count = 0
-    for name, value in sorted(headers.items()):
-        match = CLAIM_HEADER.fullmatch(name.lower())
-        if not match:
-            continue
-        claim, field = match.groups()
+    fields = [(*match.groups(), value) for name, value in headers.items()
+              if (match := CLAIM_HEADER.fullmatch(name.lower()))]
+    for claim, field, value in sorted(fields):
         if claim == "overage" or claim.startswith(("overage-", "overage_")):
             continue
         if claim in KNOWN_CLAIMS or claim in existing:
@@ -758,14 +759,26 @@ RATELIMIT_HEADERS_PATH = STATE_PATH.with_name("ratelimit_headers.json")
 LATEST_RATELIMITS: dict = {}
 RATELIMIT_HEADERS_DIRTY = False
 MAX_RATELIMIT_MODELS = 16
+RATELIMIT_HEADERS_MAX_BYTES = 8 * 1024 * 1024
+
+
+def utf8_text(value: str, limit: int | None = None) -> str:
+    value = value[:limit]
+    return value if value.isascii() else value.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def snapshot_headers(headers: dict) -> dict:
+    return {utf8_text(key, 100): utf8_text(value, 200)
+            for key, value in list(headers.items())[:40] if isinstance(value, str)}
 
 
 def remember_ratelimits(account: str, model, path: str, status: int, headers: dict, now: float) -> None:
     global RATELIMIT_HEADERS_DIRTY
     models = LATEST_RATELIMITS.setdefault(account, {})
-    key = model[:256] if isinstance(model, str) else ""
+    key = utf8_text(model, 256) if isinstance(model, str) else ""
     models.pop(key, None)
-    models[key] = {"time": now, "status": status, "path": path[:1024], "headers": headers}
+    models[key] = {"time": now, "status": status, "path": utf8_text(path, 1024),
+                   "headers": snapshot_headers(headers)}
     while len(models) > MAX_RATELIMIT_MODELS:
         del models[next(iter(models))]
     RATELIMIT_HEADERS_DIRTY = True
@@ -774,7 +787,14 @@ def remember_ratelimits(account: str, model, path: str, status: int, headers: di
 def load_ratelimit_headers() -> None:
     global RATELIMIT_HEADERS_DIRTY
     try:
-        saved = json.loads(RATELIMIT_HEADERS_PATH.read_text())
+        with os.fdopen(os.open(RATELIMIT_HEADERS_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > RATELIMIT_HEADERS_MAX_BYTES:
+                raise ValueError("invalid rate-limit snapshot file type or size")
+            data = f.read(RATELIMIT_HEADERS_MAX_BYTES + 1)
+        if len(data) > RATELIMIT_HEADERS_MAX_BYTES:
+            raise ValueError("rate-limit snapshot too large")
+        saved = json.loads(data)
         if not isinstance(saved, dict):
             raise ValueError("expected an account mapping")
     except FileNotFoundError:
@@ -791,9 +811,9 @@ def load_ratelimit_headers() -> None:
                     or type(row.get("status")) is not int or not 100 <= row["status"] <= 599
                     or not isinstance(row.get("path"), str) or not isinstance(row.get("headers"), dict)):
                 continue
-            headers = {key[:100]: value[:200] for key, value in list(row["headers"].items())[:40]
-                       if isinstance(value, str)}
-            valid[model[:256]] = dict(time=row["time"], status=row["status"], path=row["path"][:1024], headers=headers)
+            valid[utf8_text(model, 256)] = dict(time=row["time"], status=row["status"],
+                                                path=utf8_text(row["path"], 1024),
+                                                headers=snapshot_headers(row["headers"]))
         if valid:
             LATEST_RATELIMITS[name] = dict(sorted(valid.items(), key=lambda pair: pair[1]["time"])[-MAX_RATELIMIT_MODELS:])
     RATELIMIT_HEADERS_DIRTY = saved != LATEST_RATELIMITS

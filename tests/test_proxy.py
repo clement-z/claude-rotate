@@ -7,6 +7,7 @@ auth, header rewriting, SSE relay, quota-429 rotate+retry, burst-429 pacing,
 import asyncio
 import gzip
 import json
+import os
 import sys
 import tempfile
 import time
@@ -293,6 +294,17 @@ check("claim-set changes log once despite header reordering at the cap, and util
       "ratelimit" in changed and "ratelimit" not in stable and changed["util"] == stable["util"]
       and stable["util"]["7d"] == 0 and len(stable["util"]) == 1 + R.MAX_LEARNED_CLAIMS
       and not ({"invalid", "negative"} & stable["util"].keys()))
+
+fresh_state()
+prefix_claims = {f"anthropic-ratelimit-unified-{name}-utilization": "0.3"
+                 for name in [*(f"a{i:02}" for i in range(28)), "x", "x-a"]}
+use_upstream(lambda req: httpx.Response(200, json={}, headers=unified(u5=None, **prefix_claims)))
+call()
+call()
+first, second = audit_recs()
+check("the cap selects by ID even when one claim ID prefixes another",
+      "x" in first["util"] and "x-a" not in first["util"] and first["util"] == second["util"]
+      and "ratelimit" in first and "ratelimit" not in second)
 
 fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 long_error = {"type": "rate_limit_error", "message": "m" * 350, "extra": "ignored-error-marker"}
@@ -862,6 +874,43 @@ with patch.object(R, "RATELIMIT_HEADERS_PATH", snapshot_path), patch.object(R, "
 panel_status = call("/rotate/status", method="GET").json()
 check("status advertises the table without embedding its records",
       panel_status["ratelimits_available"] is True and "latest_ratelimits" not in json.dumps(panel_status))
+
+fresh_state()
+surrogate = chr(0xD800)
+with patch.object(R, "RATELIMIT_HEADERS_PATH", snapshot_path), patch.dict(R.CFG, {"configured_accounts": {"a", "b"}}):
+    call(body={"model": "claude-" + surrogate})
+    live = call("/rotate/ratelimits", method="GET")
+    assert live.status_code == 200 and "claude-?" in live.json()["latest_ratelimits"]["a"]
+    assert call("/rotate/stats", method="GET").status_code == 200
+    R.save_ratelimit_headers()
+    records = json.loads(snapshot_path.read_text())
+    records["a"][surrogate] = {"time": time.time(), "status": 200, "path": "/" + surrogate,
+                               "headers": {"unified-" + surrogate: surrogate}}
+    snapshot_path.write_text(json.dumps(records))
+    R.LATEST_RATELIMITS.clear()
+    R.load_ratelimit_headers()
+    after_restart = call("/rotate/ratelimits", method="GET")
+    models = after_restart.json()["latest_ratelimits"]["a"]
+    check("snapshot strings encode immediately and after loading old escaped surrogates",
+          after_restart.status_code == 200 and "claude-?" in models
+          and models["?"]["path"] == "/?" and models["?"]["headers"] == {"unified-?": "?"})
+
+    rejected_snapshot = tmp / "invalid-ratelimit_headers.json"
+    R.LATEST_RATELIMITS.clear()
+    before_errors = R.STORAGE_ERRORS.get("ratelimit_headers_load", {}).get("count", 0)
+    with patch.object(R, "RATELIMIT_HEADERS_PATH", rejected_snapshot):
+        with rejected_snapshot.open("wb") as f:
+            f.write(b" " * R.RATELIMIT_HEADERS_MAX_BYTES)
+            f.write(snapshot_path.read_bytes())
+        R.load_ratelimit_headers()
+        rejected_snapshot.unlink()
+        os.mkfifo(rejected_snapshot)
+        R.load_ratelimit_headers()
+        rejected_snapshot.unlink()
+        rejected_snapshot.symlink_to(snapshot_path)
+        R.load_ratelimit_headers()
+    check("an oversized, FIFO or symlink snapshot leaves the gateway table empty",
+          not R.LATEST_RATELIMITS and R.STORAGE_ERRORS["ratelimit_headers_load"]["count"] == before_errors + 3)
 
 # --- 10. panel_tailnet: Tailscale Serve identity opens the panel, not the proxy
 ts = {"tailscale-user-login": "alice@example.com"}

@@ -570,6 +570,22 @@ def test_ratelimits_live_offline_and_rotated(f):
         audit.unlink()
         empty = f.run("ratelimits")
         assert empty.returncode == 0 and "No 429s found" in empty.stdout and "(ratelimit_headers.json)" in empty.stdout
+
+        def assert_unreadable():
+            result = f.run("ratelimits", "--json")
+            assert result.returncode == 0, result
+            report = json.loads(result.stdout)
+            assert report["source"] == "unavailable" and "unreadable" in report["detail"]
+            assert not report["latest_ratelimits"]
+
+        with snapshot.open("wb") as stream:
+            stream.write(b" " * (8 * 1024 * 1024))
+            stream.write(json.dumps(table).encode())
+        assert_unreadable()
+        snapshot.unlink()
+        os.mkfifo(snapshot)
+        assert_unreadable()
+        snapshot.unlink()
     finally:
         server.shutdown()
         server.server_close()

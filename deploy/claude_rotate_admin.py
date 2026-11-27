@@ -48,6 +48,7 @@ TOKENS = ETC / "tokens"
 STATE_DIR = P("/var/lib/claude-rotate")
 STATE = STATE_DIR / "state.json"
 RATELIMIT_HEADERS = STATE_DIR / "ratelimit_headers.json"
+RATELIMIT_HEADERS_MAX_BYTES = 8 * 1024 * 1024
 AUDIT_PATH = P("/var/log/claude-rotate/audit.jsonl")
 AUDIT_TAIL_BYTES = 32 * 1024 * 1024
 AUDIT_TAIL_BACKUPS = 32
@@ -1721,13 +1722,19 @@ def latest_ratelimits(cfg):
                 return live["latest_ratelimits"], "live", None
             detail = detail or "the live rate-limit table is invalid"
     try:
-        refuse_symlink(RATELIMIT_HEADERS, "rate-limit snapshot")
-        saved = json.loads(RATELIMIT_HEADERS.read_text())
+        with os.fdopen(os.open(RATELIMIT_HEADERS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > RATELIMIT_HEADERS_MAX_BYTES:
+                raise ValueError("invalid rate-limit snapshot file type or size")
+            data = f.read(RATELIMIT_HEADERS_MAX_BYTES + 1)
+        if len(data) > RATELIMIT_HEADERS_MAX_BYTES:
+            raise ValueError("rate-limit snapshot too large")
+        saved = json.loads(data)
         if not isinstance(saved, dict):
             raise ValueError("expected an account mapping")
     except FileNotFoundError:
         return {}, "unavailable", detail or "no rate-limit snapshot saved yet"
-    except (OSError, ValueError, RecursionError, Refused) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         return {}, "unavailable", f"{RATELIMIT_HEADERS.name} is unreadable ({type(exc).__name__})"
     age = "offline snapshot, normally up to a minute old"
     return saved, RATELIMIT_HEADERS.name, f"{age}; {detail}" if detail else age
