@@ -1805,6 +1805,8 @@ def print_quota_rates(report):
             out(f"  Latest: {latest['used_percent']:g}% used at {fmt_time(latest['at'])}")
         if count := row["completion_time_readings"]:
             out(f"  {count} older audit readings use request completion time")
+        if count := row["legacy_history_samples"]:
+            out(f"  {count} older weekly samples lack upstream timestamps")
         if row["traffic_note"]:
             out(f"  {row['traffic_note']}")
         elif not row["traffic_attributed"]:

@@ -9,6 +9,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import chain
 from math import fsum
 from statistics import median, quantiles
 
@@ -189,32 +190,50 @@ def collect_audit(records, accounts, providers, start, now, prices):
 
 def add_claude_history(readings, history, accounts, start, now):
     samples = defaultdict(list)
+    legacy_counts = defaultdict(int)
+    seen_samples = set()
     for sample in history:
         sample = mapping(sample)
         at = number(sample.get("ts"))
         if not in_range(at, start, now):
             continue
+        legacy = "seen_at" not in sample
+        seen_at = mapping(sample.get("seen_at"))
         for name, point in mapping(sample.get("accounts")).items():
             if name not in accounts or not isinstance(point, list) or len(point) != 2:
                 continue
             used, reset = number(point[0]), reset_time(point[1])
             if used is None or (reset is not None and reset <= at):
                 continue
-            samples[name].append(Reading(at, round(100 * used, 10), reset, sampled=True))
+            observed = at if legacy else number(seen_at.get(name))
+            if not in_range(observed, start, min(now, at + .5)):
+                continue
+            reading = Reading(observed, round(100 * used, 10), reset, sampled=True)
+            if legacy:
+                legacy_counts[name] += 1
+            else:
+                key = (name, reading)
+                if key in seen_samples:
+                    continue
+                seen_samples.add(key)
+            samples[name].append((reading, legacy))
     for name in accounts:
         series = readings[("claude", name, "7d", None)]
         if name not in samples:
             continue
         # Rounding can move a sample ahead of the header it copied.
-        sample_keys = {(p.at, p.percent) for p in samples[name]}
+        sample_keys = {(p.at, p.percent, legacy) for p, legacy in samples[name]}
         rounded_headers = defaultdict(list)
         for i, point in enumerate(series):
             rounded = round(point.at)
-            key = (rounded, point.percent)
+            key = (rounded, point.percent, True)
             if not point.completion_time and rounded < point.at and key in sample_keys:
                 rounded_headers[key].append(i)
-        for sample in samples[name]:
-            candidates = rounded_headers.get((sample.at, sample.percent), ())
+            key = (point.at, point.percent, False)
+            if key in sample_keys:
+                rounded_headers[key].append(i)
+        for sample, legacy in samples[name]:
+            candidates = rounded_headers.get((sample.at, sample.percent, legacy), ())
             match = max((i for i in candidates if not changed_reset(series[i].reset, sample.reset)),
                         key=lambda i: series[i].at, default=None)
             if match is None:
@@ -222,6 +241,7 @@ def add_claude_history(readings, history, accounts, start, now):
             else:
                 point = series[match]
                 series[match] = replace(point, reset=point.reset or sample.reset, sampled=True)
+    return legacy_counts
 
 
 def add_provider_history(readings, history, providers, start, now):
@@ -302,17 +322,20 @@ def measurement_intervals(accepted, min_step, covered_from):
 
 def recent_quota_pace(accepted, now):
     """Points per day over time observed inside segments."""
-    previous = None
+    first = last = None
     rise = elapsed = 0
-    for point, restart in accepted:
+    for point, restart in chain(accepted, ((None, True),)):
         if restart:
-            previous = None
+            if first is not None and last.at - first.at >= 60:
+                rise += last.percent - first.percent
+                elapsed += last.at - first.at
+            first = last = None
+        if point is None:
+            break
         if point.at < now - DAY or (point.reset is not None and point.reset <= point.at):
             continue
-        if previous is not None:
-            rise += point.percent - previous.percent
-            elapsed += point.at - previous.at
-        previous = point
+        first = first or point
+        last = point
     return rise * DAY / elapsed if elapsed else None
 
 
@@ -330,7 +353,7 @@ def fit_fable(rows):
         report.update(a=a, b=b)
         shares = [f / (f + o) for f, o, _ in rows if f + o > 0]
         minimum = max(1e-6 * max(a, b), 1 / MAX_FIT_DOLLARS_PER_POINT)
-        if min(a, b) >= minimum and max(shares) - min(shares) >= MIN_FABLE_SHARE_SPREAD:
+        if min(a, b) >= minimum and max(shares) - min(shares) + 1e-12 >= MIN_FABLE_SHARE_SPREAD:
             report.update(fable_usd_per_percent=1 / a, other_usd_per_percent=1 / b)
     return report
 
@@ -393,7 +416,7 @@ def series_report(points, requests, min_step, covered_from, now, *, general_week
 
 def analyse(records, history, provider_history, accounts, providers, start, now, min_step, prices, stop=None):
     readings, traffic, reporters, earliest = collect_audit(records, accounts, providers, start, now, prices)
-    add_claude_history(readings, history, accounts, start, now)
+    legacy_counts = add_claude_history(readings, history, accounts, start, now)
     add_provider_history(readings, provider_history, providers, start, now)
     for name in providers:
         if not any(kind == "openai" and owner == name for kind, owner, _, _ in readings):
@@ -417,8 +440,9 @@ def analyse(records, history, provider_history, accounts, providers, start, now,
             requests = None
             if limit == "imagegen_premium":
                 note = "Image cost and tokens are unavailable because the audit records bytes only"
-        report = series_report(points, requests, min_step, earliest, now,
-                               general_week=kind == "claude" and limit == "7d")
+        general_week = kind == "claude" and limit == "7d"
+        report = series_report(points, requests, min_step, earliest, now, general_week=general_week)
+        report["legacy_history_samples"] = legacy_counts.get(name, 0) if general_week else 0
         reports.append({"kind": kind, "name": name, "limit": limit, "minutes": minutes, "traffic_note": note, **report})
     return reports, earliest
 
@@ -445,11 +469,16 @@ def audit_tail(stream, end, size):
         yield pending
 
 
-def audit_log_lines(audit_path, scan, stop=None):
+def audit_log_lines(audit_path, scan, stop=None, *, errors=None):
     scan.update(limited=False, skipped_lines=0)
     try:
         directory = os.open(audit_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
+        return
+    except OSError:
+        if errors is None:
+            raise
+        errors.append(f"{audit_path.name} directory could not be read")
         return
     remaining = AUDIT_TAIL_BYTES
     seen_files = set()
@@ -480,6 +509,10 @@ def audit_log_lines(audit_path, scan, stop=None):
                 if not remaining:
                     scan["limited"] = True
                     break
+    except OSError:
+        if errors is None:
+            raise
+        errors.append(f"{name} could not be read")
     finally:
         os.close(directory)
 
@@ -506,8 +539,8 @@ def quota_history_file(path, default, warnings):
     return default
 
 
-def quota_audit_records(audit_path, scan, stop=None):
-    for line in audit_log_lines(audit_path, scan, stop):
+def quota_audit_records(audit_path, scan, stop=None, *, errors=None):
+    for line in audit_log_lines(audit_path, scan, stop, errors=errors):
         try:
             record = json.loads(line)
         except (ValueError, RecursionError):
@@ -542,13 +575,14 @@ def quota_rate_summary(series):
                                                     "pace_points_per_day", "stale", "exhausts_at")}
             if remaining else None,
             "samples": row["cost_intervals"],
+            "legacy_history_samples": row["legacy_history_samples"],
         })
     return summary
 
 
 def read_report(audit_path, history_path, provider_history_path, accounts, providers, prices, now,
                 *, days=14, min_step=5, stop=None):
-    scan, claude_errors, openai_errors = {}, [], []
+    scan, claude_errors, openai_errors, audit_errors = {}, [], [], []
     check_stop(stop)
     history = quota_history_file(history_path, [], claude_errors)
     check_stop(stop)
@@ -556,10 +590,11 @@ def read_report(audit_path, history_path, provider_history_path, accounts, provi
     if provider_history and provider_history.get("version") != 1:
         openai_errors.append("provider_quota_history.json has an unsupported version")
         provider_history = {}
-    series, earliest = analyse(quota_audit_records(audit_path, scan, stop), history, provider_history,
+    series, earliest = analyse(quota_audit_records(audit_path, scan, stop, errors=audit_errors), history, provider_history,
                                accounts, providers, now - days * DAY, now, min_step, prices, stop)
-    source_errors = {source: errors for source, errors in (("claude", claude_errors), ("openai", openai_errors))
+    source_errors = {source: errors for source, errors in (("claude", claude_errors), ("openai", openai_errors),
+                                                           ("audit", audit_errors))
                      if errors}
     return {"days": days, "min_step": min_step, "audit": {"from": earliest, **scan},
-            "warnings": claude_errors + openai_errors, "source_errors": source_errors,
+            "warnings": claude_errors + openai_errors + audit_errors, "source_errors": source_errors,
             "summary": quota_rate_summary(series), "series": series}

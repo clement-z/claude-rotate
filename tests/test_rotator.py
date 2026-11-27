@@ -338,8 +338,8 @@ check("valid new IDs fill the cap without masking a later existing learned block
 # 15. The chart, projection and billing ledger follow general weekly usage only.
 R.STATE["accounts"] = {
     "a": {"util_7d": 1, "reset_7d": now + 10, "claims": {
-        "7d": {"utilization": 0.69, "reset": now + 200000},
-        "7d_oi": {"utilization": 1, "reset": now + 100000}}},
+        "7d": {"utilization": 0.69, "reset": now + 200000, "seen_at": now - 900},
+        "7d_oi": {"utilization": 1, "reset": now + 100000, "seen_at": now - 60}}},
     "b": {"claims": {"7d_oi": {"utilization": 1, "reset": now + 100000}}}}
 with tempfile.TemporaryDirectory() as tmp:
     sample_time = int(now)
@@ -354,6 +354,8 @@ with tempfile.TemporaryDirectory() as tmp:
               and R.weekly_reset("a") == now + 200000 and outlook["capacity"] == 100
               and outlook["projection"][0][1:] == [69, 100]
               and abs(ledger[0] - 19) < 0.01 and ledger[1] == 0)
+        check("weekly history stores when its underlying general reading arrived",
+              R.HISTORY[-1]["seen_at"] == {"a": now - 900})
 
 # 16. Relief needs the last applicable blocker to expire on at least one account.
 fresh_state()

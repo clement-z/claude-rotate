@@ -405,8 +405,8 @@ events. The legacy `active_account` field projects the default route.
 `GET /rotate/stats` returns rollups, alerts, the longer `periods` and `billing`.
 `GET /rotate/quota-rate` returns the last computed quota-rate summary, its
 computation time in Unix seconds and the weekly Fable cost fits. It reports
-`"status":"computing"` before the first result and includes any per-source
-history errors in `source_errors`. It uses the same panel authorization and
+`"status":"computing"` before the first attempt completes and includes any
+audit or history errors in `source_errors`. It uses the same panel authorization and
 `Cache-Control: no-store`.
 Both panel writes require same-origin JSON. `POST /rotate/switch` takes
 `{"account": NAME}` or `{"auto": true}`. `POST /rotate/device-pin` takes
@@ -461,7 +461,9 @@ older records that use request completion time. A drop of more than one point,
 a smaller drop confirmed by the next reading, or a reported reset starts a new
 segment. Reset estimates within 60 seconds count as the same deadline.
 The independent 30-minute samples are used throughout the general weekly
-series, including to detect resets and update the latest reading while idle.
+series. New snapshots carry the upstream reading time, so copying a cached
+value cannot refresh it. The report flags older snapshots that lack this
+timestamp and uses their snapshot time as a fallback.
 Claude's `7d` includes all models, `7d_oi` includes Fable, and other Claude
 claims use the model families observed reporting them.
 
@@ -488,13 +490,15 @@ summary and fits using the default lookback and minimum rise. The gateway
 computes it in a worker thread shortly after startup and every ten minutes,
 using the same bounded audit scan as the command. The panel fetches on open,
 every 30 seconds until the first result, then every five minutes. A damaged
-history file is reported alongside results from the healthy source. A failed
-scan or fetch keeps the last successful result and its timestamp.
+history file is reported alongside results from the healthy source. An
+unreadable audit rotation ends the scan and the report uses the readable
+records and available history. Other failed scans or fetches keep the last
+successful result and its timestamp, when available.
 
 Time left uses quota readings from the last 24 h, including usage outside the
-gateway. It adds rises and elapsed time within segments, skipping jumps and
-unobserved gaps between segments. It needs at least two readings in one
-segment and works without priced intervals. It projects an exhaustion time
+gateway. It adds rises and elapsed time within segments, skipping jumps,
+unobserved gaps and segments shorter than one minute. It needs at least two
+readings in one eligible segment and works without priced intervals. It projects an exhaustion time
 from the last reading and compares it with the current time and the reset.
 Readings older than four hours give a stale projection. When the estimate
 extends past a known reset, the report shows when the quota resets.

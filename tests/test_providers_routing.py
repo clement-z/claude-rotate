@@ -342,6 +342,23 @@ async def quota_rate_worker(c):
     }) + "\n" for age, used in ((60, .1), (30, .2))))
     bad_history = tmp / "unreadable-provider-history.json"
     bad_history.write_text("{broken")
+    weekly_history = tmp / "quota-rate-weekly.json"
+    now = time.time()
+    weekly_history.write_text(json.dumps([
+        {"ts": round(now - age), "seen_at": {"acct": now - age},
+         "accounts": {"acct": [used, now + 360000]}}
+        for age, used in ((7200, .00), (3600, .05))
+    ]))
+    archive_opens = []
+    original_open = os.open
+
+    def open_audit(path, *args, **kwargs):
+        if path in (audit_path.name + ".1", audit_path.name + ".2"):
+            archive_opens.append(path)
+        if path == audit_path.name + ".1":
+            raise PermissionError("mock unreadable audit rotation")
+        return original_open(path, *args, **kwargs)
+
     loop = asyncio.get_running_loop()
     main_thread = threading.get_ident()
     resumed = asyncio.Event()
@@ -362,9 +379,16 @@ async def quota_rate_worker(c):
         return original(stop)
 
     with patch.multiple(R, compute_quota_rate=compute, AUDIT_PATH=audit_path, STORAGE_ERRORS={},
-                        QUOTA_HISTORY_PATH=bad_history, QUOTA_RATE_REPORT=R.QUOTA_RATE_REPORT):
+                        HISTORY_PATH=weekly_history, QUOTA_HISTORY_PATH=bad_history,
+                        QUOTA_RATE_REPORT=R.QUOTA_RATE_PENDING), patch.object(os, "open", side_effect=open_audit):
         response = await ask(c, "/rotate/quota-rate", "claude")
         check("quota-rate says computing before the first report", response.json()["status"] == "computing")
+        R.finish_quota_rate(threading.Event(), None, RuntimeError("mock first scan failure"))
+        failed = (await ask(c, "/rotate/quota-rate", "claude")).json()
+        check("an unexpected first failure replaces the computing state with an error",
+              failed["status"] == "ready" and failed["computed_at"] > 0 and "quota-rate" in failed["source_errors"])
+        R.QUOTA_RATE_REPORT = R.QUOTA_RATE_PENDING
+        R.STORAGE_ERRORS.clear()
         stop = R.start_quota_rate_worker(start_delay=0, interval=.01)
         try:
             await asyncio.wait_for(resumed.wait(), 3)
@@ -379,8 +403,12 @@ async def quota_rate_worker(c):
             check("a failed quota-rate scan records a storage error and the loop retries",
                   R.STORAGE_ERRORS.get("quota_rate", {}).get("count") == 1)
             check("a damaged OpenAI history keeps the Claude summary and adds a source error",
-                  report["source_errors"] == {"openai": [f"{bad_history.name} could not be read"]}
+                  report["source_errors"]["openai"] == [f"{bad_history.name} could not be read"]
                   and R.STORAGE_ERRORS.get("quota_rate_openai", {}).get("count") == 1)
+            check("an unreadable rotation stops the scan and keeps history pace in the first result",
+                  archive_opens == [audit_path.name + ".1"]
+                  and report["source_errors"]["audit"] == [f"{audit_path.name}.1 could not be read"]
+                  and 240 < row["time_left"]["pace_points_per_day"] < 243)
         finally:
             stop.set()
         await asyncio.wait_for(stopped.wait(), 1)

@@ -154,6 +154,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
               "time_left": {k: general["remaining"][k] for k in
                             ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day", "stale", "exhausts_at")},
               "samples": 6,
+              "legacy_history_samples": 4,
           })
 
     r = run()
@@ -170,6 +171,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and "Cost per 1%: not enough data" in r.stdout and "work / codex, 10080 min" in r.stdout)
     check("human output identifies legacy timestamps and OpenAI attribution limits",
           "older audit readings use request completion time" in r.stdout
+          and "older weekly samples lack upstream timestamps" in r.stdout
           and "Attributing Sign in with ChatGPT inference to the Codex limit is unconfirmed" in r.stdout
           and "Image cost and tokens are unavailable because the audit records bytes only" in r.stdout)
     r = run("--min-step", "nan")
@@ -305,6 +307,9 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     fit = quota_rate.fit_fable([(1, 1, 10), (1.1, 1, 10.5)])
     check("positive coefficients are insufficient when Fable's share barely changes",
           fit["a"] > 0 and fit["b"] > 0 and fit["other_usd_per_percent"] is None)
+    fit = quota_rate.fit_fable([(2, 8, 10), (3, 7, 10)])
+    check("a spread of exactly ten percentage points passes the Fable fit threshold",
+          math.isclose(fit["fable_usd_per_percent"], 1) and math.isclose(fit["other_usd_per_percent"], 1))
 
     (state / "usage_history.json").unlink()
     save_rows(audit, [
@@ -331,6 +336,28 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     remaining = rows["a", "7d"]["remaining"]
     check("a projection from a reading over four hours old is marked stale",
           remaining["stale"] and remaining["hours"] is None and "projection stale" in run().stdout)
+
+    save_rows(audit, [audit_row(-6, util={"7d": .79}), audit_row(-5, util={"7d": .80})])
+    (state / "usage_history.json").write_text(json.dumps([
+        {"ts": at(h), "accounts": {"a": [.80, new_reset]}, "seen_at": {"a": at(-5)}}
+        for h in (-4.5, -3, -2, -1, -.5)
+    ]))
+    general = rows_for()["a", "7d"]
+    check("copies of a cached weekly reading do not make its projection fresh or flatten the pace",
+          general["latest"]["at"] == at(-5) and general["remaining"]["stale"]
+          and general["remaining"]["pace_points_per_day"] == 24
+          and not general["remaining"]["lasts_until_reset"] and general["legacy_history_samples"] == 0)
+
+    accepted = [
+        (quota_rate.Reading(at(-4), 10, None), False),
+        (quota_rate.Reading(at(-4), 20, None), False),
+        (quota_rate.Reading(at(-3), 0, None), True),
+        (quota_rate.Reading(at(-3) + 30, 10, None), False),
+        (quota_rate.Reading(at(-2), 0, None), True),
+        (quota_rate.Reading(at(-1), 5, None), False),
+    ]
+    check("zero-duration and sub-minute segments do not contribute to pace",
+          quota_rate.recent_quota_pace(accepted, now) == 120)
 
     stop = Event()
     lines = quota_rate.audit_log_lines(audit, {}, stop)

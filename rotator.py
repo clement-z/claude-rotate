@@ -1217,7 +1217,8 @@ def record_history(now: float) -> None:
     snapshot = weekly_snapshot()
     if not snapshot:
         return
-    sample = {"ts": round(now), "accounts": snapshot}
+    sample = {"ts": round(now), "accounts": snapshot,
+              "seen_at": {name: claim_reading(name, "7d").get("seen_at") for name in snapshot}}
     ledger_sample(HISTORY[-1] if HISTORY else None, sample)
     HISTORY.append(sample)
     while HISTORY[0]["ts"] < now - HISTORY_DAYS * 86400:
@@ -1564,7 +1565,8 @@ def load_prices() -> dict:
 
 
 PRICES = load_prices()
-QUOTA_RATE_REPORT = b'{"status":"computing","computed_at":null,"summary":[],"fits":[],"source_errors":{}}'
+QUOTA_RATE_PENDING = b'{"status":"computing","computed_at":null,"summary":[],"fits":[],"source_errors":{}}'
+QUOTA_RATE_REPORT = QUOTA_RATE_PENDING
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
     "util_warn": 0.8,
@@ -1589,6 +1591,11 @@ def finish_quota_rate(stop, result, error):
         return
     if error is not None:
         storage_error("quota_rate", error)
+        if QUOTA_RATE_REPORT == QUOTA_RATE_PENDING:
+            QUOTA_RATE_REPORT = json.dumps({
+                "status": "ready", "computed_at": time.time(), "summary": [], "fits": [],
+                "source_errors": {"quota-rate": ["Quota report could not be computed"]},
+            }).encode()
         return
     QUOTA_RATE_REPORT, source_errors = result
     for source, errors in source_errors.items():
@@ -2395,8 +2402,10 @@ async function refreshQuotaRate(){
       Number.isFinite(f.fable_usd_per_percent)&&Number.isFinite(f.other_usd_per_percent)).map(f=>
       '<div><b>'+esc(f.account)+'</b> &middot; '+esc('Fable '+dollars(f.fable_usd_per_percent)+
         ' per 1%, other '+dollars(f.other_usd_per_percent)+' per 1%')+'</div>');
+    const sourceNames=new Map([['claude','Claude'],['openai','OpenAI'],['audit','Audit']]);
     const errors=Object.entries(data.source_errors||{}).filter(([,messages])=>Array.isArray(messages))
-      .map(([source,messages])=>(source==='claude'?'Claude':source==='openai'?'OpenAI':source)+': '+messages.join(', '));
+      .map(([source,messages])=>(sourceNames.get(source)||source)+': '+messages.join(', '));
+    if(data.summary.some(row=>row.legacy_history_samples>0)) errors.push('Older weekly samples use snapshot times');
     $('quota-rates').innerHTML=rows.length?'<tr>'+columns.map(c=>'<th scope="col">'+esc(c)+'</th>').join('')+'</tr>'+rows.join(''):'';
     $('quota-rate-fits').innerHTML=fits.join('');
     $('quota-rate-errors').textContent=errors.join(' · ');
