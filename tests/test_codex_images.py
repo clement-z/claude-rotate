@@ -648,6 +648,39 @@ async def search_checks():
           and one(new).get("retries") == 1 and one(new).get("refresh_after_401") == "attempted"
           and one(new).get("upstream_error") == "rejected_by_hardened_oauth_boundary")
 
+    partial = b'{"error":'
+    stream = Body(partial, asyncio.Event())
+
+    def slow_401(request):
+        return httpx.Response(401, stream=stream, headers={
+            "content-type": "application/json", "content-length": str(len(partial) + 4)})
+
+    na = len(cx_auth.calls)
+    login.refreshed_at = 0
+    access = secret("fake-cx-search-slow-401", True)
+    backend.answer = lambda request: (slow_401(request)
+                                      if request.headers["authorization"] == f"Bearer {access}" else expired(request))
+    cx_auth.answer = lambda request: httpx.Response(200, json={
+        "access_token": access, "refresh_token": secret("fake-cx-search-slow-rotation", True)})
+    with patch.object(P, "PEEK_TIMEOUT_S", 0.02):
+        r, new = await asyncio.wait_for(call("POST", path, content=body), 2)
+    rec = one(new)
+    check("a stalled replay 401 on search closes by the peek deadline and relays the partial body",
+          r.status_code == 401 and r.content == partial and stream.closed and idle()
+          and r.headers.get("content-length") == str(len(partial))
+          and rec.get("retries") == 1 and "upstream_error" not in rec and len(cx_auth.calls) == na + 1)
+
+    stream = Body(partial, asyncio.Event())
+    na = len(siwc_auth.calls)
+    with patch.object(P, "PEEK_TIMEOUT_S", 0.02), patch.object(PLAIN, "refreshed_at", time.time()), \
+         patch.object(siwc["plain"], "answer", slow_401):
+        r, new = await asyncio.wait_for(call("POST", "/plain/v1/alpha/search", content=body), 2)
+    rec = one(new)
+    check("a stalled initial 401 on Sign in with ChatGPT closes by the peek deadline with no extra refresh",
+          r.status_code == 401 and r.content == partial and stream.closed and idle()
+          and "upstream_error" not in rec and len(siwc_auth.calls) == na
+          and rec.get("refresh_after_401", "").startswith("held back"))
+
     stream = Body(b"x" * (P.PEEK_MAX + 1), asyncio.Event())
     backend.answer = lambda request: httpx.Response(401, stream=stream)
     refreshing = asyncio.Event()

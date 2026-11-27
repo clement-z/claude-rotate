@@ -80,6 +80,7 @@ RETRY_S, RETRY_MAX_S = 30, 300  # backoff after a failed refresh, shared by ever
 # more often (each rotation risks a lost answer, and spends a refresh early).
 FORCED_REFRESH_MIN_S = 600
 PEEK_MAX = 64 * 1024  # how much of a 401 body is read to classify it
+PEEK_TIMEOUT_S = 10  # overall wait for a 401 body
 # OpenAI's 401 for a valid credential asking for an operation the route does not allow.
 REFUSED_OPERATION = {"rejected_by_hardened_oauth_boundary"}
 SSE_LINE_MAX = 8 * 1024 * 1024  # a longer SSE line is skipped for usage, still relayed
@@ -349,7 +350,7 @@ class OpenAISiwc:
         """(streamed upstream response, retries, audit notes). An upstream 401 gets one
         refresh, unless it says the operation is not allowed or a refresh ran less than
         FORCED_REFRESH_MIN_S ago; the request is replayed only with a new token, and not
-        for a caller that left. The caller gets any 401 byte for byte."""
+        for a caller that left. The 401 body is relayed up to the peek deadline."""
         token = await self.token()
         await _check(alive)
         upstream = await self.client.send(self.client.build_request(
@@ -761,19 +762,30 @@ class Peeked(httpx.AsyncByteStream):
 
 
 async def peek(upstream: httpx.Response) -> tuple[httpx.Response, bytes | None]:
-    """(the same answer, to relay unchanged; its body if it is at most PEEK_MAX bytes)."""
-    rest, head, whole = upstream.aiter_bytes(), b"", True
-    try:
+    """Read ahead on a 401. If it stalls, close it and relay the bytes already read."""
+    rest, head = upstream.aiter_bytes(), b""
+
+    async def read_head():
+        nonlocal head
         while len(head) <= PEEK_MAX:
             head += await rest.__anext__()
-        whole = False
+
+    whole, timed_out = False, False
+    try:
+        await asyncio.wait_for(read_head(), PEEK_TIMEOUT_S)
     except StopAsyncIteration:
-        pass
+        whole = True
+    except asyncio.TimeoutError:
+        timed_out = True
+        await upstream.aclose()
     except BaseException:
         await upstream.aclose()
         raise
     # The bytes are decoded already: the copy must not decode them again.
-    headers = [(k, v) for k, v in upstream.headers.multi_items() if k.lower() != "content-encoding"]
+    drop = {"content-encoding", "content-length"} if timed_out else {"content-encoding"}
+    headers = [(k, v) for k, v in upstream.headers.multi_items() if k.lower() not in drop]
+    if timed_out:
+        return httpx.Response(upstream.status_code, headers=headers, request=upstream.request, content=head), head
     return (httpx.Response(upstream.status_code, headers=headers, request=upstream.request,
                            stream=Peeked(head, rest, upstream)), head if whole else None)
 
