@@ -144,8 +144,8 @@ It reports any audit lines it skipped for exceeding 1 MiB.
 
 `sudo claude-rotate-admin quota-rate` estimates API-equivalent cost and
 tokens per quota percentage point using local history and retained audit
-logs. It also reports remaining quota and a time estimate at the last 24 h
-gateway pace. It can run with the service stopped. See
+logs. The summary reports remaining quota and time left based on the last
+24 h of quota readings. It can run with the service stopped. See
 [quota-rate estimation](../README.md#estimating-usage-per-quota-point).
 
 Claude audit lines store `util` as numeric utilization by claim ID.

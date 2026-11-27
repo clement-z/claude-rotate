@@ -470,10 +470,20 @@ Results include median cost and its interquartile range, median tokens by
 type, and the fraction of qualifying independently sampled intervals with no
 gateway traffic. That fraction is unavailable for series without independent
 samples, such as Fable 7d.
-Remaining dollars and tokens use the latest reading and the median rates.
-Time left uses the last 24 h gateway cost pace when the audit covers that
-period. The general weekly fit estimates how many points each Fable dollar
-and each other dollar consumes when the samples distinguish the two rates.
+The summary table shows each limit's latest usage, median cost and output
+tokens per point, dollars and time left, and the number of priced intervals.
+The same summary appears under `summary` in JSON. Remaining dollars and
+tokens use the latest reading and the median rates. The general weekly fit
+reports dollars per point for Fable and other models when both fitted rates
+are positive. JSON also retains the original coefficients.
+
+Time left uses quota readings from the last 24 h, including usage outside the
+gateway. It adds the rise from the first to last reading within each segment,
+skips jumps at resets, and divides by the elapsed time between the earliest
+and latest usable readings. It needs at least two readings in one segment
+and works without priced intervals. When the estimate extends past a known
+reset, the report shows when the quota resets. Durations above 48 h use days.
+
 Outside usage can increase quota readings, including in intervals with
 gateway traffic. Unobserved resets can also skew estimates. An unconfirmed
 drop of one point or less is treated as noise, so a one-point credit can be

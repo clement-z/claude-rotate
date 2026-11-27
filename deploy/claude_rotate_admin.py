@@ -1835,8 +1835,68 @@ def quota_token_text(tokens):
         ("cache_read_input_tokens", "cache read"), ("cache_creation_input_tokens", "cache write")))
 
 
+def quota_limit_label(row):
+    limit = {"7d_oi": "Fable 7d", "imagegen_premium": "images"}.get(row["limit"], row["limit"])
+    minutes = row["minutes"]
+    if minutes == 10080:
+        return f"{limit} 7d"
+    if minutes:
+        window = f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m"
+        return f"{limit} {window}"
+    return limit
+
+
+def quota_rate_summary(series):
+    summary = []
+    for row in series:
+        latest, remaining, tokens = row["latest"], row["remaining"], row["tokens_per_percent"]
+        summary.append({
+            "kind": row["kind"], "account": row["name"], "limit": quota_limit_label(row),
+            "used_percent": latest["used_percent"] if latest else None,
+            "usd_per_percent": row["usd_per_percent"],
+            "output_tokens_per_percent": tokens["output_tokens"] if tokens else None,
+            "usd_left": remaining["usd"] if remaining else None,
+            "time_left": {k: remaining[k] for k in ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day")}
+            if remaining else None,
+            "samples": row["cost_intervals"],
+        })
+    return summary
+
+
+def quota_time_text(projection):
+    if projection:
+        if projection["lasts_until_reset"]:
+            return f"won't run out before the reset in {projection['reset_in_hours'] / 24:.2f} d"
+        hours = projection["hours"]
+        if hours is not None:
+            return f"{hours / 24:.2f} d" if hours > 48 else f"{hours:.2f} h"
+        if projection["pace_points_per_day"] == 0:
+            return "no rise observed"
+    return "not enough data"
+
+
+def print_quota_summary(summary):
+    rows = [("Account", "Limit", "Used %", "$ / 1% (IQR)", "Output tokens / 1%", "$ left", "Time left", "Samples")]
+    for row in summary:
+        cost, used, tokens, left = (row[k] for k in ("usd_per_percent", "used_percent", "output_tokens_per_percent",
+                                                    "usd_left"))
+        price = f"${cost['median']:.4g}" if cost else "—"
+        if cost and cost["q1"] is not None:
+            price += f" (${cost['q1']:.4g}–${cost['q3']:.4g})"
+        rows.append((diagnostic_text(row["account"]), diagnostic_text(row["limit"]),
+                     f"{used:g}%" if used is not None else "—", price,
+                     f"{tokens:,.0f}" if tokens is not None else "—", f"${left:.4g}" if left is not None else "—",
+                     quota_time_text(row["time_left"]), str(row["samples"])))
+    widths = [max(map(len, column)) for column in zip(*rows)]
+    for row in rows:
+        out("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
 def print_quota_rates(report):
     out(f"Quota rates over {report['days']} days (minimum rise {report['min_step']:g} points)")
+    out("")
+    print_quota_summary(report["summary"])
+    out("")
     out(f"Audit coverage begins {fmt_time(report['audit']['from'])}"
         + (" (scan limit reached)" if report["audit"]["limited"] else ""))
     if report["audit"]["skipped_lines"]:
@@ -1875,14 +1935,13 @@ def print_quota_rates(report):
             out(f"  Remaining: {remaining['percent']:g}%, {cost}")
             if remaining["tokens"]:
                 out(f"  Tokens left: {quota_token_text(remaining['tokens'])}")
-            hours = remaining["hours"]
-            out(f"  Time left at the last 24 h gateway pace: {hours:.2f} h" if hours is not None
-                else "  Time left at the last 24 h gateway pace: not enough data")
+            out(f"  Time left at the last 24 h quota pace: {quota_time_text(remaining)}")
         elif row["latest"]:
             out("  Remaining: awaiting a reading after reset")
         if fit := row.get("fable_fit"):
-            coefficients = "not enough data" if fit["a"] is None else f"a={fit['a']:.4g}, b={fit['b']:.4g}"
-            out(f"  7d rise = a × Fable $ + b × other $: {coefficients} (n={fit['n']})")
+            fable, other = fit["fable_usd_per_percent"], fit["other_usd_per_percent"]
+            estimate = "not enough data" if fable is None else f"Fable ${fable:.2f} per 1%, other ${other:.2f} per 1%"
+            out(f"  7d fit: {estimate} (n={fit['n']})")
 
 
 def cmd_quota_rate(args) -> int:
@@ -1912,7 +1971,7 @@ def cmd_quota_rate(args) -> int:
     series, earliest = analyse(quota_audit_records(scan), history, provider_history, accounts, providers,
                                now - args.days * DAY, now, args.min_step, load_prices(cfg.get("prices_per_mtok", {})))
     report = {"days": args.days, "min_step": args.min_step, "audit": {"from": earliest, **scan},
-              "warnings": warnings, "series": series}
+              "warnings": warnings, "summary": quota_rate_summary(series), "series": series}
     if args.json:
         out(json.dumps(report, indent=2))
     else:

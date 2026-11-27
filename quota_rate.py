@@ -209,11 +209,11 @@ def accepted_readings(readings):
         yield latest, restart
 
 
-def measurement_intervals(readings, min_step, covered_from):
+def measurement_intervals(accepted, min_step, covered_from):
     """Build non-overlapping intervals from all readings and from samples alone."""
     intervals, sampled_intervals = [], []
     anchor = sampled_anchor = latest = None
-    for latest, restart in accepted_readings(readings):
+    for latest, restart in accepted:
         if restart:
             anchor = sampled_anchor = None
         if covered_from is None or latest.at < covered_from or (
@@ -234,22 +234,46 @@ def measurement_intervals(readings, min_step, covered_from):
     return intervals, sampled_intervals, latest
 
 
+def recent_quota_pace(accepted, now):
+    """Points per day over the observed span, adding rises within each segment."""
+    first = last = previous = None
+    rise = 0
+    has_pair = False
+    for point, restart in accepted:
+        if restart:
+            previous = None
+        if point.at < now - DAY or (point.reset is not None and point.reset <= point.at):
+            continue
+        if first is None:
+            first = point.at
+        if previous is not None:
+            has_pair = has_pair or point.at > previous.at
+            rise += point.percent - previous.percent
+        previous = point
+        last = point.at
+    return rise * DAY / (last - first) if has_pair else None
+
+
 def fit_fable(rows):
     """Least squares through the origin with one coefficient per dollar stream."""
     ff = fsum(f * f for f, _, _ in rows)
     oo = fsum(o * o for _, o, _ in rows)
     fo = fsum(f * o for f, o, _ in rows)
     determinant = ff * oo - fo * fo
-    report = {"n": len(rows), "a": None, "b": None}
+    report = {"n": len(rows), "a": None, "b": None, "fable_usd_per_percent": None, "other_usd_per_percent": None}
     if len(rows) > 1 and determinant > 1e-12 * ff * oo:
         fy = fsum(f * y for f, _, y in rows)
         oy = fsum(o * y for _, o, y in rows)
-        report.update(a=(fy * oo - oy * fo) / determinant, b=(oy * ff - fy * fo) / determinant)
+        a, b = (fy * oo - oy * fo) / determinant, (oy * ff - fy * fo) / determinant
+        report.update(a=a, b=b)
+        if a > 0 and b > 0:
+            report.update(fable_usd_per_percent=1 / a, other_usd_per_percent=1 / b)
     return report
 
 
 def series_report(points, requests, min_step, covered_from, now, *, general_week=False):
-    intervals, sampled_intervals, latest = measurement_intervals(points, min_step, covered_from)
+    accepted = list(accepted_readings(points))
+    intervals, sampled_intervals, latest = measurement_intervals(accepted, min_step, covered_from)
     dollar_rates, token_rates, fit_rows = [], [], []
     times = [request.at for request in requests] if requests is not None else []
     sample_count = len(sampled_intervals)
@@ -276,15 +300,15 @@ def series_report(points, requests, min_step, covered_from, now, *, general_week
     if latest and (latest.reset is None or latest.reset > now):
         left = max(0, 100 - latest.percent)
         usd = left * dollars["median"] if dollars else None
-        hours = None
-        if usd is not None and requests is not None and covered_from is not None and covered_from <= now - DAY:
-            day = requests[bisect_right(times, now - DAY):]
-            if all(request.cost is not None for request in day):
-                pace = fsum(request.cost for request in day)
-                if pace > 0:
-                    hours = 24 * usd / pace
+        pace = recent_quota_pace(accepted, now)
+        hours = 0 if left == 0 else 24 * left / pace if pace else None
+        reset_hours = (latest.reset - now) / 3600 if latest.reset is not None else None
+        lasts_until_reset = (reset_hours is not None and left > 0
+                             and (pace == 0 or (hours is not None and hours > reset_hours)))
         remaining = {"percent": left, "usd": usd,
-                     "tokens": {k: left * v for k, v in tokens.items()} if tokens else None, "hours": hours}
+                     "tokens": {k: left * v for k, v in tokens.items()} if tokens else None,
+                     "hours": hours, "reset_in_hours": reset_hours, "lasts_until_reset": lasts_until_reset,
+                     "pace_points_per_day": pace}
     result = {
         "latest": {"at": latest.at, "used_percent": latest.percent, "reset": latest.reset} if latest else None,
         "intervals": len(intervals), "cost_intervals": len(dollar_rates), "token_intervals": len(token_rates),
