@@ -33,7 +33,12 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     config = root / "etc/claude-rotate/config.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({
-        "accounts": [{"name": n, "token_file": n + ".token"} for n in ("a", "b")],
+        "accounts": [{"name": "a", "token_file": "a.token", "billing": [
+            {"from": "2000-01-01", "plan": "pro"},
+            {"from": "2020-01-01", "plan": "team", "renews": True},
+            {"from": "2099-01-01", "plan": "ultra"},
+        ]}, {"name": "b", "token_file": "b.token"}],
+        "plans": {"team": {"price": 120, "weight": 1}},
         "devices": {}, "providers": {"work": {"kind": "openai-siwc", "prefix": "/openai"},
                                      "lan": {"kind": "static-bearer"}},
     }))
@@ -113,8 +118,22 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           general["sampled_intervals"] == 3 and general["outside_intervals"] == 1
           and math.isclose(general["outside_share"], 1 / 3))
     check("general weekly fit distinguishes Fable and other costs",
-          general["fable_fit"] == {"n": 6, "a": 2.0, "b": 1.0,
-                                   "fable_usd_per_percent": .5, "other_usd_per_percent": 1.0})
+          all(general["fable_fit"][key] == value for key, value in {
+              "n": 6, "a": 2.0, "b": 1.0, "fable_usd_per_percent": .5, "other_usd_per_percent": 1.0,
+              "relative_quota_per_dollar": 2,
+          }.items()))
+    week_price = 120 * 7 / (365.25 / 12)
+    check("weekly value uses the effective custom monthly price for the median, IQR and fit",
+          math.isclose(general["subscription_window_usd"], week_price)
+          and all(math.isclose(general["value_multiple"][key], cost * 100 / week_price)
+                  for key, cost in general["usd_per_percent"].items())
+          and math.isclose(general["fable_fit"]["fable_value_multiple"], 50 / week_price)
+          and math.isclose(general["fable_fit"]["other_value_multiple"], 100 / week_price))
+    day_price = quota_rate.subscription_window_price(120, 1440)
+    check("a daily window uses one day of the monthly price and a zero price has no multiple",
+          math.isclose(day_price, 120 / (365.25 / 12))
+          and math.isclose(quota_rate.subscription_value(.75, day_price), 75 / (120 / (365.25 / 12)))
+          and quota_rate.subscription_window_price(0, 1440) is None)
     check("time left adds each segment's rise inside the last 24 h and excludes reset jumps",
           general["remaining"]["percent"] == 5 and general["remaining"]["usd"] == 3.75
           and general["remaining"]["pace_points_per_day"] == 45
@@ -125,6 +144,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and fable_week["usd_per_percent"]["median"] == .5
           and fable_week["tokens_per_percent"]["output_tokens"] == 12_500
           and fable_week["remaining"]["usd"] == 42.5
+          and math.isclose(fable_week["value_multiple"]["median"], 50 / week_price)
           and rows["a", "learned"]["usd_per_percent"]["median"] == .5)
     check("Fable-only history has no independent estimate of outside use",
           fable_week["outside_share"] is None and fable_week["sampled_intervals"] == 0)
@@ -150,20 +170,30 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and summary["a", "7d"] == {
               "kind": "claude", "account": "a", "limit": "7d", "used_percent": 95,
               "usd_per_percent": {"median": .75, "q1": .5, "q3": 1},
+              "value_multiple": general["value_multiple"], "subscription_window_usd": general["subscription_window_usd"],
               "output_tokens_per_percent": general["tokens_per_percent"]["output_tokens"], "usd_left": 3.75,
               "time_left": {k: general["remaining"][k] for k in
                             ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day", "stale", "exhausts_at")},
               "samples": 6,
               "legacy_history_samples": 4,
           })
+    check("unpriced accounts and providers have no multiple even if per-point cost is known",
+          summary["b", "7d"]["value_multiple"] is None and summary["b", "7d"]["subscription_window_usd"] is None
+          and summary["work", "codex 7d"]["usd_per_percent"] is not None
+          and summary["work", "codex 7d"]["value_multiple"] is None)
 
     r = run()
     summary_output = r.stdout
     table, sep, details = summary_output.partition("\nclaude a / 7d")
-    check("the summary table precedes the details and the fit displays dollars per point",
+    check("the summary shows value ranges and a price hint while details retain per-point costs",
           r.returncode == 0 and sep and "Account" in table and "Samples" in table
-          and all(label in table for label in ("Fable 7d", "codex 7d", "images 24h", "1.67 h"))
-          and "Fable $0.50 per 1%, other $1.00 per 1% (n=6)" in details)
+          and all(label in table for label in ("Value ($/$)", "2.7x (1.8–3.6x)", "Fable 7d", "codex 7d",
+                                               "images 24h", "1.67 h"))
+          and table.count("Add billing to an account in config.json") == 1
+          and "Fable-only use of the Fable allowance" in table
+          and "Cost per 1%: $0.75 median" in details and "Tokens per 1%:" in details
+          and "Fable 2.0x the quota per $ of other models (Fable 1.8x, other 3.6x API $ per subscription $)" in details
+          and next(line for line in table.splitlines() if "codex 7d" in line).split()[4] == "-")
 
     r = run("--days", "1", "--min-step", "25")
     check("human output uses flags and marks insufficient data",

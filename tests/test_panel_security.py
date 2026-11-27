@@ -13,6 +13,7 @@ def main():
                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PANEL_HTML" for t in n.targets))
     assert "General weekly quota runs out in" in panel
     assert 'id="quota-rate-empty" class="muted">Computing…' in panel
+    assert "Fable-only use of the Fable allowance" in panel and "to show its value" in panel
     assert re.search(r'<div id="weekly"[^>]*>[^<]*</div>\s*<div class="tip" id="tip">', panel), \
         "the tooltip must be outside the chart so its taps do not reach the chart"
     node = shutil.which("node")
@@ -116,20 +117,26 @@ elements.tip.parentNode=new Element();
   assert.equal(elements['quota-rates']?.innerHTML||'','','a pending report has no rows');
   assert(timers.has(30000)&&!timers.has(300000),'a pending report retries in 30 seconds');
   quotaRate={computed_at:receipt-125,summary:[
-    {account:value,limit:value,used_percent:82,usd_per_percent:{median:11.34,q1:10.24,q3:14.59},
+    {account:value,limit:value,used_percent:82,usd_per_percent:{median:29.41},
+     subscription_window_usd:48,value_multiple:{median:11.34,q1:10.24,q3:14.59},
      output_tokens_per_percent:25000,usd_left:1571.1,time_left:{hours:12.5},samples:21},
     {account:'OpenAI',limit:'images 24h',used_percent:0,usd_per_percent:null,output_tokens_per_percent:null,
-     usd_left:value,time_left:{stale:true},samples:0}
-  ],fits:[{account:value,fable_usd_per_percent:9.03,other_usd_per_percent:21.05}],source_errors:{openai:[value]}};
+     usd_left:value,time_left:{stale:true},samples:0},
+    {account:'other',limit:'7d',subscription_window_usd:20,value_multiple:null}
+  ],fits:[{account:value,relative_quota_per_dollar:2.33,fable_value_multiple:19.63,other_value_multiple:45.77},
+         {account:'unpriced',relative_quota_per_dollar:2.1}],source_errors:{openai:[value]}};
   await timers.get(30000)();
   assert(timers.has(300000),'a completed report refreshes in five minutes');
   const rates=elements['quota-rates'].innerHTML, fits=elements['quota-rate-fits'].innerHTML;
   assert(!rates.includes('<mark')&&!fits.includes('<mark'));
   assert(rates.includes('&lt;mark')&&fits.includes('&lt;mark'),'quota-rate account, limit and fit labels are escaped');
-  assert(rates.includes('$11.34')&&rates.includes('IQR $10.24–$14.59')&&rates.includes('$'+(1571).toLocaleString())
+  assert(rates.includes('11.3x')&&rates.includes('IQR 10.2–14.6x')&&!rates.includes('$29.41')
+    && rates.includes('<td data-l="Value ($/$)">-</td>')&&rates.includes('$'+(1571).toLocaleString())
     && rates.includes('12.50 h')&&rates.includes('Projection stale'));
   assert(rates.includes('>0%</td>')&&rates.includes('Not enough data')&&elements['quota-rate-empty'].hidden);
-  assert(fits.includes('Fable $9.03 per 1%, other $21.05 per 1%'));
+  assert(fits.includes('Fable 2.3x the quota per $ of other models'));
+  assert(fits.includes('Fable 19.6x, other 45.8x API $ per subscription $'));
+  assert(fits.includes('Fable 2.1x the quota per $ of other models</div>'));
   assert.equal(elements['quota-rate-age'].textContent,'computed 2 min ago');
   assert.equal(elements['quota-rate-errors'].textContent,'OpenAI: '+value,'source errors are shown as text');
   assert.equal(elements['quota-rate-errors'].innerHTML,'');

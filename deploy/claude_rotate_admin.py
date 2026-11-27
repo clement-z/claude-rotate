@@ -1769,13 +1769,13 @@ def quota_time_text(projection):
 
 
 def print_quota_summary(summary):
-    rows = [("Account", "Limit", "Used %", "$ / 1% (IQR)", "Output tokens / 1%", "$ left", "Time left", "Samples")]
+    rows = [("Account", "Limit", "Used %", "Value ($/$)", "Output tokens / 1%", "$ left", "Time left", "Samples")]
     for row in summary:
-        cost, used, tokens, left = (row[k] for k in ("usd_per_percent", "used_percent", "output_tokens_per_percent",
-                                                    "usd_left"))
-        price = f"${cost['median']:.4g}" if cost else "—"
-        if cost and cost["q1"] is not None:
-            price += f" (${cost['q1']:.4g}–${cost['q3']:.4g})"
+        value, used, tokens, left = (row[k] for k in ("value_multiple", "used_percent", "output_tokens_per_percent",
+                                                     "usd_left"))
+        price = f"{value['median']:.1f}x" if value else "-"
+        if value and value["q1"] is not None and value["q3"] is not None:
+            price += f" ({value['q1']:.1f}–{value['q3']:.1f}x)"
         rows.append((diagnostic_text(row["account"]), diagnostic_text(row["limit"]),
                      f"{used:g}%" if used is not None else "—", price,
                      f"{tokens:,.0f}" if tokens is not None else "—", f"${left:.4g}" if left is not None else "—",
@@ -1783,6 +1783,8 @@ def print_quota_summary(summary):
     widths = [max(map(len, column)) for column in zip(*rows)]
     for row in rows:
         out("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+    out("Value assumes full use of the window at API list prices. Fable 7d assumes Fable-only use of the Fable allowance.")
+    out("Add billing to an account in config.json to show its value.")
 
 
 def print_quota_rates(report):
@@ -1834,8 +1836,13 @@ def print_quota_rates(report):
         elif row["latest"]:
             out("  Remaining: awaiting a reading after reset")
         if fit := row.get("fable_fit"):
-            fable, other = fit["fable_usd_per_percent"], fit["other_usd_per_percent"]
-            estimate = "not enough data" if fable is None else f"Fable ${fable:.2f} per 1%, other ${other:.2f} per 1%"
+            relative = fit.get("relative_quota_per_dollar")
+            estimate = "not enough data"
+            if relative is not None:
+                estimate = f"Fable {relative:.1f}x the quota per $ of other models"
+                fable, other = fit["fable_value_multiple"], fit["other_value_multiple"]
+                if fable is not None and other is not None:
+                    estimate += f" (Fable {fable:.1f}x, other {other:.1f}x API $ per subscription $)"
             out(f"  7d fit: {estimate} (n={fit['n']})")
 
 
@@ -1850,6 +1857,7 @@ def cmd_quota_rate(args) -> int:
                  if object_fields(spec).get("kind") == "openai-siwc"}
     report = rates.read_report(AUDIT_PATH, STATE_DIR / "usage_history.json", STATE_DIR / "provider_quota_history.json",
                                accounts, providers, pricing.load_prices(cfg.get("prices_per_mtok", {})), now,
+                               monthly_prices=pricing.monthly_plan_prices(cfg, now),
                                days=args.days, min_step=args.min_step)
     if args.json:
         out(json.dumps(report, indent=2))

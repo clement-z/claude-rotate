@@ -1,7 +1,53 @@
-"""API-equivalent prices shared by the gateway and offline usage analysis."""
+"""API and subscription prices shared by the gateway and offline analysis."""
 
 import re
 import sys
+import time
+from datetime import date
+
+
+DEFAULT_PLANS = {"pro": {"price": 20, "weight": 0.2}, "max": {"price": 100, "weight": 1},
+                 "ultra": {"price": 200, "weight": 2}}  # USD per month; weekly quota vs Max
+
+
+def load_billing(overrides, accounts, base_plans=DEFAULT_PLANS):
+    """Read monthly prices and each account's dated plan timeline."""
+    plans, timelines, errors = dict(base_plans), {}, []
+    for name, plan in (overrides.items() if isinstance(overrides, dict) else ()):
+        if (isinstance(plan, dict) and type(plan.get("price")) in (int, float) and plan["price"] >= 0
+                and type(plan.get("weight")) in (int, float) and plan["weight"] > 0):
+            plans[name] = plan
+        else:
+            errors.append(f"plan '{name}' needs a price >= 0 and a weight > 0")
+    for account in accounts:
+        if "billing" not in account:
+            continue
+        name, timeline = account["name"], []
+        try:
+            for entry in account["billing"]:
+                start = date.fromisoformat(entry["from"])
+                if entry["plan"] not in plans or (timeline and start <= timeline[-1][1]):
+                    raise ValueError
+                timeline.append((time.mktime(start.timetuple()), start, entry["plan"], entry.get("renews") is True))
+        except (TypeError, KeyError, ValueError, AttributeError, OverflowError):
+            timeline = []
+        if timeline:
+            timelines[name] = timeline
+        else:
+            errors.append(f"account '{name}': billing needs entries with a 'from' date "
+                          f"(YYYY-MM-DD, increasing) and a plan ({', '.join(plans)})")
+    return plans, timelines, errors
+
+
+def plan_at(timeline, ts):
+    if timeline:
+        return next((entry for entry in reversed(timeline) if entry[0] <= ts), timeline[0])
+    return None
+
+
+def monthly_plan_prices(cfg, ts):
+    plans, timelines, _ = load_billing(cfg.get("plans"), cfg["accounts"])
+    return {name: plans[plan_at(timeline, ts)[2]]["price"] for name, timeline in timelines.items()}
 
 
 def token_count(value) -> int:

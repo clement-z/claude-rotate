@@ -477,13 +477,24 @@ Results include median cost and its interquartile range, median tokens by
 type, and the fraction of qualifying independently sampled intervals with no
 gateway traffic. That fraction is unavailable for series without independent
 samples, such as Fable 7d.
-The summary table shows each limit's latest usage, median cost and output
+The summary table shows each limit's latest usage, **Value ($/$)**, output
 tokens per point, dollars and time left, and the number of priced intervals.
-The same summary appears under `summary` in JSON. Remaining dollars and
-tokens use the latest reading and the median rates. The general weekly fit
-reports dollars per point for Fable and other models when the coefficients
-are large enough to invert and the Fable share of cost varies by at least ten
-percentage points across intervals. JSON also retains the original coefficients.
+Value is API-equivalent dollars at full use of the window per subscription
+dollar. It multiplies the median dollars per point by 100 and divides by
+the account's current monthly plan price prorated over the window, using
+365.25/12 days per month. The interquartile range uses the same conversion.
+Fable 7d assumes Fable-only use of the Fable allowance. Add `billing` to an
+account in `config.json` to show its value. The estimate uses API list prices
+and excludes outside-only usage where detected.
+
+JSON retains the summary, dollars and tokens per point, and the original
+fit coefficients. The CLI details still show dollars and tokens per point.
+Remaining dollars and tokens use the latest reading and the median rates.
+The general weekly fit compares how much quota Fable uses per API dollar
+relative to other models and shows the separate value multiples when a
+plan price is configured. The fit requires coefficients large enough to
+invert and a Fable share of cost that varies by at least ten percentage
+points across intervals.
 
 The panel's **Quota rates** section below the weekly chart shows the same
 summary and fits using the default lookback and minimum rise. The gateway

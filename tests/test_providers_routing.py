@@ -378,7 +378,9 @@ async def quota_rate_worker(c):
             raise R.quota_rate.ScanStopped
         return original(stop)
 
-    with patch.multiple(R, compute_quota_rate=compute, AUDIT_PATH=audit_path, STORAGE_ERRORS={},
+    billed = dict(R.CFG["accounts"][0], billing=[{"from": "2020-01-01", "plan": "max"}])
+    with patch.dict(R.CFG, {"accounts": [billed]}), patch.multiple(
+                        R, compute_quota_rate=compute, AUDIT_PATH=audit_path, STORAGE_ERRORS={},
                         HISTORY_PATH=weekly_history, QUOTA_HISTORY_PATH=bad_history,
                         QUOTA_RATE_REPORT=R.QUOTA_RATE_PENDING), patch.object(os, "open", side_effect=open_audit):
         response = await ask(c, "/rotate/quota-rate", "claude")
@@ -409,6 +411,9 @@ async def quota_rate_worker(c):
                   archive_opens == [audit_path.name + ".1"]
                   and report["source_errors"]["audit"] == [f"{audit_path.name}.1 could not be read"]
                   and 240 < row["time_left"]["pace_points_per_day"] < 243)
+            check("the panel report uses the configured Claude billing price for quota value",
+                  round(row["value_multiple"]["median"], 3) == 2.174
+                  and next(row for row in report["summary"] if row["account"] == "openai")["value_multiple"] is None)
         finally:
             stop.set()
         await asyncio.wait_for(stopped.wait(), 1)

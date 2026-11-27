@@ -524,8 +524,7 @@ def priority(name: str) -> int:
     return ACCOUNTS[name].get("priority", 100)
 
 
-PLANS = {"pro": {"price": 20, "weight": 0.2}, "max": {"price": 100, "weight": 1},
-         "ultra": {"price": 200, "weight": 2}}  # USD list price a month; weekly quota vs Max
+PLANS = dict(pricing.DEFAULT_PLANS)
 BILLING_ERRORS: list = []
 
 
@@ -533,34 +532,12 @@ def load_billing() -> dict:
     """Each account's plan timeline from config: [(start ts, start date, plan, restarts
     the billing cycle)]. A broken entry is reported in the panel and ignored: billing is
     analytics and must never stop the proxy."""
-    import datetime as dt
-    for name, plan in (CFG.get("plans") or {}).items():
-        if (isinstance(plan, dict) and type(plan.get("price")) in (int, float) and plan["price"] >= 0
-                and type(plan.get("weight")) in (int, float) and plan["weight"] > 0):
-            PLANS[name] = plan
-        else:
-            BILLING_ERRORS.append(f"plan '{name}' needs a price >= 0 and a weight > 0")
-    out = {}
-    for name, acct in ACCOUNTS.items():
-        if "billing" not in acct:
-            continue
-        timeline = []
-        try:
-            for e in acct["billing"]:
-                start = dt.date.fromisoformat(e["from"])
-                if e["plan"] not in PLANS or (timeline and start <= timeline[-1][1]):
-                    raise ValueError
-                timeline.append((time.mktime(start.timetuple()), start, e["plan"], e.get("renews") is True))
-        except (TypeError, KeyError, ValueError, AttributeError):
-            timeline = []
-        if timeline:
-            out[name] = timeline
-        else:
-            BILLING_ERRORS.append(f"account '{name}': billing needs entries with a 'from' date "
-                                  f"(YYYY-MM-DD, increasing) and a plan ({', '.join(PLANS)})")
-    for error in BILLING_ERRORS:
+    global PLANS
+    PLANS, timelines, errors = pricing.load_billing(CFG.get("plans"), ACCOUNTS.values(), PLANS)
+    BILLING_ERRORS.extend(errors)
+    for error in errors:
         print(f"warning: billing ignored: {error}", file=sys.stderr)
-    return out
+    return timelines
 
 
 BILLING = load_billing()
@@ -568,10 +545,7 @@ BILLING = load_billing()
 
 def plan_at(name: str, ts: float):
     """The billing entry in force at ts (the first one before it starts), or None."""
-    timeline = BILLING.get(name)
-    if not timeline:
-        return None
-    return next((e for e in reversed(timeline) if e[0] <= ts), timeline[0])
+    return pricing.plan_at(BILLING.get(name), ts)
 
 
 def weight(name: str, ts: float | None = None) -> float:
@@ -1575,8 +1549,10 @@ ALERT_CFG = CFG.get("alerts", {
 
 def compute_quota_rate(stop):
     accounts = {account["name"] for account in CFG["accounts"]}
+    now = time.time()
     report = quota_rate.read_report(AUDIT_PATH, HISTORY_PATH, QUOTA_HISTORY_PATH, accounts,
-                                    set(quota_histories()), PRICES, time.time(), stop=stop)
+                                    set(quota_histories()), PRICES, now,
+                                    monthly_prices=pricing.monthly_plan_prices(CFG, now), stop=stop)
     fits = [dict(row["fable_fit"], account=row["name"]) for row in report["series"]
             if row.get("fable_fit", {}).get("fable_usd_per_percent") is not None]
     source_errors = report["source_errors"]
@@ -2187,7 +2163,9 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <p id="quota-rate-empty" class="muted">Computing…</p>
  <table id="quota-rates" class="cards"></table><div id="quota-rate-fits" class="muted small"></div>
  <div id="quota-rate-errors" class="muted small"></div>
- <p class="muted small">API list prices. Estimates skip detected outside-only rises and split at mid-window credits. See <code>claude-rotate-admin quota-rate</code> for details.</p>
+ <p class="muted small">Value is API-equivalent dollars at list prices per subscription dollar at full use of the window.
+ Fable 7d assumes Fable-only use of the Fable allowance. Estimates skip detected outside-only rises and split at mid-window credits.
+ Add <code>billing</code> to an account in config.json to show its value. See <code>claude-rotate-admin quota-rate</code> for details.</p>
 </section>
 <section class="card"><h2>Subscriptions <span class="muted" style="font-weight:400">billing periods &middot; USD list prices</span></h2><div id="billing"></div></section>
 <section class="card"><h2>Devices</h2><table id="devices" class="cards"></table></section>
@@ -2384,24 +2362,28 @@ async function refreshQuotaRate(){
     if(!response.ok) return;
     const data=await response.json();
     if(!Number.isFinite(data?.computed_at)||!Array.isArray(data.summary)||data.computed_at<quotaRateComputedAt) return;
-    const columns=['Account','Limit','Used','$ / 1%','Output tok / 1%','$ left','Time left','Samples'];
+    const columns=['Account','Limit','Used','Value ($/$)','Output tok / 1%','$ left','Time left','Samples'];
     const dollars=n=>'$'+(n>=1000?Math.round(n).toLocaleString():n.toFixed(2));
+    const multiple=n=>n.toFixed(1)+'x';
     const value=(n,format)=>Number.isFinite(n)?esc(format(n)):'&ndash;';
     const none='<span class="muted small">Not enough data</span>';
     const rows=data.summary.map(row=>{
-      const c=row.usd_per_percent;
+      const c=row.value_multiple;
       const iqr=Number.isFinite(c?.q1)&&Number.isFinite(c?.q3)?
-        '<span class="sub">IQR '+esc(dollars(c.q1)+'–'+dollars(c.q3))+'</span>':'';
+        '<span class="sub">IQR '+esc(c.q1.toFixed(1)+'–'+multiple(c.q3))+'</span>':'';
       const cells=['<b>'+esc(row.account)+'</b>',esc(row.limit),value(row.used_percent,n=>n+'%'),
-        Number.isFinite(c?.median)?esc(dollars(c.median))+iqr:none,
+        Number.isFinite(c?.median)?esc(multiple(c.median))+iqr:Number.isFinite(row.subscription_window_usd)?none:'-',
         value(row.output_tokens_per_percent,n=>Math.round(n).toLocaleString()),value(row.usd_left,dollars),
         esc(quotaRateTime(row.time_left))||'&ndash;',value(row.samples,String)];
       return '<tr>'+cells.map((cell,i)=>`<td data-l="${esc(columns[i])}">${cell}</td>`).join('')+'</tr>';
     });
-    const fits=(Array.isArray(data.fits)?data.fits:[]).filter(f=>
-      Number.isFinite(f.fable_usd_per_percent)&&Number.isFinite(f.other_usd_per_percent)).map(f=>
-      '<div><b>'+esc(f.account)+'</b> &middot; '+esc('Fable '+dollars(f.fable_usd_per_percent)+
-        ' per 1%, other '+dollars(f.other_usd_per_percent)+' per 1%')+'</div>');
+    const fits=(Array.isArray(data.fits)?data.fits:[]).filter(f=>Number.isFinite(f.relative_quota_per_dollar)).map(f=>{
+      let text='Fable '+multiple(f.relative_quota_per_dollar)+' the quota per $ of other models';
+      if(Number.isFinite(f.fable_value_multiple)&&Number.isFinite(f.other_value_multiple)){
+        text+=' · Fable '+multiple(f.fable_value_multiple)+', other '+multiple(f.other_value_multiple)+' API $ per subscription $';
+      }
+      return '<div><b>'+esc(f.account)+'</b> &middot; '+esc(text)+'</div>';
+    });
     const sourceNames=new Map([['claude','Claude'],['openai','OpenAI'],['audit','Audit']]);
     const errors=Object.entries(data.source_errors||{}).filter(([,messages])=>Array.isArray(messages))
       .map(([source,messages])=>(sourceNames.get(source)||source)+': '+messages.join(', '));

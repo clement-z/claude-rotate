@@ -10,12 +10,14 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import chain
-from math import fsum
+from math import fsum, isfinite
 from statistics import median, quantiles
 
 from pricing import api_cost, price_for, token_count
 
 DAY = 86400
+MONTH_MINUTES = 365.25 / 12 * 24 * 60
+CLAUDE_WINDOW_MINUTES = {"5h": 300, "7d": 10080, "7d_oi": 10080}
 AUDIT_TAIL_BYTES = 32 * 1024 * 1024
 AUDIT_TAIL_BACKUPS = 32
 AUDIT_TAIL_LINE_BYTES = 1024 * 1024
@@ -561,6 +563,35 @@ def quota_limit_label(row):
     return limit
 
 
+def subscription_window_price(monthly_price, minutes):
+    if number(monthly_price) and number(minutes):
+        return monthly_price * minutes / MONTH_MINUTES or None
+    return None
+
+
+def subscription_value(usd_per_percent, window_price):
+    if usd_per_percent is None or window_price is None:
+        return None
+    value = usd_per_percent * 100 / window_price
+    return value if isfinite(value) else None
+
+
+def add_subscription_values(series, monthly_prices):
+    for row in series:
+        name, limit = row["name"], row["limit"]
+        minutes = row["minutes"] or CLAUDE_WINDOW_MINUTES.get(limit)
+        price = subscription_window_price(monthly_prices.get(name), minutes) if row["kind"] == "claude" else None
+        cost = row["usd_per_percent"]
+        value = {k: subscription_value(v, price) for k, v in cost.items()} if cost else None
+        row["subscription_window_usd"] = price
+        row["value_multiple"] = value if value and value["median"] is not None else None
+        fit = row.get("fable_fit")
+        if fit and fit["fable_usd_per_percent"] is not None:
+            fit.update(relative_quota_per_dollar=fit["a"] / fit["b"],
+                       fable_value_multiple=subscription_value(fit["fable_usd_per_percent"], price),
+                       other_value_multiple=subscription_value(fit["other_usd_per_percent"], price))
+
+
 def quota_rate_summary(series):
     summary = []
     for row in series:
@@ -569,6 +600,8 @@ def quota_rate_summary(series):
             "kind": row["kind"], "account": row["name"], "limit": quota_limit_label(row),
             "used_percent": latest["used_percent"] if latest else None,
             "usd_per_percent": row["usd_per_percent"],
+            "subscription_window_usd": row["subscription_window_usd"],
+            "value_multiple": row["value_multiple"],
             "output_tokens_per_percent": tokens["output_tokens"] if tokens else None,
             "usd_left": remaining["usd"] if remaining else None,
             "time_left": {k: remaining[k] for k in ("hours", "reset_in_hours", "lasts_until_reset",
@@ -581,7 +614,7 @@ def quota_rate_summary(series):
 
 
 def read_report(audit_path, history_path, provider_history_path, accounts, providers, prices, now,
-                *, days=14, min_step=5, stop=None):
+                *, monthly_prices=None, days=14, min_step=5, stop=None):
     scan, claude_errors, openai_errors, audit_errors = {}, [], [], []
     check_stop(stop)
     history = quota_history_file(history_path, [], claude_errors)
@@ -592,6 +625,7 @@ def read_report(audit_path, history_path, provider_history_path, accounts, provi
         provider_history = {}
     series, earliest = analyse(quota_audit_records(audit_path, scan, stop, errors=audit_errors), history, provider_history,
                                accounts, providers, now - days * DAY, now, min_step, prices, stop)
+    add_subscription_values(series, monthly_prices or {})
     source_errors = {source: errors for source, errors in (("claude", claude_errors), ("openai", openai_errors),
                                                            ("audit", audit_errors))
                      if errors}
