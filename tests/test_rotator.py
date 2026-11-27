@@ -377,6 +377,23 @@ for representative, expected in (("seven_day", R.RECHECK_S), ("seven_day_oi", 80
           abs(R.blocker_deadline("a", "fable", now) - now - expected) < 5
           and R.blocker_deadline("a", "default", now) == 0)
 
+run(R.note_response("a", weekly, 200, family="default"))
+check("a default success leaves an inferred Fable block in place",
+      R.blocker_deadline("a", "fable", now) == now + 8000)
+recovered = weekly | {"anthropic-ratelimit-unified-7d_oi-utilization": "0.10",
+                      "anthropic-ratelimit-unified-7d_oi-status": "allowed",
+                      "anthropic-ratelimit-unified-7d_oi-reset": str(now + 8000)}
+run(R.note_response("a", httpx.Headers(recovered), 200, family="fable"))
+check("an authoritative Fable success clears the inferred block before its reset",
+      R.blocker_deadline("a", "fable", now) == 0 and R.usable("a", "fable"))
+
+fresh_state()
+verdict = run(R.note_response("a", httpx.Headers({"anthropic-ratelimit-unified-7d_oi-utilization": "1"}),
+                              429, family="fable"))
+check("a fresh 100% Fable reading without a reset blocks for the recheck instead of pacing as a burst",
+      verdict == "switched" and now < R.blocker_deadline("a", "fable", now) < now + R.RECHECK_S + 5
+      and not R.STATE["accounts"]["a"].get("pace_by_family") and R.blocker_deadline("a", "default", now) == 0)
+
 fresh_state()
 run(R.note_response("a", httpx.Headers({"anthropic-ratelimit-unified-7d_oi-status": "rejected"}),
                     429, family="fable"))

@@ -45,6 +45,7 @@ R.HOLD_MAX_S = 0
 def fresh_state(active="a", accounts=None):
     R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
                "last_switch_ts": 0}
+    R.RECOVERY_PROBES.clear()
     R.AUDIT_PATH.write_text("")
 
 
@@ -205,6 +206,28 @@ check("audit records a retried burst, its headers, Retry-After and structured er
       len(limits) == 1 and limits[0]["verdict"] == "burst" and limits[0]["account"] == "a"
       and limits[0]["retry_after"] == "1" and limits[0]["headers"]["unified-5h-utilization"] == "0.3"
       and limits[0]["error"] == burst_error and "discarded-body-marker" not in R.AUDIT_PATH.read_text())
+
+fresh_state()
+calls = []
+
+
+def two_default_bursts(req):
+    calls.append(req.headers["authorization"])
+    if len(calls) <= 2:
+        return httpx.Response(429, json={"error": burst_error}, headers=unified(
+            u5=None, u7="0.2", **{"retry-after": "0.02"}))
+    return httpx.Response(200, json={"usage": {}}, headers=unified(u5=None))
+
+
+use_upstream(two_default_bursts)
+started = time.monotonic()
+r = call()
+rec = audit_recs()[-1]
+check("two ordinary Opus bursts stay on the warm account under bounded pacing",
+      r.status_code == 200 and calls == ["Bearer tok-a"] * 3 and rec["retries"] == 2
+      and time.monotonic() - started >= 0.04
+      and [limit["verdict"] for limit in rec["rate_limits"]] == ["burst", "burst"]
+      and not R.STATE["accounts"]["a"].get("blocks_by_family"))
 
 # --- 6. every account spent, hold off → 429 passthrough ----------------------
 now = time.time()
@@ -374,7 +397,7 @@ check("a 4 KiB audit file keeps the attempt and error after dropping both header
       and "ratelimit" not in rec and "headers" not in rec["rate_limits"][0]
       and rec["rate_limits"][0]["error"] == returned_error)
 
-# --- 7. every account spent, hold on → wait for reset, then succeed ----------
+# --- 7. every account spent, hold on → bounded recovery probe -----------------
 now = time.time()
 fresh_state("a", {"a": {"util_5h": 0.1, "reset_5h": now + 100},
                   "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
@@ -392,18 +415,38 @@ def hold_handler(req):
                                   u5="1.0", status="rejected",
                                   **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}))
     return httpx.Response(200, json={"usage": {"input_tokens": 1, "output_tokens": 1}},
-                          headers=unified(u5="0.0"))
+                          headers=unified(u5=None))
 
 
 use_upstream(hold_handler)
 t0 = time.time()
-r = call()
+with patch.object(R, "RECOVERY_PROBE_S", 0.05):
+    r = call()
 elapsed = time.time() - t0
-check("an expired hold returns the original 429 without retrying a hard-blocked account",
-      r.status_code == 429 and r.json() == {"error": "limit"} and len(calls) == 1)
-check("hold waited for the deadline window", 1.5 <= elapsed < 10)
+check("a held request probes after the interval and recovers after the plan drops 5h",
+      r.status_code == 200 and len(calls) == 2 and "5h" not in R.STATE["accounts"]["a"]["claims"])
+check("the recovery probe runs before the held request's deadline", 0.04 <= elapsed < R.HOLD_MAX_S)
 check("hold event recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
 R.HOLD_MAX_S = 0
+
+# At the deadline a route can have recovered since the saved 429.
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+calls = []
+clock = [now]
+
+
+async def recover_on_expiry(seconds, request=None, *, wake=None):
+    clock[0] += seconds
+    if seconds:
+        R.STATE["accounts"]["a"]["claims"].pop("5h", None)
+
+
+with patch.object(R, "HOLD_MAX_S", 1), patch.object(R, "retry_wait", recover_on_expiry), patch.object(
+        R, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0],
+                                  strftime=time.strftime, localtime=time.localtime)):
+    r = call()
+check("at hold expiry reselecting uses a recovered account instead of returning the saved 429",
+      r.status_code == 200 and len(calls) == 2 and clock[0] == now + 1)
 
 # Fast-forward the hold waits so the real hold loop can make twelve retries.
 fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
@@ -411,7 +454,7 @@ calls = []
 clock = [now]
 
 
-async def advance_hold(seconds, request=None):
+async def advance_hold(seconds, request=None, *, wake=None):
     clock[0] += seconds
 
 
@@ -444,10 +487,10 @@ async def family_replay(path, ambiguous):
     reset = time.time() + 10000
     wait_for_retry = R.retry_wait
 
-    async def retry_wait(seconds, request):
+    async def retry_wait(seconds, request, *, wake=None):
         if seconds:
             await asyncio.wait_for(opus_done.wait(), 2)
-        await wait_for_retry(seconds, request)
+        await wait_for_retry(seconds, request, wake=wake)
 
     async def respond(req):
         model = json.loads(req.content)["model"]
@@ -543,6 +586,8 @@ check("a late Fable stream close cannot restore old claim readings or reverse th
 
 fresh_state("a", {"a": {"util_7d": 1, "reset_7d": time.time() + 100},
                   "b": {"util_7d": 1, "reset_7d": time.time() + 500}})
+for family in R.MODEL_FAMILIES:
+    R.recovery_probe(family).next_at = time.monotonic() + 60
 
 
 def reject_dispatch(req):
@@ -552,9 +597,9 @@ def reject_dispatch(req):
 use_upstream(reject_dispatch)
 local = call()
 chat_local = call(chat, body=chat_body)
-check("known blocks generate local 429 and chat 503 with Retry-After and no upstream attempt",
-      local.status_code == 429 and chat_local.status_code == 503 and 95 <= int(local.headers["retry-after"]) <= 100
-      and 95 <= int(chat_local.headers["retry-after"]) <= 100
+check("throttled probes return local 429 and chat 503 capped at the next probe opportunity",
+      local.status_code == 429 and chat_local.status_code == 503 and 55 <= int(local.headers["retry-after"]) <= 60
+      and 55 <= int(chat_local.headers["retry-after"]) <= 60
       and all(rec["local"] and "rate_limits" not in rec for rec in audit_recs()))
 
 # --- 8. admin endpoints ------------------------------------------------------

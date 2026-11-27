@@ -511,7 +511,7 @@ def account_eligibility(cfg: dict, state, name: str, family: str = "default"):
                 reading = claims.get(claim, {})
                 reset = reading.get("reset", 0)
                 utilization = reading.get("utilization", 0)
-                if (reset > now and utilization >= 1 or reading.get("status") == "rejected"
+                if ((utilization >= 1 or reading.get("status") == "rejected")
                         and max(reset, reading.get("recheck_at", 0)) > now):
                     reasons.append(f"{claim} window is exhausted")
                 elif claim in limits and (not reset or reset > now) and utilization >= limits[claim]:
