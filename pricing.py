@@ -10,32 +10,37 @@ DEFAULT_PLANS = {"pro": {"price": 20, "weight": 0.2}, "max": {"price": 100, "wei
                  "ultra": {"price": 200, "weight": 2}}  # USD per month; weekly quota vs Max
 
 
-def load_billing(overrides, accounts, base_plans=DEFAULT_PLANS):
-    """Read monthly prices and each account's dated plan timeline."""
-    plans, timelines, errors = dict(base_plans), {}, []
+def load_billing(overrides, accounts, base_plans=DEFAULT_PLANS, *, providers=None):
+    """Read monthly prices and separate Claude and OpenAI plan timelines."""
+    plans, errors = dict(base_plans), []
     for name, plan in (overrides.items() if isinstance(overrides, dict) else ()):
         if (isinstance(plan, dict) and type(plan.get("price")) in (int, float) and plan["price"] >= 0
-                and type(plan.get("weight")) in (int, float) and plan["weight"] > 0):
+                and ("weight" not in plan or (type(plan["weight"]) in (int, float) and plan["weight"] > 0))):
             plans[name] = plan
         else:
-            errors.append(f"plan '{name}' needs a price >= 0 and a weight > 0")
-    for account in accounts:
-        if "billing" not in account:
-            continue
-        name, timeline = account["name"], []
-        try:
-            for entry in account["billing"]:
-                start = date.fromisoformat(entry["from"])
-                if entry["plan"] not in plans or (timeline and start <= timeline[-1][1]):
-                    raise ValueError
-                timeline.append((time.mktime(start.timetuple()), start, entry["plan"], entry.get("renews") is True))
-        except (TypeError, KeyError, ValueError, AttributeError, OverflowError):
-            timeline = []
-        if timeline:
-            timelines[name] = timeline
-        else:
-            errors.append(f"account '{name}': billing needs entries with a 'from' date "
-                          f"(YYYY-MM-DD, increasing) and a plan ({', '.join(plans)})")
+            errors.append(f"plan '{name}' needs a price >= 0 and, if set, a weight > 0")
+    openai = (dict(spec, name=name) for name, spec in (providers.items() if isinstance(providers, dict) else ())
+              if isinstance(spec, dict) and spec.get("kind") == "openai-siwc")
+    timelines = {"claude": {}, "openai": {}}
+    for kind, category, entries in (("claude", "account", accounts), ("openai", "provider", openai)):
+        allowed = [name for name, plan in plans.items() if kind == "openai" or "weight" in plan]
+        for config in entries:
+            if "billing" not in config:
+                continue
+            name, timeline = config["name"], []
+            try:
+                for entry in config["billing"]:
+                    start = date.fromisoformat(entry["from"])
+                    if entry["plan"] not in allowed or (timeline and start <= timeline[-1][1]):
+                        raise ValueError
+                    timeline.append((time.mktime(start.timetuple()), start, entry["plan"], entry.get("renews") is True))
+            except (TypeError, KeyError, ValueError, AttributeError, OverflowError):
+                timeline = []
+            if timeline:
+                timelines[kind][name] = timeline
+            else:
+                errors.append(f"{category} '{name}': billing needs entries with a 'from' date "
+                              f"(YYYY-MM-DD, increasing) and a plan ({', '.join(allowed)})")
     return plans, timelines, errors
 
 
@@ -46,8 +51,9 @@ def plan_at(timeline, ts):
 
 
 def monthly_plan_prices(cfg, ts):
-    plans, timelines, _ = load_billing(cfg.get("plans"), cfg["accounts"])
-    return {name: plans[plan_at(timeline, ts)[2]]["price"] for name, timeline in timelines.items()}
+    plans, timelines, _ = load_billing(cfg.get("plans"), cfg["accounts"], providers=cfg.get("providers"))
+    return {(kind, name): plans[plan_at(timeline, ts)[2]]["price"]
+            for kind, entries in timelines.items() for name, timeline in entries.items()}
 
 
 def token_count(value) -> int:

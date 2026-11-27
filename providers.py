@@ -41,7 +41,7 @@ RESERVED = {"v1", "api", "rotate", "docs", "redoc", ANTHROPIC}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 URL_RE = re.compile(r"^https?://[^/?#\s@]+(/[^?#\s]*)?$")  # no userinfo, query or fragment
 KEYS = {"static-bearer": {"kind", "prefix", "upstream", "token_file"},
-        "openai-siwc": {"kind", "prefix", "images"}}
+        "openai-siwc": {"kind", "prefix", "images", "billing"}}
 TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 # Pinned: a refresh sends the rotating refresh token, so no config may redirect it.
 SIWC_API = "https://api.openai.com"
@@ -540,8 +540,8 @@ class OpenAISiwc:
                     if minutes and prev.get("window_minutes") == minutes:
                         matching_slot = which
                 latest[matching_slot or empty_slot or slot] = window
-                if "plan" not in latest and "plan" in prior:
-                    latest["plan"] = prior["plan"]
+            if "plan" not in latest and "plan" in prior:
+                latest["plan"] = prior["plan"]
             self.quotas[limit] = latest
         self.quota_history.cap_series()
 

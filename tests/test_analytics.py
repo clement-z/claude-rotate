@@ -322,4 +322,50 @@ check("a file from before the ledger gets only the ledger rebuilt",
       R.ROLLUP["accounts"][iso(2)]["a"]["requests"] == 1 and R.ROLLUP["quota"][iso(1)]["a"] == [110.0, 1800]
       and R.ROLLUP["days"] == {})
 
+# Provider billing backfills only its own ledger, even if a Claude account shares its name.
+first = today.replace(day=1)
+previous = (first - dt.timedelta(days=1)).replace(day=1)
+R.CFG["plans"]["chatgpt-prolite"] = {"price": 50}
+R.CFG["providers"] = {"a": {"kind": "openai-siwc",
+                          "billing": [{"from": previous.isoformat(), "plan": "chatgpt-prolite"}]}}
+provider = object.__new__(R.providers.OpenAISiwc)
+provider.quotas = {}
+R.PROVIDERS = {"a": provider}
+R.BILLING = R.load_billing()
+existing = empty_rollup() | {"quota": {}, "accounts": {today.isoformat(): {"a": {"cost_usd": 7}}}}
+R.USAGE_PATH.write_text(json.dumps(existing))
+
+
+def provider_line(day, path, method="POST"):
+    return json.dumps({"ts": f"{day}T10:00:00+0000", "device": "laptop", "provider": "a",
+                       "path": path, "method": method, "model": "gpt-6.2-sol",
+                       "usage": {"output_tokens": 1_000_000}}) + "\n"
+
+
+Path(f"{R.AUDIT_PATH}.1").write_text(provider_line(previous, "/old-prefix/v1/chat/completions"))
+R.AUDIT_PATH.write_text("".join([
+    provider_line(today, "/openai/v1/responses"),
+    provider_line(today, "/openai/v1/models", "GET"),
+    provider_line(today, "/openai/v1/images/generations"),
+    provider_line(today, "/openai/v1/alpha/search"),
+]))
+R.load_rollup()
+provider_report = R.provider_billing_report(today)["a"]
+current, prior = provider_report["periods"]
+check("provider billing backfills model requests by period without changing existing totals",
+      {k: v for k, v in R.ROLLUP.items() if k != "providers"} == existing
+      and current["usage"]["requests"] == prior["usage"]["requests"] == 1
+      and current["usage"]["cost_usd"] == prior["usage"]["cost_usd"] == 10
+      and current["price"] == provider_report["price"] == 50
+      and provider_report["renews"] == R.month_add(first, 1).isoformat()
+      and current["used"] is None and current["limited_h"] is None)
+R.roll_up(json.loads(provider_line(today, "/openai/v1/responses")), today.isoformat())
+R.save_rollup()
+R.load_rollup()
+check("provider billing keeps new usage across restart and leaves Claude plan comparisons alone",
+      R.provider_billing_report(today)["a"]["periods"][0]["usage"]["cost_usd"] == 20
+      and R.ROLLUP["accounts"] == existing["accounts"]
+      and all(item["plan"] != "chatgpt-prolite" for row in R.billing_report(today)["a"]["periods"]
+              for item in row["whatif"]))
+
 print(f"\nall {PASS} checks passed")

@@ -443,6 +443,47 @@ async def reporting(c):
           and not any(s in log for s in SECRETS + list(KEY.values())))
 
 
+async def provider_billing(c):
+    plan = "chatgpt-prolite"
+    bill = [{"from": "2026-11-01", "plan": plan}]
+    specs = {
+        "openai": {"kind": "openai-siwc", "billing": bill},
+        "broken": {"kind": "openai-siwc", "billing": [{"from": "invalid", "plan": plan}]},
+        "unknown": {"kind": "openai-siwc", "billing": [{"from": "2026-11-01", "plan": "unknown-plan"}]},
+    }
+    live = P.load_providers({"providers": specs}, tmp, tmp)
+    now = time.time()
+    capacity = R.weekly_outlook(now)["capacity"]
+    try:
+        with patch.dict(R.CFG, {"providers": specs, "plans": {plan: {"price": 50}}}), patch.multiple(
+                R, PROVIDERS=live, PLANS=dict(R.PLANS), BILLING={}, PROVIDER_BILLING={}, BILLING_ERRORS=[]):
+            R.BILLING = R.load_billing()
+            provider = live["openai"]
+            window = {"used_percent": 20, "window_minutes": 10080, "resets_at": now + 3600}
+            provider.record_quotas({"codex": {"primary": window, "plan": "pro_lite"}}, "usage", now)
+            provider.record_quotas({"codex": {"primary": window | {"window_minutes": 300},
+                                             "secondary": window}}, "inference", now)
+            status = (await ask(c, "/rotate/status", "claude")).json()
+            check("provider billing accepts a price-only plan and preserves the reported plan across headers",
+                  status["providers"]["openai"]["billing"] ==
+                  {"plan": plan, "price": 50, "reported_plan": "pro_lite", "plan_mismatch": False}
+                  and set(R.PROVIDER_BILLING) == {"openai"})
+            check("OpenAI billing leaves Claude weekly capacity unchanged",
+                  status["weekly"]["capacity"] == capacity and not R.BILLING)
+            provider.record_quotas({"codex": {"primary": window, "plan": "plus"}}, "usage", now)
+            stats = (await ask(c, "/rotate/stats", "claude")).json()
+            check("provider subscriptions show reported plan mismatches and flag invalid billing in alerts",
+                  stats["provider_billing"]["openai"]["plan_mismatch"]
+                  and stats["provider_billing"]["openai"]["reported_plan"] == "plus"
+                  and all(any(f"billing ignored: provider '{name}'" in alert["text"] for alert in stats["alerts"])
+                          for name in ("broken", "unknown"))
+                  and set(stats["provider_billing"]) == {"openai"})
+    finally:
+        for provider in live.values():
+            await provider.client.aclose()
+            await provider.auth.aclose()
+
+
 async def device_pins(c):
     accounts = dict(R.ACCOUNTS, backup={"name": "backup", "token": "fake-backup-token"})
     pins = {"claude": {"account": "backup", "mode": "strict"},
@@ -624,6 +665,7 @@ async def main():
         await panel(c)
         await quota_rate_worker(c)
         await reporting(c)
+        await provider_billing(c)
         check("no refresh was attempted", seen["auth"] == [])
         await connection_lines(c)
         await device_pins(c)

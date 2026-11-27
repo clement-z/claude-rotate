@@ -256,6 +256,20 @@ elements.tip.parentNode=new Element();
     assert(!html(elements[id]).includes('<mark'),id+' contains raw markup');
     assert(html(elements[id]).includes('&lt;mark'),id+' lost escaped text');
   }
+  assert(!elements.billing.innerHTML.includes('ChatGPT plan'),'an unbilled provider has no subscription section');
+  stats.provider_billing={[value]:{plan:value,reporting_plan:value,reported_plan:value,plan_mismatch:true,price:50,
+    periods:[{start:'2026-11-01',end:'2026-12-01',plans:[value],price:50,days:30,elapsed:28,
+              used:null,limited_h:null,usage:{cost_usd:150}}]}};
+  status.providers[value].billing={plan:value,reported_plan:value};
+  await timers.get(10000)();
+  assert(!elements.billing.innerHTML.includes('<mark')&&elements.billing.innerHTML.includes('ChatGPT plan &lt;mark'));
+  assert(elements.billing.innerHTML.includes('Plan differs')&&elements.billing.innerHTML.includes('3.0&times; the price'));
+  assert(elements.billing.innerHTML.includes('<td data-l="Weekly use">–</td>')
+     && elements.billing.innerHTML.includes('<td data-l="At its limit">&ndash;</td>'));
+  assert(html(elements.oai).includes('Configured &lt;mark'));
+  delete stats.provider_billing;
+  delete status.providers[value].billing;
+  await timers.get(10000)();
   const oai=html(elements.oai);
   assert.equal(oai.split('ChatGPT plan').length-1,2,'one quota card per openai-siwc provider, none for static-bearer');
   assert(!oai.includes(value+'-static')&&!oai.includes('&lt;mark data-audit=&quot;marker&quot;&gt;&amp;&#39;&quot;&lt;/mark&gt;-static'),'static-bearer provider got a quota card');

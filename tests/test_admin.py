@@ -299,6 +299,24 @@ def test_status_has_no_secrets(f):
     assert "token validity is only visible through real upstream traffic" in human.stdout
 
 
+def test_status_provider_billing(f):
+    f.set_active(False)
+    original = f.config.read_bytes()
+    cfg = f.cfg()
+    cfg["plans"] = {"chatgpt-prolite": {"price": 50}}
+    cfg["providers"] = {"openai": {"kind": "openai-siwc",
+                                  "billing": [{"from": "2026-11-01", "plan": "chatgpt-prolite"}]}}
+    try:
+        f.config.write_text(json.dumps(cfg))
+        r = f.run("status", "--json")
+        assert r.returncode == 0, r
+        assert json.loads(r.stdout)["provider_billing"] == {"openai": {"plan": "chatgpt-prolite", "price": 50}}
+        human = f.run("status")
+        assert human.returncode == 0 and "provider openai: configured plan chatgpt-prolite, $50/mo" in human.stdout
+    finally:
+        f.config.write_bytes(original)
+
+
 def test_status_live_query_uses_header(f):
     seen = {}
     now = round(time.time())
@@ -795,7 +813,8 @@ def main():
              "test_add_token_and_renewal", "test_add_user_activation_and_duplicates",
              "test_readiness_needs_enabled_nonempty_token", "test_inherited_lock_descriptor",
              "test_restart_failure_is_reported", "test_concurrent_add_users_are_serialized",
-             "test_status_has_no_secrets", "test_status_live_query_uses_header", "test_status_reports_malformed_config_pin",
+             "test_status_has_no_secrets", "test_status_provider_billing",
+             "test_status_live_query_uses_header", "test_status_reports_malformed_config_pin",
              "test_ratelimits_live_offline_and_rotated",
              "test_rotate_rejections_do_not_mutate", "test_rotate_refuses_split_route_noop",
              "test_rotate_switches_after_stop_and_preserves_state",

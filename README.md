@@ -484,7 +484,7 @@ dollar. It multiplies the median dollars per point by 100 and divides by
 the account's current monthly plan price prorated over the window, using
 365.25/12 days per month. The interquartile range uses the same conversion.
 Fable 7d assumes Fable-only use of the Fable allowance. Add `billing` to an
-account in `config.json` to show its value. The estimate uses API list prices
+account or OpenAI provider in `config.json` to show its value. The estimate uses API list prices
 and excludes outside-only usage where detected.
 
 JSON retains the summary, dollars and tokens per point, and the original
@@ -594,6 +594,28 @@ path prefix; the bare root stays the rotated Claude accounts, unchanged.
   which its reuse detection may answer by revoking the sign-in's tokens; the
   proxy holds none of them by then. This does not rely on any grace period for a
   rotated token: OpenAI does not document one for this flow.
+- **OpenAI billing.** Add a monthly price under `plans` and the same dated
+  `billing` timeline used for accounts to the `openai-siwc` entry in
+  `config.json`. The first entry sets the renewal day. An entry with
+  `"renews": true` restarts the cycle. Replace the example price with what
+  you pay.
+
+  ```json
+  "plans": {"chatgpt-prolite": {"price": 50}},
+  "providers": {
+    "openai": {"kind": "openai-siwc",
+               "billing": [{"from": "2026-11-01", "plan": "chatgpt-prolite"}]}
+  }
+  ```
+
+  The plan needs no Claude quota weight. Subscriptions compares the
+  configured plan with the ChatGPT plan reported by the backend when
+  available and flags different names. It totals API-equivalent spend for
+  Responses and Chat Completions requests by billing period. OpenAI weekly
+  use and time at the limit show dashes. Assigning Sign in with ChatGPT
+  inference to the Codex limit is unconfirmed, and image requests carry no
+  token counts for estimating image value. On upgrade, OpenAI spending
+  for past days is recovered from retained audit logs.
 - **Status.** `/rotate/status` gives each provider a state: `ok`; `unavailable`
   when the access token has expired and no refresh can be made yet; `down` after
   a refusal or without a credential. Apart from the state, `unsaved` is set when
@@ -777,7 +799,8 @@ can lose readings since the last successful save.
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `accounts[].billing` | the account's plans over time, for the panel's Subscriptions card and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra"}]`. The first date sets the monthly renewal day; a later entry changes plan from its date and keeps the renewal day (Anthropic prorates upgrades). Add `"renews": true` to an entry that restarts the billing cycle, such as Pro to Max. Record a downgrade with the renewal date it takes effect on. A broken entry is ignored and shown as a panel alert. |
-| `plans{}` | extra or corrected plans: `name → {"price": USD a month, "weight": weekly quota relative to Max}`. Built in: `pro` (20, 0.2), `max` (100, 1), `ultra` (200, 2); Anthropic states Max as 5 times Pro every week and Ultra as 10 times. |
+| `providers.<name>.billing` | optional for `openai-siwc`, with the same timeline format and validation as `accounts[].billing`. Used for Subscriptions and Quota rates. |
+| `plans{}` | extra or corrected plans: `name → {"price": USD a month}`. Claude plans also need `"weight"`, the weekly quota relative to Max. Built in: `pro` (20, 0.2), `max` (100, 1), `ultra` (200, 2). OpenAI plan prices come from the config. |
 | `accounts[].weight` | weekly capacity relative to a Max account, for accounts without `billing` (default 1): an Ultra is `2`, a Pro `0.2`. With `billing`, the plan sets it. |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | preferred switching threshold for the 7d and Fable 7d claims (default 0.98) |

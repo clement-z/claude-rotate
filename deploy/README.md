@@ -148,6 +148,24 @@ logs. The summary reports remaining quota and time left based on the last
 24 h of quota readings. It can run with the service stopped. See
 [quota-rate estimation](../README.md#estimating-usage-per-quota-point).
 
+To show subscription value and period costs for an OpenAI provider, edit
+`config.json` and merge these entries into `plans` and `providers`. Use
+your actual monthly price in place of the example.
+
+```json
+"plans": {"chatgpt-prolite": {"price": 50}},
+"providers": {
+  "openai": {"kind": "openai-siwc",
+             "billing": [{"from": "2026-11-01", "plan": "chatgpt-prolite"}]}
+}
+```
+
+`claude-rotate-admin status` shows the configured provider plan. The panel
+also shows the plan reported by ChatGPT when available. OpenAI billing
+periods sum Responses and Chat Completions usage. Assigning Sign in with
+ChatGPT inference to the Codex limit is unconfirmed. Image requests carry
+no tokens, so image value is unavailable.
+
 Claude audit lines store `util` as numeric utilization by claim ID.
 `ratelimit` captures Fable answers and claim-set changes per account and
 family. `rate_limits` retains upstream 429 attempts and their verdicts,

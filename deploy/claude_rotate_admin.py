@@ -1375,6 +1375,12 @@ def collect_status():
     except Refused as exc:
         state, report["state_error"] = None, str(exc)
     now = time.time()
+    pricing, _ = quota_rate_modules()
+    plans, timelines, _ = pricing.load_billing(cfg.get("plans"), (), providers=cfg.get("providers"))
+    report["provider_billing"] = {
+        name: {"plan": plan, "price": plans[plan]["price"]}
+        for name, timeline in timelines["openai"].items() for plan in (pricing.plan_at(timeline, now)[2],)
+    }
     state = state or {}
     legacy_active = state.get("active_account") or default_state(cfg)["active_account"]
     routes = state.get("routes") or {}
@@ -1426,7 +1432,7 @@ def collect_status():
                               "storage_errors": live.get("storage_errors"),
                               "providers": {n: {k: p.get(k) for k in (
                                   "kind", "prefix", "state", "reason", "unsaved", "last_error", "client_id", "host_id",
-                                  "access_token_min", "refresh_token_days", "images", "quotas")}
+                                  "access_token_min", "refresh_token_days", "images", "quotas", "billing")}
                                   for n, p in object_fields(live.get("providers")).items() if isinstance(p, dict)},
                               "accounts": {n: live_account_view(cfg, a, now)
                                            for n, a in object_fields(live.get("accounts")).items()
@@ -1542,6 +1548,8 @@ def cmd_status(args) -> int:
             + (f"; providers {', '.join(map(str, device['providers']))}"
                if device["providers"] != [ANTHROPIC] else "")
             + (f"; Claude routing {routing}" if pin else ""))
+    for name, bill in report["provider_billing"].items():
+        out(diagnostic_text(f"  provider {name}: configured plan {bill['plan']}, ${bill['price']:g}/mo"))
     if live:
         errors = live.get("storage_errors") or {}
         out("live /rotate/status: reachable; storage_errors: " + (json.dumps(errors) if errors else "none"))
@@ -1784,7 +1792,7 @@ def print_quota_summary(summary):
     for row in rows:
         out("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
     out("Value assumes full use of the window at API list prices. Fable 7d assumes Fable-only use of the Fable allowance.")
-    out("Add billing to an account in config.json to show its value.")
+    out("Add billing to an account or OpenAI provider in config.json to show its value.")
 
 
 def print_quota_rates(report):

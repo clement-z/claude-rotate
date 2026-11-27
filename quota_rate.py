@@ -141,6 +141,12 @@ def request_usage(record, at, prices, provider=None):
     return RequestUsage(at, tokens, cost, fable)
 
 
+def openai_model_request(record):
+    path = record.get("path")
+    return (record.get("method", "POST") == "POST" and isinstance(path, str)
+            and path.removeprefix("/").partition("/")[2] in OPENAI_ENDPOINTS)
+
+
 def collect_audit(records, accounts, providers, start, now, prices):
     readings = defaultdict(ReadingSeries)
     traffic = defaultdict(list)
@@ -158,9 +164,8 @@ def collect_audit(records, accounts, providers, start, now, prices):
         if record.get("method", "POST") != "POST":
             continue
         if isinstance(provider, str) and provider in providers:
-            path = record.get("path")
             # The audit provider identifies the account even after a URL prefix rename.
-            if isinstance(path, str) and path.removeprefix("/").partition("/")[2] in OPENAI_ENDPOINTS:
+            if openai_model_request(record):
                 traffic[("openai", provider, "codex")].append(request_usage(record, at, prices, provider))
         elif not provider and isinstance(account, str) and account in accounts:
             if record.get("path") not in CLAUDE_PATHS:
@@ -580,7 +585,7 @@ def add_subscription_values(series, monthly_prices):
     for row in series:
         name, limit = row["name"], row["limit"]
         minutes = row["minutes"] or CLAUDE_WINDOW_MINUTES.get(limit)
-        price = subscription_window_price(monthly_prices.get(name), minutes) if row["kind"] == "claude" else None
+        price = subscription_window_price(monthly_prices.get((row["kind"], name)), minutes)
         cost = row["usd_per_percent"]
         value = {k: subscription_value(v, price) for k, v in cost.items()} if cost else None
         row["subscription_window_usd"] = price

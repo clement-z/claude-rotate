@@ -38,8 +38,9 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
             {"from": "2020-01-01", "plan": "team", "renews": True},
             {"from": "2099-01-01", "plan": "ultra"},
         ]}, {"name": "b", "token_file": "b.token"}],
-        "plans": {"team": {"price": 120, "weight": 1}},
-        "devices": {}, "providers": {"work": {"kind": "openai-siwc", "prefix": "/openai"},
+        "plans": {"team": {"price": 120, "weight": 1}, "chatgpt-prolite": {"price": 50}},
+        "devices": {}, "providers": {"work": {"kind": "openai-siwc", "prefix": "/openai",
+                                              "billing": [{"from": "2020-01-01", "plan": "chatgpt-prolite"}]},
                                      "lan": {"kind": "static-bearer"}},
     }))
     state = root / "var/lib/claude-rotate"
@@ -161,6 +162,14 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     check("image byte counts cannot estimate dollars or tokens",
           images["intervals"] == 1 and not images["traffic_attributed"] and images["usd_per_percent"] is None
           and images["tokens_per_percent"] is None and images["remaining"]["usd"] is None)
+    check("OpenAI billing prices the Codex week and the image day",
+          math.isclose(codex["value_multiple"]["median"], .2554 * 100 / (50 * 7 / (365.25 / 12)))
+          and math.isclose(images["subscription_window_usd"], 50 / (365.25 / 12))
+          and images["value_multiple"] is None)
+    priced_image = dict(images, usd_per_percent={"median": .5, "q1": None, "q3": None})
+    quota_rate.add_subscription_values([priced_image], {("openai", "work"): 50})
+    check("the value conversion uses the 24-hour window when given an image rate",
+          math.isclose(priced_image["value_multiple"]["median"], 365.25 / 12))
     check("sparse account shows its latest utilization and plain insufficient estimates",
           rows["b", "7d"]["usd_per_percent"] is None and rows["b", "7d"]["remaining"]["hours"] is None
           and rows["b", "7d"]["fable_fit"]["n"] == 0 and rows["b", "7d"]["fable_fit"]["a"] is None)
@@ -177,10 +186,11 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
               "samples": 6,
               "legacy_history_samples": 4,
           })
-    check("unpriced accounts and providers have no multiple even if per-point cost is known",
+    unpriced_codex = dict(codex)
+    quota_rate.add_subscription_values([unpriced_codex], {("claude", "work"): 50})
+    check("unpriced accounts and providers do not borrow each other's billing",
           summary["b", "7d"]["value_multiple"] is None and summary["b", "7d"]["subscription_window_usd"] is None
-          and summary["work", "codex 7d"]["usd_per_percent"] is not None
-          and summary["work", "codex 7d"]["value_multiple"] is None)
+          and unpriced_codex["usd_per_percent"] is not None and unpriced_codex["value_multiple"] is None)
 
     r = run()
     summary_output = r.stdout
@@ -189,11 +199,11 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           r.returncode == 0 and sep and "Account" in table and "Samples" in table
           and all(label in table for label in ("Value ($/$)", "2.7x (1.8–3.6x)", "Fable 7d", "codex 7d",
                                                "images 24h", "1.67 h"))
-          and table.count("Add billing to an account in config.json") == 1
+          and table.count("Add billing to an account or OpenAI provider in config.json") == 1
           and "Fable-only use of the Fable allowance" in table
           and "Cost per 1%: $0.75 median" in details and "Tokens per 1%:" in details
           and "Fable 2.0x the quota per $ of other models (Fable 1.8x, other 3.6x API $ per subscription $)" in details
-          and next(line for line in table.splitlines() if "codex 7d" in line).split()[4] == "-")
+          and next(line for line in table.splitlines() if "codex 7d" in line).split()[4] == "2.2x")
 
     r = run("--days", "1", "--min-step", "25")
     check("human output uses flags and marks insufficient data",
