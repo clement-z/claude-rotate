@@ -682,9 +682,9 @@ def cmd_add_user(args) -> int:
         removed = [k for k, v in cfg["devices"].items() if PLACEHOLDER in (device_key(v) or "")]
         for name in removed:
             del cfg["devices"][name]
-        key = f"dev-{args.name}-{secrets.token_hex(8)}"
+        key = f"dev-{args.name}-{secrets.token_hex(16)}"
         while key in {device_key(v) for v in cfg["devices"].values()}:
-            key = f"dev-{args.name}-{secrets.token_hex(8)}"
+            key = f"dev-{args.name}-{secrets.token_hex(16)}"
         cfg["devices"][args.name] = key if names == [ANTHROPIC] else {"key": key, "providers": names}
         write_config(cfg)
         for name in removed:

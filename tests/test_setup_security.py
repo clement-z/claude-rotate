@@ -1,6 +1,7 @@
 """Exercise setup with copied files, dummy secrets and no real service access."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -35,6 +36,8 @@ def main():
         cfg_path = root / "config.json"
         cfg_path.chmod(0o644)
         assert run("add-device", "Alice_01-laptop").returncode == 0
+        key = json.loads(cfg_path.read_text())["devices"]["Alice_01-laptop"]
+        assert re.fullmatch(r"dev-Alice_01-laptop-[0-9a-f]{32}", key)
         assert cfg_path.stat().st_mode & 0o777 == 0o600
         assert (root / "tokens").stat().st_mode & 0o777 == 0o700
         assert run("add-account", "audit-account", input="sk-ant-oat01-dummy-test\n").returncode == 0

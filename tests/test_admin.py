@@ -174,7 +174,7 @@ def test_add_user_activation_and_duplicates(f):
     assert r.returncode == 0, r
     cfg = f.cfg()
     key = cfg["devices"]["alice-laptop"]
-    assert key.startswith("dev-alice-laptop-") and len(key) == len("dev-alice-laptop-") + 16
+    assert key.startswith("dev-alice-laptop-") and len(key) == len("dev-alice-laptop-") + 32
     assert f"export CLAUDE_CODE_OAUTH_TOKEN={key}" in r.stdout
     assert "export ANTHROPIC_BASE_URL=" in r.stdout
     assert "is live" in r.stdout

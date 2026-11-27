@@ -55,7 +55,7 @@ init)
     echo "  python3 rotator.py"
     ;;
 add-device)
-    key="dev-${name}-$(openssl rand -hex 8)"
+    key="dev-${name}-$(openssl rand -hex 16)"
     python3 - "$name" "$key" <<'EOF'
 import json, sys
 cfg = json.load(open("config.json"))
