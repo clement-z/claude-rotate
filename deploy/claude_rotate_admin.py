@@ -1418,10 +1418,6 @@ def collect_status():
             report["live"] = {"active_account": live.get("active_account"),
                               "active_by_family": {f: object_fields(live.get("active_by_family")).get(
                                   f, live.get("active_account")) for f in MODEL_FAMILIES},
-                              "device_pins": {n: pin_view(p.get("account_pin"), p.get("source"))
-                                              for n, p in object_fields(
-                                                  live.get("device_pins", report["device_pins"])).items()
-                                              if isinstance(p, dict)},
                               "storage_errors": live.get("storage_errors"),
                               "providers": {n: {k: p.get(k) for k in (
                                   "kind", "prefix", "state", "reason", "unsaved", "last_error", "client_id", "host_id",
@@ -1430,6 +1426,9 @@ def collect_status():
                               "accounts": {n: live_account_view(cfg, a, now)
                                            for n, a in object_fields(live.get("accounts")).items()
                                            if isinstance(a, dict)}}
+            if isinstance(pins := live.get("device_pins"), dict):
+                report["live"]["device_pins"] = {n: pin_view(p.get("account_pin"), p.get("source"))
+                                                  for n, p in pins.items() if isinstance(p, dict)}
         else:
             report["live_error"] = problem
     return report
@@ -1507,11 +1506,14 @@ def cmd_status(args) -> int:
         for family, block in view["blocks_by_family"].items():
             out(f"    {family} blocked until {fmt_time(block['until'])} ({block['reason']})")
     out("devices:")
+    pins_reported = live is not None and "device_pins" in live
+    pins = live["device_pins"] if pins_reported else report["device_pins"]
     for device in report["devices"]:
-        pin = (live or report)["device_pins"].get(device["name"], {})
+        pin = pins.get(device["name"], {})
         route = pin.get("account_pin")
         if route:
-            routing = f"{route['account']}, {route['mode']} ({pin['source']})"
+            source = "configured, inactive on running version" if live and not pins_reported else pin["source"]
+            routing = f"{route['account']}, {route['mode']} ({source})"
         elif pin.get("source") == "config":
             routing = "invalid config pin"
         else:

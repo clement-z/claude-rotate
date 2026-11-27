@@ -349,6 +349,13 @@ service. Never `git pull` or `pip install` into the active release. Update
 config separately with the admin command; restart is required for
 configuration/token changes.
 
+Before upgrading to the release with Claude family routing and device pins,
+stop the service and back up `/var/lib/claude-rotate/state.json` and
+`/etc/claude-rotate/config.json`. The one-way state migration runs on first
+start. To roll back, restore both backups with the service stopped before
+starting the older release, which rejects `account_pin` in config.
+Panel device-pin overrides clear on every restart.
+
 For a manual promotion or a rollback to a kept release, as root, stop the
 service, then replace the root-owned `current` symlink atomically on the same
 filesystem:

@@ -390,10 +390,13 @@ def test_status_live_query_uses_header(f):
         human = f.run("status")
         assert human.returncode == 0 and "default acct-2, fable acct-2" in human.stdout, human
         assert "General weekly: 64% used" in human.stdout and "Fable weekly:" not in human.stdout
-        assert "5h:" not in human.stdout and "acct-2, strict (config)" in human.stdout
+        assert "5h:" not in human.stdout and "acct-2, strict (configured, inactive on running version)" in human.stdout
         r = f.run("status", "--json")
         assert r.returncode == 0, r
-        assert set(json.loads(r.stdout)["live"]["accounts"]["acct-1"]["claims"]) == {"7d"}
+        report = json.loads(r.stdout)
+        assert set(report["live"]["accounts"]["acct-1"]["claims"]) == {"7d"}
+        assert report["device_pins"][device] == {"account_pin": pin, "source": "config"}
+        assert "device_pins" not in report["live"]
     finally:
         server.shutdown()
         server.server_close()
