@@ -37,6 +37,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 import weakref
 from collections import deque
@@ -52,7 +53,7 @@ from starlette.datastructures import MutableHeaders
 
 import providers
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
-from providers import ANTHROPIC
+from providers import ANTHROPIC, HISTORY_DAYS
 
 ROOT = Path(__file__).parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_ROTATE_CONFIG", ROOT / "config.json"))
@@ -72,9 +73,13 @@ PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip", "x-o
 @asynccontextmanager
 async def lifespan(app):
     tasks = [asyncio.create_task(refresh_loop()), asyncio.create_task(providers.maintain_loop(PROVIDERS))]
-    yield
-    for task in tasks:
-        task.cancel()
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        save_quota_history(time.time())
 
 
 app = FastAPI(lifespan=lifespan)
@@ -567,9 +572,11 @@ async def refresh_loop() -> None:
     while True:
         if REFRESH_IDLE_S:
             await refresh_idle_accounts()
-        record_history(time.time())
+        now = time.time()
+        record_history(now)
         save_rollup()
         save_quotas()
+        save_quota_history(now)
         await asyncio.sleep(60)
 
 
@@ -612,9 +619,83 @@ def save_quotas() -> None:
         storage_error("quotas_write", exc)
 
 
+QUOTA_HISTORY_PATH = STATE_PATH.with_name("provider_quota_history.json")
+QUOTA_HISTORY_VERSION = 1
+QUOTA_HISTORY_CLEANUP = False
+
+
+def quota_histories() -> dict:
+    return {name: p.quota_history for name, p in PROVIDERS.items()
+            if isinstance(p, providers.OpenAISiwc)}
+
+
+def quota_history_snapshot(now: float) -> dict:
+    return {name: series for name, history in quota_histories().items()
+            if (series := history.snapshot(now))}
+
+
+def load_quota_history() -> None:
+    global QUOTA_HISTORY_CLEANUP
+    try:
+        saved = json.loads(QUOTA_HISTORY_PATH.read_text())
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"warning: ignoring {QUOTA_HISTORY_PATH} ({type(exc).__name__})", file=sys.stderr)
+        return
+    if (not isinstance(saved, dict) or type(saved.get("version")) is not int
+            or saved["version"] != QUOTA_HISTORY_VERSION or not isinstance(saved.get("providers"), dict)):
+        print(f"warning: ignoring {QUOTA_HISTORY_PATH} (unsupported history format)", file=sys.stderr)
+        return
+    now = time.time()
+    cutoff = now - HISTORY_DAYS * 86400
+    for name, history in quota_histories().items():
+        series = saved["providers"].get(name)
+        if not isinstance(series, list):
+            continue
+        for entry in series:
+            if not isinstance(entry, dict) or not isinstance(entry.get("points"), list):
+                continue
+            for point in entry["points"]:
+                if (isinstance(point, list) and len(point) == 4
+                        and providers.number(point[0]) and cutoff <= point[0] <= now):
+                    history.add(entry.get("limit"), entry.get("minutes"), point)
+        history.cap_series()
+        history.dirty = False
+    QUOTA_HISTORY_CLEANUP = saved["providers"] != quota_history_snapshot(now)
+
+
+def save_quota_history(now: float) -> None:
+    global QUOTA_HISTORY_CLEANUP
+    histories = quota_histories().values()
+    for history in histories:
+        history.prune(now)
+    if not QUOTA_HISTORY_CLEANUP and not any(h.dirty for h in histories):
+        return
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=QUOTA_HISTORY_PATH.parent,
+                                         prefix=".provider_quota_history.", suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            json.dump({"version": QUOTA_HISTORY_VERSION, "providers": quota_history_snapshot(now)}, f)
+        tmp.replace(QUOTA_HISTORY_PATH)
+    except OSError as exc:
+        storage_error("quota_history_write", exc)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    else:
+        QUOTA_HISTORY_CLEANUP = False
+        for history in histories:
+            history.dirty = False
+
+
 load_quotas()
+load_quota_history()
 HISTORY_PATH = STATE_PATH.with_name("usage_history.json")
-HISTORY_DAYS, SAMPLE_S, PROJECT_DAYS = 14, 1800, 7.5
+SAMPLE_S, PROJECT_DAYS = 1800, 7.5
 
 
 def load_history() -> list:
@@ -2064,7 +2145,7 @@ async def forward(request: Request, prov, device: str, path: str, body: bytes, h
         rec["retries"] = retries
     rec.update(notes)
     if hasattr(prov, "record_quotas"):
-        prov.record_quotas(upstream.headers, "inference")
+        prov.record_quotas(providers.quota_snapshots(upstream.headers), "inference", time.time())
     # Upstream cookies belong to the upstream. A provider page opened in a browser must
     # not run script on this origin, where the panel and device keys are used.
     # Uvicorn adds its own Date and Server; the upstream's would make a second of each.
@@ -2162,7 +2243,7 @@ async def image_proxy(request: Request, prov, device: str, endpoint: str, path: 
             return unavailable(502, f"the ChatGPT backend is unreachable: {providers.connect_failure(exc)}",
                                "api_error")
         login.note_answer(upstream.status_code)
-        prov.record_quotas(upstream.headers, "images")
+        prov.record_quotas(providers.quota_snapshots(upstream.headers), "images", time.time())
         rec["status"] = upstream.status_code
         if retries:
             rec["retries"] = retries

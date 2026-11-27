@@ -59,6 +59,13 @@ CODEX_REFRESH_FALLBACK_S = 8 * 86400  # Codex's age rule, for a token without a 
 # no model call. The Sign in with ChatGPT route carries no quota headers on /responses.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 USAGE_POLL_S = 300
+HISTORY_DAYS = 14
+QUOTA_BUCKET_S = 300
+QUOTA_MAX_SERIES = 16
+QUOTA_MAX_POINTS = HISTORY_DAYS * 86400 // QUOTA_BUCKET_S + 1
+QUOTA_SOURCES = {"usage", "images", "inference"}
+QUOTA_ID = re.compile(r"[a-z0-9_]{1,48}")
+QUOTA_RESET_MAX = 253402300800  # the end of year 9999
 # Refresh errors that only a new sign-in repairs.
 FATAL = {"invalid_grant", "invalid_client", "refresh_token_reused",
          "refresh_token_expired", "refresh_token_invalidated"}
@@ -205,6 +212,54 @@ class StaticBearer:
                 "state": "down" if self.down else "ok", "reason": self.down}
 
 
+class QuotaHistory:
+    def __init__(self):
+        self.series: dict = {}  # (limit, minutes) -> UTC bucket -> observation
+        self.dirty = False
+
+    def add(self, limit, minutes, point) -> None:
+        seen, used, reset, source = point
+        if not (isinstance(limit, str) and QUOTA_ID.fullmatch(limit)
+                and type(minutes) is int and 0 < minutes < 1e15
+                and number(seen) and seen > 0 and number(used) and 0 <= used <= 100
+                and (reset is None or number(reset) and 0 < reset < QUOTA_RESET_MAX)
+                and isinstance(source, str) and source in QUOTA_SOURCES):
+            return
+        bucket = int(seen // QUOTA_BUCKET_S)
+        points = self.series.setdefault((limit, minutes), {})
+        prior = points.get(bucket)
+        if prior is None or seen >= prior[0]:
+            points[bucket] = point
+            if len(points) > QUOTA_MAX_POINTS:
+                del points[min(points)]
+            self.dirty = True
+
+    def cap_series(self) -> None:
+        while len(self.series) > QUOTA_MAX_SERIES:
+            oldest = min(self.series, key=lambda key: max(self.series[key].values())[0])
+            del self.series[oldest]
+            self.dirty = True
+
+    def prune(self, now: float) -> None:
+        cutoff = now - HISTORY_DAYS * 86400
+        for key, points in list(self.series.items()):
+            for bucket, point in list(points.items()):
+                if not cutoff <= point[0] <= now:
+                    del points[bucket]
+                    self.dirty = True
+            if not points:
+                del self.series[key]
+
+    def snapshot(self, now: float) -> list:
+        out = []
+        cutoff = now - HISTORY_DAYS * 86400
+        for (limit, minutes), buckets in sorted(self.series.items()):
+            points = [p for p in sorted(buckets.values()) if cutoff <= p[0] <= now]
+            if points:
+                out.append({"limit": limit, "minutes": minutes, "points": points})
+        return out
+
+
 class OpenAISiwc:
     kind = "openai-siwc"
     upstream = SIWC_API
@@ -225,6 +280,7 @@ class OpenAISiwc:
         self.refreshes, self.failures, self.retry_at = 0, 0, 0.0
         self.refreshed_at = 0.0  # when the token endpoint was last asked, for any reason
         self.quotas: dict = {}  # quota headers last seen on its answers, by limit id
+        self.quota_history = QuotaHistory()
         self.rec = self._load()
         self.images = CodexLogin(name, state_dir) if spec.get("images") is True else None
 
@@ -426,8 +482,8 @@ class OpenAISiwc:
             except Exception as exc:
                 print(f"warning: provider {self.name}: usage query failed ({type(exc).__name__})", file=sys.stderr)
                 usage = None
-            for limit, figures in (usage or {}).items():
-                self.quotas[limit] = figures | {"route": "usage", "seen_at": int(time.time())}
+            if usage:
+                self.record_quotas(usage, "usage", time.time())
         if not self.rec:
             return
         if self.unsaved:  # also a refusal or a lost answer that is not on disk yet
@@ -435,10 +491,17 @@ class OpenAISiwc:
         if not self.down and self._remaining() < REFRESH_AHEAD_S:
             await self.refresh(self.rec["access_token"])
 
-    def record_quotas(self, headers: httpx.Headers, route: str) -> None:
-        """Keep the latest quota figures the answer carries, by limit id."""
-        for limit, figures in quota_snapshots(headers).items():
-            self.quotas[limit] = figures | {"route": route, "seen_at": int(time.time())}
+    def record_quotas(self, quotas: dict, source: str, seen: float) -> None:
+        for limit, figures in quotas.items():
+            self.quotas[limit] = figures | {"route": source, "seen_at": int(seen)}
+            for slot in ("primary", "secondary"):
+                if window := figures.get(slot):
+                    reset = window["resets_at"]
+                    if not (number(reset) and 0 < reset < QUOTA_RESET_MAX):
+                        reset = None
+                    self.quota_history.add(limit, window["window_minutes"],
+                                           [seen, window["used_percent"], reset, source])
+        self.quota_history.cap_series()
 
     def status(self) -> dict:
         now = time.time()
@@ -589,12 +652,12 @@ def usage_quotas(data: dict) -> dict:
             continue
         name = next((v for v in (extra.get("metered_feature"), extra.get("limit_name")) if isinstance(v, str)), "")
         name = name.strip().lower().replace("-", "_")
-        if re.fullmatch(r"[a-z0-9_]{1,48}", name) and (found := figures(extra.get("rate_limit"))):
+        if QUOTA_ID.fullmatch(name) and (found := figures(extra.get("rate_limit"))):
             quotas[name] = found | plan
     return quotas
 
 
-QUOTA_RE = re.compile(r"x-([a-z0-9-]{1,48})-primary-used-percent")
+QUOTA_RE = re.compile(r"x-([a-z0-9-]{1,48})-(?:primary|secondary)-used-percent")
 
 
 def quota_snapshots(headers) -> dict:
@@ -617,14 +680,12 @@ def quota_snapshots(headers) -> dict:
 
     def limit_id(text):
         text = text.strip().lower().replace("-", "_")
-        return text if re.fullmatch(r"[a-z0-9_]{1,48}", text) else None
+        return text if QUOTA_ID.fullmatch(text) else None
 
     out = {}
-    for name in list(headers.keys()):
-        match = QUOTA_RE.fullmatch(name.lower())
-        if not match:
-            continue
-        family = match.group(1)
+    families = dict.fromkeys(match[1] for name in headers.keys()
+                             if (match := QUOTA_RE.fullmatch(name.lower())))
+    for family in families:
         limit = (limit_id(headers.get("x-codex-active-limit", "")) or "codex") if family == "codex" else limit_id(family)
         figures = {"primary": window(f"x-{family}", "primary"), "secondary": window(f"x-{family}", "secondary")}
         if limit and (figures["primary"] or figures["secondary"]):

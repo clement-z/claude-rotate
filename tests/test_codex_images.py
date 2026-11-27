@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -295,6 +296,136 @@ MAY_REACH = set(FROM_CLIENT) | {"authorization", "chatgpt-account-id", "accept-e
 NEVER = ("x-openai-actor-authorization", "x-codex-turn-metadata", "cookie", "x-unlisted")
 # Non-ASCII and odd spacing, so a re-encoded body would show.
 PROMPT = '{"model":"gpt-image-2",  "prompt":"a red fox, «renard» — \U0001f98a","size":"1024x1024"}'.encode()
+
+
+async def history_checks():
+    for history in R.quota_histories().values():
+        history.series.clear()
+    start = int(time.time()) // 300 * 300 + 10
+    now = start
+    reset = start + 3600
+    poll = {"rate_limit": {
+        "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": reset},
+        "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800, "reset_at": reset}},
+        "additional_rate_limits": [{"metered_feature": "old-limit", "rate_limit": {
+            "primary_window": {"used_percent": 3, "limit_window_seconds": 86400}}}]}
+    status = 200
+    image_used = 12
+
+    def backend_answer(request):
+        if request.url.path == "/backend-api/wham/usage":
+            return httpx.Response(status, json=poll)
+        return httpx.Response(200, headers={
+            "content-type": "application/json", "x-codex-active-limit": "imagegen_premium",
+            "x-codex-primary-used-percent": str(image_used), "x-codex-primary-window-minutes": "1440"},
+            content=IMAGE)
+
+    def points(provider, limit, minutes):
+        return next((s["points"] for s in provider.quota_history.snapshot(now)
+                     if (s["limit"], s["minutes"]) == (limit, minutes)), [])
+
+    with patch.object(time, "time", lambda: now):
+        backend.answer, OAI.images.usage_at = backend_answer, 0
+        await OAI.maintain()
+        now += 1
+        await OAI.maintain()
+        check("a skipped poll makes no observation, and a successful zero is recorded",
+              points(OAI, "codex", 300) == [[start, 0, reset, "usage"]])
+        now += 299
+        windows = poll["rate_limit"]
+        windows["primary_window"], windows["secondary_window"] = windows["secondary_window"], windows["primary_window"]
+        del poll["additional_rate_limits"]
+        await OAI.maintain()
+        check("unchanged polls survive a primary/secondary swap, and omitted limits retain history",
+              points(OAI, "codex", 300) == [[start, 0, reset, "usage"], [now, 0, reset, "usage"]]
+              and len(points(OAI, "codex", 10080)) == 2
+              and points(OAI, "old_limit", 1440) == [[start, 3, None, "usage"]])
+        now += 300
+        status = 503
+        before = OAI.quota_history.snapshot(now)
+        await OAI.maintain()
+        check("a failed poll makes no observation", OAI.quota_history.snapshot(now) == before)
+
+        await call("POST", "/openai/v1/images/generations", content=PROMPT)
+        now += 1.25
+        image_used = 0
+        await call("POST", "/openai/v1/images/generations", content=PROMPT)
+        check("an image burst keeps the last reading in its UTC bucket with its receipt time",
+              points(OAI, "imagegen_premium", 1440) == [[now, 0, None, "images"]])
+        siwc["plain"].answer = lambda request: httpx.Response(200, headers={
+            "x-codex-secondary-used-percent": "80", "x-codex-secondary-window-minutes": "300",
+            "x-codex-primary-used-percent": "32"}, json={"ok": True})
+        await call("POST", "/plain/v1/responses", content=js({"model": "gpt-5.1-codex"}))
+        check("inference captures a secondary window on a second provider and skips unknown durations",
+              PLAIN.quota_history.snapshot(now) == [
+                  {"limit": "codex", "minutes": 300, "points": [[now, 80, None, "inference"]]}]
+              and len(points(OAI, "codex", 300)) == 2)
+        siwc["openai"].answer = lambda request: httpx.Response(200, headers={
+            "x-codex-secondary-used-percent": "88", "x-codex-secondary-window-minutes": "300"}, json={"ok": True})
+        now = start + 301
+        await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
+        check("a later header reading wins when a usage poll shares its bucket",
+              points(OAI, "codex", 300) == [[start, 0, reset, "usage"], [now, 88, None, "inference"]])
+        now = start + 602
+        saved = R.quota_history_snapshot(now)
+        path = R.QUOTA_HISTORY_PATH
+        with patch.object(Path, "replace", side_effect=OSError("temporary disk error")):
+            R.save_quota_history(now)
+        check("a failed history write surfaces an error and keeps dirty observations",
+              R.STORAGE_ERRORS["quota_history_write"]["count"] == 1 and OAI.quota_history.dirty
+              and not path.exists() and not list(tmp.glob(".provider_quota_history.*.tmp")))
+        R.save_quota_history(now)
+        mtime = path.stat().st_mtime_ns
+        R.save_quota_history(now)
+        check("the next write retries successfully and clean history is left alone",
+              json.loads(path.read_text()) == {"version": 1, "providers": saved}
+              and stat.S_IMODE(path.stat().st_mode) == 0o600 and path.stat().st_mtime_ns == mtime)
+        for p in (OAI, PLAIN, DRAW):
+            p.quota_history = P.QuotaHistory()
+        R.load_quotas()
+        check("latest cache load makes no history points", not R.quota_history_snapshot(now))
+        R.load_quota_history()
+        check("restart restores observations exactly", R.quota_history_snapshot(now) == saved)
+
+        for malformed in ("{not json", '{"version":2,"providers":{}}'):
+            for p in (OAI, PLAIN, DRAW):
+                p.quota_history = P.QuotaHistory()
+            path.write_text(malformed)
+            R.load_quota_history()
+            check("bad JSON or unsupported version starts with empty history", not R.quota_history_snapshot(now))
+        good = [start, 11, None, "usage"]
+        valid = {"limit": "codex", "minutes": 300, "points": [
+            [start + 300, 20, reset, "usage"], [start + 290, 12, None, "images"], good,
+            [now + 1, 50, None, "usage"], [now - 15*86400, 70, None, "usage"], [now, 101, None, "usage"],
+            [now, float("nan"), None, "usage"], [now, 10, False, "usage"], [now, 10, None, {}], "bad"]}
+        path.write_text(json.dumps({"version": 1, "providers": {
+            "openai": [valid, {"limit": "<invalid>", "minutes": 300, "points": [good]}, None],
+            "lan": [valid], "removed": [valid]}}))
+        R.load_quota_history()
+        check("mixed history loads only configured OpenAI series and valid, sorted, deduplicated points",
+              R.quota_history_snapshot(now) == {"openai": [{
+                  "limit": "codex", "minutes": 300, "points": [good, [start + 300, 20, reset, "usage"]]}]})
+        OAI.record_quotas({"short": {"primary": {"window_minutes": 0, "used_percent": 10, "resets_at": reset}},
+                           "overflow": {"primary": {"window_minutes": 300, "used_percent": 101, "resets_at": reset}}},
+                          "usage", now)
+        check("nonpositive durations and out-of-range usage update latest figures only",
+              set(OAI.quotas) >= {"short", "overflow"} and len(OAI.quota_history.series) == 1)
+
+        for i in range(17):
+            now += 1
+            OAI.record_quotas({f"limit_{i}": {"primary": {"window_minutes": 60, "used_percent": 20,
+                                                        "resets_at": None}}}, "inference", now)
+        series = OAI.quota_history.series
+        check("a provider keeps its 16 newest series",
+              set(series) == {(f"limit_{i}", 60) for i in range(1, 17)})
+        async with R.lifespan(R.app):
+            pass
+        check("orderly shutdown flushes pending observations",
+              json.loads(path.read_text())["providers"] == R.quota_history_snapshot(now))
+        now += P.HISTORY_DAYS * 86400 + 1
+        R.save_quota_history(now)
+        check("idle maintenance prunes expired observations from memory and disk",
+              not OAI.quota_history.series and not json.loads(path.read_text())["providers"])
 
 
 async def main():
@@ -880,6 +1011,7 @@ async def main():
           not any(leaks(req, SECRETS - CODEX_SECRETS) for req in backend.calls + cx_auth.calls))
     check("no provider's own credential was refreshed", siwc_auth.calls == [])
     check("all idle at the end", idle())
+    await history_checks()
     await C.aclose()
 
 
