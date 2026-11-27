@@ -1949,12 +1949,50 @@ async def retry_wait(seconds: float, request: Request | None) -> None:
         await asyncio.sleep(min(remaining, 1.0) if request is not None else remaining)
 
 
-async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes,
+RATE_LIMIT_PREFIX = "anthropic-ratelimit-"
+MAX_RATE_LIMIT_ATTEMPTS = 10
+MAX_STREAMED_RATE_LIMIT_BODY = 64 * 1024
+
+
+def rate_limit_headers(headers: httpx.Headers) -> dict:
+    out = {}
+    for name, value in headers.items():
+        if name.startswith(RATE_LIMIT_PREFIX):
+            out[name[len(RATE_LIMIT_PREFIX):]] = value[:200]
+            if len(out) == 40:
+                break
+    return out
+
+
+def rate_limit_error(entry: dict, content: bytes | bytearray) -> None:
+    try:
+        data = json.loads(content)
+    except (ValueError, RecursionError):
+        return
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        fields = {key: error[key][:limit] for key, limit in (("type", 100), ("message", 300))
+                  if isinstance(error.get(key), str)}
+        if fields:
+            entry["error"] = fields
+
+
+def add_claude_audit_fields(rec: dict, upstream: httpx.Response, account: str, retries: int) -> None:
+    rec.update(account=account, status=upstream.status_code)
+    if retries:
+        rec["retries"] = retries
+    model = rec["model"]
+    if ((isinstance(model, str) and "fable" in model.lower())
+            or "anthropic-ratelimit-unified-5h-utilization" not in upstream.headers):
+        rec["ratelimit"] = rate_limit_headers(upstream.headers)
+
+
+async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, rec: dict,
                         request: Request | None = None):
     """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
     pick the active account, pace bursts, retry through switches, optionally hold
     until the soonest window reset. Returns (upstream, account, retries, noted,
-    verdict) — noted means note_response already ran for the returned response;
+    verdict) and records 429s in rec. Noted means note_response already ran for the returned response;
     verdict is note_response's word for the LAST 429 seen ("burst" / "switched" /
     "exhausted" / None)."""
     hold_deadline = time.time() + HOLD_MAX_S if HOLD_MAX_S else None
@@ -1980,6 +2018,17 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes,
         if upstream.status_code != 429:
             return upstream, account, retries, noted, verdict
         verdict = await note_response(account, upstream.headers, 429)
+        retry_after = upstream.headers.get("retry-after")
+        entry = {"account": account, "verdict": verdict,
+                 "retry_after": retry_after[:200] if retry_after is not None else None,
+                 "headers": rate_limit_headers(upstream.headers)}
+        entries = rec.setdefault("rate_limits", [])
+        if len(entries) < MAX_RATE_LIMIT_ATTEMPTS:
+            entries.append(entry)
+        else:
+            # Keep the initial attempts and the most recent one.
+            entries[-1] = entry
+            rec["rate_limits_omitted"] = rec.get("rate_limits_omitted", 0) + 1
         wait = 0.0
         retry = verdict in ("switched", "burst") and retries < 5
         if not retry and verdict == "exhausted" and hold_deadline:
@@ -1990,7 +2039,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes,
         if not retry:
             noted = True
             return upstream, account, retries, noted, verdict
-        await bounded_response(upstream)
+        rate_limit_error(entry, await bounded_response(upstream))
         retries += 1
         if wait > 0:
             async with state_lock:
@@ -2031,13 +2080,11 @@ async def openai_chat(request: Request):
                             status_code=400)
     fwd = {"content-type": "application/json", "accept-encoding": "identity",
            "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
+    rec = {"device": device, "path": "/v1/chat/completions", "method": "POST", "model": abody.get("model")}
     upstream, account, retries, noted, verdict = await send_upstream(
-        "POST", "/v1/messages", fwd, json.dumps(abody).encode(), request)
+        "POST", "/v1/messages", fwd, json.dumps(abody).encode(), rec, request)
 
-    rec = {"device": device, "account": account, "path": "/v1/chat/completions", "method": "POST",
-           "model": abody.get("model"), "status": upstream.status_code}
-    if retries:
-        rec["retries"] = retries
+    add_claude_audit_fields(rec, upstream, account, retries)
     resp_headers = {"x-rotate-account": account}
     for h in ("anthropic-ratelimit-unified-5h-utilization",
               "anthropic-ratelimit-unified-7d-utilization",
@@ -2047,7 +2094,7 @@ async def openai_chat(request: Request):
             resp_headers[h] = upstream.headers[h]
 
     if upstream.status_code == 429 and verdict == "exhausted":
-        await bounded_response(upstream)
+        rate_limit_error(rec["rate_limits"][-1], await bounded_response(upstream))
         retry_after = max(1, round(earliest_relief() - time.time()))
         rec["status"] = 503
         audit(rec)
@@ -2080,6 +2127,8 @@ async def openai_chat(request: Request):
                                  media_type="text/event-stream")
 
     content = await bounded_response(upstream)
+    if upstream.status_code == 429:
+        rate_limit_error(rec["rate_limits"][-1], content)
     if not noted:
         await note_response(account, upstream.headers, upstream.status_code)
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
@@ -2515,13 +2564,11 @@ async def proxy(request: Request, path: str):
     fwd_headers = forward_headers(request)
     model = request_model(request, body)
     url = upstream_url(UPSTREAM, upstream_path(request), upstream_query(request))
+    rec = {"device": device, "path": "/" + path, "method": request.method, "model": model}
     upstream, account, retries, noted, _verdict = await send_upstream(
-        request.method, url, fwd_headers, body, request)
+        request.method, url, fwd_headers, body, rec, request)
 
-    rec = {"device": device, "account": account, "path": "/" + path, "method": request.method,
-           "model": model, "status": upstream.status_code}
-    if retries:
-        rec["retries"] = retries
+    add_claude_audit_fields(rec, upstream, account, retries)
     resp_headers = response_headers(upstream)
     resp_headers["x-rotate-account"] = account
 
@@ -2529,10 +2576,18 @@ async def proxy(request: Request, path: str):
         usage_acc: dict = {}
 
         async def relay():
+            error_body = bytearray() if upstream.status_code == 429 else None
             try:
                 async for chunk in upstream.aiter_bytes():
+                    if error_body is not None:
+                        if len(error_body) + len(chunk) <= MAX_STREAMED_RATE_LIMIT_BODY:
+                            error_body.extend(chunk)
+                        else:
+                            error_body = None
                     usage_from_sse(chunk.decode("utf-8", errors="replace"), usage_acc)
                     yield chunk
+                if error_body is not None:
+                    rate_limit_error(rec["rate_limits"][-1], error_body)
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(usage_acc)
@@ -2543,6 +2598,8 @@ async def proxy(request: Request, path: str):
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
     content = await bounded_response(upstream)
+    if upstream.status_code == 429:
+        rate_limit_error(rec["rate_limits"][-1], content)
     try:
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):

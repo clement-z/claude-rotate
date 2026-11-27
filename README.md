@@ -391,6 +391,18 @@ JSON endpoints: `/rotate/status` (accounts + switch events) and
 auth. `POST /rotate/switch` with `{"account": NAME}` or `{"auto": true}` is the
 panel's switch; it accepts only `application/json`. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 
+On either Claude endpoint, `rate_limits` lists upstream 429s, including ones
+the proxy retried. Each entry records the account, rotation verdict, raw
+`Retry-After`, rate-limit headers, and the upstream error type and message when
+available. The audit keeps the first nine and the latest attempt if there are
+more than ten, and counts omitted attempts in `rate_limits_omitted`.
+
+`ratelimit` captures the final answer's rate-limit headers for Fable requests
+and for answers without the unified 5-hour utilization header. These snapshots
+help identify model-specific limits and explain missing utilization readings.
+Both fields keep up to 40 `anthropic-ratelimit-*` headers, with the prefix removed
+and values truncated to 200 characters.
+
 ## OpenAI-compatible endpoint
 
 `POST /v1/chat/completions` (same device-key auth) accepts OpenAI-format chat

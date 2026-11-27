@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -54,7 +55,7 @@ def unified(u5="0.5", u7="0.2", status="allowed", **extra):
          "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
          "anthropic-ratelimit-unified-status": status}
     h.update(extra)
-    return h
+    return {k: v for k, v in h.items() if v is not None}
 
 
 def use_upstream(handler):
@@ -117,6 +118,7 @@ recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
       and recs[-1]["usage"]["input_tokens"] == 7 and recs[-1]["model"] == "claude-opus-5")
+check("ordinary answer with 5h utilization has no rate-limit snapshot", "ratelimit" not in recs[-1])
 
 # --- 3. SSE relay ------------------------------------------------------------
 fresh_state()
@@ -157,16 +159,21 @@ check("active account rotated", R.STATE["active_account"] == "b")
 recs = audit_recs()
 check("audit records final account + retry count",
       recs[-1]["account"] == "b" and recs[-1]["retries"] == 1 and recs[-1]["status"] == 200)
+check("audit records the switched 429 under the original account",
+      len(recs[-1]["rate_limits"]) == 1 and recs[-1]["rate_limits"][0]["account"] == "a"
+      and recs[-1]["rate_limits"][0]["verdict"] == "switched"
+      and recs[-1]["rate_limits"][0]["headers"]["unified-status"] == "rejected")
 
 # --- 5. burst 429 → pace same account, no rotation ---------------------------
 fresh_state("a", {"a": {"util_5h": 0.3, "util_7d": 0.1}, "b": {"util_5h": 0.0}})
 calls = []
+burst_error = {"type": "rate_limit_error", "message": "burst on this account"}
 
 
 def burst_handler(req):
     calls.append(req.headers["authorization"])
     if len(calls) == 1:
-        return httpx.Response(429, json={"error": "burst"},
+        return httpx.Response(429, json={"error": burst_error, "private": "discarded-body-marker"},
                               headers={**unified(u5="0.3"), "retry-after": "1"})
     return httpx.Response(200, json={"usage": {"input_tokens": 1, "output_tokens": 1}},
                           headers=unified(u5="0.3"))
@@ -180,6 +187,11 @@ check("burst 429 hidden from client", r.status_code == 200)
 check("burst retried on the SAME account", calls == ["Bearer tok-a", "Bearer tok-a"])
 check("no rotation on burst", R.STATE["active_account"] == "a")
 check("pace honored (~retry-after)", 0.9 <= elapsed < 5)
+limits = audit_recs()[-1]["rate_limits"]
+check("audit records a retried burst, its headers, Retry-After and structured error",
+      len(limits) == 1 and limits[0]["verdict"] == "burst" and limits[0]["account"] == "a"
+      and limits[0]["retry_after"] == "1" and limits[0]["headers"]["unified-5h-utilization"] == "0.3"
+      and limits[0]["error"] == burst_error and "discarded-body-marker" not in R.AUDIT_PATH.read_text())
 
 # --- 6. every account spent, hold off → 429 passthrough ----------------------
 now = time.time()
@@ -189,13 +201,93 @@ fresh_state("a", dict(spent))
 R.HOLD_MAX_S = 0
 # Pin the active account's reset as the soonest so pick_account's fallback
 # stays on it → "exhausted" (not a bounce to the other spent account).
-use_upstream(lambda req: httpx.Response(429, json={"error": "limit"},
+returned_error = {"type": "rate_limit_error", "message": "spent"}
+use_upstream(lambda req: httpx.Response(429, json={"error": returned_error},
                                         headers=unified(
                                             u5="1.0", status="rejected",
                                             **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)})))
 r = call()
-check("all spent + hold off → 429 passthrough", r.status_code == 429)
+check("all spent + hold off → 429 passthrough", r.status_code == 429 and r.json() == {"error": returned_error})
 check("audit records the 429", audit_recs()[-1]["status"] == 429)
+entry = audit_recs()[-1]["rate_limits"][0]
+check("audit records the returned exhausted attempt and error",
+      entry["account"] == "a" and entry["verdict"] == "exhausted" and entry["error"] == returned_error)
+
+# Buffered and streaming audit records use the same narrow header snapshot.
+fresh_state()
+extra = {"Anthropic-RateLimit-Fable": "x" * 250,
+         **{f"anthropic-ratelimit-test-{i}": str(i) for i in range(50)},
+         "authorization": "response-secret-marker", "x-ignored": "ignored-header-marker"}
+use_upstream(lambda req: httpx.Response(200, headers=unified(**extra), json={"usage": {}}))
+r = call(body={"model": "Claude-FaBlE-5", "messages": []},
+         headers={"anthropic-ratelimit-request-only": "request-header-marker"})
+snapshot = audit_recs()[-1]["ratelimit"]
+check("Fable captures only response rate-limit headers, truncated and capped at forty",
+      r.status_code == 200 and len(snapshot) == 40 and snapshot["fable"] == "x" * 200
+      and all(k == "fable" or k.startswith(("unified-", "test-")) for k in snapshot)
+      and not any(s in R.AUDIT_PATH.read_text() for s in (
+          "response-secret-marker", "ignored-header-marker", "request-header-marker", "tok-a", "devkey-1")))
+
+use_upstream(lambda req: httpx.Response(200, content=SSE.encode(), headers={
+    **unified(u5=None), "content-type": "text/event-stream"}))
+r = call()
+rec = audit_recs()[-1]
+check("a non-Fable stream without 5h utilization records the other headers",
+      r.text == SSE and rec["util_5h"] is None and rec["ratelimit"]["unified-7d-utilization"] == "0.2"
+      and "unified-5h-utilization" not in rec["ratelimit"])
+
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+long_error = {"type": "rate_limit_error", "message": "m" * 350, "extra": "ignored-error-marker"}
+use_upstream(lambda req: httpx.Response(429, content=json.dumps({"error": long_error}).encode(), headers={
+    **unified(u5="1.0", status="rejected", **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}),
+    "content-type": "text/event-stream", "retry-after": "1" * 250}))
+r = call()
+entry = audit_recs()[-1]["rate_limits"][0]
+check("a streamed 429 is relayed and its audit bounds Retry-After and the error message",
+      r.status_code == 429 and r.json() == {"error": long_error} and entry["retry_after"] == "1" * 200
+      and entry["error"] == {"type": "rate_limit_error", "message": "m" * 300})
+
+chat = "/v1/chat/completions"
+chat_body = {"model": "claude-fable-5", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+fresh_state()
+calls = []
+
+
+def chat_upstream(req):
+    calls.append(req)
+    if len(calls) == 1:
+        return httpx.Response(429, json={"error": burst_error}, headers=unified(**{"retry-after": "0"}))
+    return httpx.Response(200, content=SSE.encode(), headers={**unified(), "content-type": "text/event-stream"})
+
+
+use_upstream(chat_upstream)
+r = call(chat, body=chat_body)
+rec = audit_recs()[-1]
+check("OpenAI chat stream audits a retried burst and the Fable answer",
+      r.status_code == 200 and "[DONE]" in r.text and rec["retries"] == 1
+      and rec["rate_limits"][0]["error"] == burst_error and rec["ratelimit"]["unified-status"] == "allowed")
+
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+use_upstream(lambda req: httpx.Response(429, json={"error": returned_error},
+                                        headers=unified(u5=None, status="rejected",
+                                                        **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)})))
+r = call(chat, body=chat_body | {"model": "claude-opus-5", "stream": False})
+rec = audit_recs()[-1]
+check("OpenAI chat still maps exhaustion to 503 and audits the upstream 429 and missing 5h",
+      r.status_code == 503 and r.json()["error"]["type"] == "overloaded_error"
+      and rec["status"] == 503 and rec["rate_limits"][0]["error"] == returned_error
+      and rec["rate_limits"][0]["verdict"] == "exhausted" and rec["ratelimit"]["unified-status"] == "rejected"
+      and "unified-5h-utilization" not in rec["ratelimit"])
+
+fresh_state()
+use_upstream(lambda req: httpx.Response(429, json={"error": burst_error},
+                                        headers=unified(**{"retry-after": "0"})))
+r = call(chat, body=chat_body | {"stream": False})
+rec = audit_recs()[-1]
+check("OpenAI chat still translates a returned burst 429 after retries and records all six attempts",
+      r.status_code == 429 and r.json() == {"error": {"type": "api_error", "message": "upstream: burst on this account"}}
+      and rec["retries"] == 5 and len(rec["rate_limits"]) == 6
+      and all(e["verdict"] == "burst" and e["error"] == burst_error for e in rec["rate_limits"]))
 
 # --- 7. every account spent, hold on → wait for reset, then succeed ----------
 now = time.time()
@@ -226,6 +318,29 @@ check("held request eventually succeeds", r.status_code == 200 and len(calls) ==
 check("hold waited for the deadline window", 1.5 <= elapsed < 10)
 check("hold event recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
 R.HOLD_MAX_S = 0
+
+# Fast-forward the hold waits so the real hold loop can make twelve retries.
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+calls = []
+
+
+def repeated_hold(req):
+    calls.append(req)
+    if len(calls) <= 12:
+        return httpx.Response(429, json={"error": {"type": "rate_limit_error", "message": str(len(calls))}},
+                              headers=unified(u5="1.0", status="rejected",
+                                              **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}))
+    return httpx.Response(200, json={"usage": {}}, headers=unified())
+
+
+use_upstream(repeated_hold)
+with patch.object(R, "HOLD_MAX_S", 60), patch.object(R, "retry_wait"):
+    r = call()
+rec = audit_recs()[-1]
+check("more than ten held 429s retain ten entries and count the omitted attempts",
+      r.status_code == 200 and rec["retries"] == 12 and rec["rate_limits_omitted"] == 2
+      and [e["error"]["message"] for e in rec["rate_limits"]] == [str(i) for i in range(1, 10)] + ["12"]
+      and all(e["verdict"] == "exhausted" for e in rec["rate_limits"]))
 
 # --- 8. admin endpoints ------------------------------------------------------
 fresh_state()
