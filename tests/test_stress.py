@@ -138,9 +138,11 @@ fresh_state("a", {"a": {"util_5h": 0.3, "util_7d": 0.1}, "b": {"util_5h": 0.0}})
 burst_count = {"n": 0}
 
 
-def burst_handler(req):
+async def burst_handler(req):
     burst_count["n"] += 1
-    if burst_count["n"] <= 50:
+    first_burst = burst_count["n"] <= 50
+    await asyncio.sleep(0.05)
+    if first_burst:
         return httpx.Response(429, json={"error": "burst"},
                               headers={**unified(u5="0.3"), "retry-after": "0.1"})
     return httpx.Response(200, json=OK_JSON, headers=unified(u5="0.3"))
@@ -154,7 +156,7 @@ check("burst storm: zero rotations",
       not any(e["type"] == "switch" for e in R.STATE["events"])
       and R.STATE["active_account"] == "a")
 
-# --- 4. concurrent holds: everyone parks, everyone finishes ------------------
+# --- 4. concurrent holds: known blocks eventually return a local response ---
 now = time.time()
 fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
                   "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
@@ -175,8 +177,9 @@ def hold_handler(req):
 
 use_upstream(hold_handler)
 resps, secs = blast(20)
-check("20 concurrent held requests all finish 200",
-      all(r.status_code == 200 for r in resps))
+check("20 concurrent holds expire with local 429s and make no upstream requests",
+      all(r.status_code == 429 for r in resps) and hold_count["n"] == 0
+      and all(rec["local"] is True and "rate_limits" not in rec for rec in audit_recs()))
 check("held ~deadline then released together", 1.5 <= secs < 20, f"{secs:.1f}s")
 check("hold events recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
 R.HOLD_MAX_S = 0
@@ -204,11 +207,13 @@ R.COOLDOWN_S = 0
 async def churn():
     for i in range(300):
         active = R.STATE["active_account"]
+        other = "b" if active == "a" else "a"
+        await R.note_response(other, httpx.Headers(unified(u5="0.1")), 200, automatic=False)
         h = httpx.Headers({**unified(u5="1.0", status="rejected"),
                            "anthropic-ratelimit-unified-5h-reset": str(time.time() + 1000 + i)})
         await R.note_response(active, h, 429)
 asyncio.run(churn())
-check("events capped at 200 under churn", len(R.STATE["events"]) <= 200,
+check("events capped at 200 under churn", len(R.STATE["events"]) == 200,
       f"{len(R.STATE['events'])} events")
 R.COOLDOWN_S = 300
 

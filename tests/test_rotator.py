@@ -76,8 +76,9 @@ R.STATE["accounts"] = {"a": {"util_5h": 0.4, "util_7d": 0.2}}
 v = run(R.note_response("a", headers(u5=0.4, u7=0.2, retry_after=7), 429))
 check("burst 429 verdict is 'burst'", v == "burst")
 check("burst 429 does not rotate", R.STATE["active_account"] == "a")
-check("burst 429 sets pace_until ~retry-after",
-      6 < R.STATE["accounts"]["a"]["pace_until"] - time.time() <= 7.5)
+check("burst 429 sets only the default family's pace deadline",
+      6 < R.STATE["accounts"]["a"]["pace_by_family"]["default"] - time.time() <= 7.5
+      and "fable" not in R.STATE["accounts"]["a"]["pace_by_family"])
 
 # 3. quota 429 (unified-status rejected) → rotate despite cooldown
 fresh_state("a")
@@ -96,14 +97,12 @@ check("switch event reason", R.STATE["events"][-1]["reason"] == "quota_exhausted
 fresh_state("a")
 R.STATE["accounts"] = {
     "a": {"util_5h": 1.0, "reset_5h": now + 1000},
-    "b": {"util_5h": 0.95, "reset_5h": now + 2000},
-    "c": {"util_5h": 0.9, "reset_5h": now + 500},
+    "b": {"util_5h": 1.0, "reset_5h": now + 2000},
+    "c": {"util_5h": 1.0, "reset_5h": now + 500},
 }
 v = run(R.note_response("a", headers(u5=1.0, status="rejected"), 429))
-# fallback pick = earliest 5h reset = c; c != a so it switches (bounce toward relief)
-check("all-spent quota hit still moves toward earliest reset", v == "switched" and R.STATE["active_account"] == "c")
-v = run(R.note_response("c", headers(u5=0.9, status="rejected"), 429))
-check("exhausted when fallback is itself", v == "exhausted")
+check("all-spent quota hit leaves the active route and has no dispatch candidate",
+      v == "exhausted" and R.STATE["active_account"] == "a" and R.pick_account() is None)
 check("earliest_relief is soonest reset", abs(R.earliest_relief() - (now + 500)) < 5)
 
 # 5. threshold switch respects cooldown
@@ -112,7 +111,7 @@ R.STATE["last_switch_ts"] = time.time()
 R.STATE["accounts"] = {"a": {"util_5h": 0.85}, "b": {"util_5h": 0.1}, "c": {"util_5h": 0.2}}
 v = run(R.note_response("a", headers(u5=0.85), 200))
 check("threshold switch blocked by cooldown", v is None and R.STATE["active_account"] == "a")
-R.STATE["last_switch_ts"] = 0
+R.family_route("default")["last_switch_ts"] = 0
 v = run(R.note_response("a", headers(u5=0.85), 200))
 check("threshold switch after cooldown", v == "switched" and R.STATE["active_account"] == "b")
 
@@ -191,12 +190,12 @@ v = run(R.note_response("a", headers(u5=0.0), 200))
 check("disabled active abandoned", v == "switched" and R.STATE["active_account"] == "c")
 check("disabled event reason", R.STATE["events"][-1]["reason"] == "account_disabled")
 
-# 11b. all-spent fallback skips disabled accounts too
+# 11b. Hard exhaustion skips every blocked account, including the disabled one.
 fresh_state("b")
 R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now + 10},
                        "b": {"util_5h": 1.0, "reset_5h": now + 100},
                        "c": {"util_5h": 1.0, "reset_5h": now + 50}}
-check("fallback skips disabled", R.pick_account() == "c")
+check("no fallback dispatches to a blocked or disabled account", R.pick_account() is None)
 
 # 12. a panel pick holds against consume-first until the account reaches a threshold
 R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
@@ -310,5 +309,38 @@ with tempfile.TemporaryDirectory() as tmp:
               and R.weekly_reset("a") == now + 200000 and outlook["capacity"] == 100
               and outlook["projection"][0][1:] == [69, 100]
               and abs(ledger[0] - 19) < 0.01 and ledger[1] == 0)
+
+# 16. Relief needs the last applicable blocker to expire on at least one account.
+fresh_state()
+R.STATE["accounts"] = {
+    "a": {"claims": {"7d": {"utilization": 1, "reset": now + 3600},
+                     "7d_oi": {"status": "rejected", "reset": now + 10800}}},
+    "b": {"claims": {"7d": {"utilization": 0.69, "reset": now + 9000},
+                     "7d_oi": {"utilization": 1, "reset": now + 7200}}}}
+with patch.object(R, "ACCOUNTS", {name: R.ACCOUNTS[name] for name in ("a", "b")}):
+    check("family relief takes the earliest account's last blocker, and default ignores Fable",
+          R.earliest_relief("fable", now) == now + 7200 and R.earliest_relief("default", now) == now
+          and R.pick_account("fable") is None and R.pick_account("default") == "b")
+
+for representative, expected in (("seven_day", R.RECHECK_S), ("seven_day_oi", 8000)):
+    fresh_state()
+    ambiguous = headers(u7=0.69, r7=now + 8000, status="rejected") | {
+        "anthropic-ratelimit-unified-representative-claim": representative,
+        "anthropic-ratelimit-unified-reset": str(now + 8000)}
+    run(R.note_response("a", httpx.Headers(ambiguous), 429, family="fable"))
+    check(f"aggregate rejection with {representative} blocks only Fable for the supported duration",
+          abs(R.blocker_deadline("a", "fable", now) - now - expected) < 5
+          and R.blocker_deadline("a", "default", now) == 0)
+
+fresh_state()
+run(R.note_response("a", httpx.Headers({"anthropic-ratelimit-unified-7d_oi-status": "rejected"}),
+                    429, family="fable"))
+check("a rejected Fable claim without a reset uses a bounded recheck",
+      now < R.blocker_deadline("a", "fable", now) < now + R.RECHECK_S + 5)
+run(R.note_response("a", weekly, 200, family="default"))
+check("default success does not erase a rejection on the Fable claim",
+      R.blocker_deadline("a", "fable", now) > now)
+run(R.note_response("a", weekly, 200, family="fable"))
+check("authoritative Fable recovery removes its old hard block", R.blocker_deadline("a", "fable", now) == 0)
 
 print(f"\nall {PASS} checks passed")

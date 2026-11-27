@@ -10,6 +10,7 @@ import json
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -47,13 +48,16 @@ def fresh_state(active="a", accounts=None):
     R.AUDIT_PATH.write_text("")
 
 
-def unified(u5="0.5", u7="0.2", status="allowed", **extra):
+def unified(u5="0.5", u7="0.2", status="allowed", oi=None, oi_status=None, oi_reset=None, **extra):
     now = time.time()
     h = {"anthropic-ratelimit-unified-5h-utilization": u5,
          "anthropic-ratelimit-unified-7d-utilization": u7,
-         "anthropic-ratelimit-unified-5h-reset": str(now + 3600),
+         "anthropic-ratelimit-unified-5h-reset": str(now + 3600) if u5 is not None else None,
          "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
-         "anthropic-ratelimit-unified-status": status}
+         "anthropic-ratelimit-unified-status": status,
+         "anthropic-ratelimit-unified-7d_oi-utilization": oi,
+         "anthropic-ratelimit-unified-7d_oi-status": oi_status,
+         "anthropic-ratelimit-unified-7d_oi-reset": oi_reset}
     h.update(extra)
     return {k: v for k, v in h.items() if v is not None}
 
@@ -204,12 +208,11 @@ check("audit records a retried burst, its headers, Retry-After and structured er
 
 # --- 6. every account spent, hold off → 429 passthrough ----------------------
 now = time.time()
-spent = {"a": {"util_5h": 1.0, "reset_5h": now + 100},
+spent = {"a": {"util_5h": 0.1, "reset_5h": now + 100},
          "b": {"util_5h": 1.0, "reset_5h": now + 2000}}
 fresh_state("a", dict(spent))
 R.HOLD_MAX_S = 0
-# Pin the active account's reset as the soonest so pick_account's fallback
-# stays on it → "exhausted" (not a bounce to the other spent account).
+# The last candidate becomes hard-blocked on its returned 429.
 returned_error = {"type": "rate_limit_error", "message": "spent"}
 use_upstream(lambda req: httpx.Response(429, json={"error": returned_error},
                                         headers=unified(
@@ -257,6 +260,7 @@ check("a streamed 429 is relayed and its audit bounds Retry-After and the error 
       and entry["error"] == {"type": "rate_limit_error", "message": "m" * 300})
 
 frame = b"event: error\ndata: " + json.dumps({"type": "error", "error": returned_error}).encode() + b"\n\n"
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 use_upstream(lambda req: httpx.Response(429, stream=Chunks(frame[:16], frame[16:33], frame[33:]), headers={
     **unified(u5="1.0", status="rejected", **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}),
     "content-type": "text/event-stream"}))
@@ -301,10 +305,11 @@ use_upstream(lambda req: httpx.Response(429, json={"error": burst_error},
                                         headers=unified(**{"retry-after": "0"})))
 r = call(chat, body=chat_body | {"stream": False})
 rec = audit_recs()[-1]
-check("OpenAI chat still translates a returned burst 429 after retries and records all six attempts",
-      r.status_code == 429 and r.json() == {"error": {"type": "api_error", "message": "upstream: burst on this account"}}
-      and rec["retries"] == 5 and len(rec["rate_limits"]) == 6
-      and all(e["verdict"] == "burst" and e["error"] == burst_error for e in rec["rate_limits"]))
+check("repeated ambiguous 429s on both accounts exhaust the family in four attempts",
+      r.status_code == 503 and r.json()["error"]["type"] == "overloaded_error"
+      and rec["retries"] == 3 and len(rec["rate_limits"]) == 4
+      and [e["verdict"] for e in rec["rate_limits"]] == ["burst", "switched", "burst", "exhausted"]
+      and all(e["error"] == burst_error for e in rec["rate_limits"]))
 
 for path in ("/v1/messages", chat):
     fresh_state()
@@ -360,6 +365,7 @@ check("rate-limit header names are capped at 100 characters in both snapshots",
       and rec["rate_limits"][0]["headers"]["n" * 100] == "long-name"
       and all(len(name) <= 100 for name in rec["ratelimit"]))
 with patch.object(R, "AUDIT_MAX_BYTES", 4096):
+    fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
     r = call(body=chat_body)
 rec = audit_recs()[-1]
 check("a 4 KiB audit file keeps the attempt and error after dropping both header snapshots",
@@ -370,7 +376,7 @@ check("a 4 KiB audit file keeps the attempt and error after dropping both header
 
 # --- 7. every account spent, hold on → wait for reset, then succeed ----------
 now = time.time()
-fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
+fresh_state("a", {"a": {"util_5h": 0.1, "reset_5h": now + 100},
                   "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 R.HOLD_MAX_S = 2  # deadline caps the wait so the test stays fast
 calls = []
@@ -393,7 +399,8 @@ use_upstream(hold_handler)
 t0 = time.time()
 r = call()
 elapsed = time.time() - t0
-check("held request eventually succeeds", r.status_code == 200 and len(calls) == 2)
+check("an expired hold returns the original 429 without retrying a hard-blocked account",
+      r.status_code == 429 and r.json() == {"error": "limit"} and len(calls) == 1)
 check("hold waited for the deadline window", 1.5 <= elapsed < 10)
 check("hold event recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
 R.HOLD_MAX_S = 0
@@ -401,6 +408,11 @@ R.HOLD_MAX_S = 0
 # Fast-forward the hold waits so the real hold loop can make twelve retries.
 fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 calls = []
+clock = [now]
+
+
+async def advance_hold(seconds, request=None):
+    clock[0] += seconds
 
 
 def repeated_hold(req):
@@ -408,18 +420,142 @@ def repeated_hold(req):
     if len(calls) <= 12:
         return httpx.Response(429, json={"error": {"type": "rate_limit_error", "message": str(len(calls))}},
                               headers=unified(u5="1.0", status="rejected",
-                                              **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}))
+                                              **{"anthropic-ratelimit-unified-5h-reset": str(clock[0] + 1)}))
     return httpx.Response(200, json={"usage": {}}, headers=unified())
 
 
 use_upstream(repeated_hold)
-with patch.object(R, "HOLD_MAX_S", 60), patch.object(R, "retry_wait"):
+with patch.object(R, "HOLD_MAX_S", 60), patch.object(R, "retry_wait", advance_hold), patch.object(
+        R, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0],
+                                  strftime=time.strftime, localtime=time.localtime)):
     r = call()
 rec = audit_recs()[-1]
 check("more than ten held 429s retain ten entries and count the omitted attempts",
       r.status_code == 200 and rec["retries"] == 12 and rec["rate_limits_omitted"] == 2
       and [e["error"]["message"] for e in rec["rate_limits"]] == [str(i) for i in range(1, 10)] + ["12"]
       and all(e["verdict"] == "exhausted" for e in rec["rate_limits"]))
+
+
+async def family_replay(path, ambiguous):
+    fresh_state()
+    calls = []
+    started = asyncio.Event()
+    opus_done = asyncio.Event()
+    reset = time.time() + 10000
+    wait_for_retry = R.retry_wait
+
+    async def retry_wait(seconds, request):
+        if seconds:
+            await asyncio.wait_for(opus_done.wait(), 2)
+        await wait_for_retry(seconds, request)
+
+    async def respond(req):
+        model = json.loads(req.content)["model"]
+        account = req.headers["authorization"][-1]
+        calls.append((model, account, time.monotonic()))
+        if model == "claude-fable-5-2" and account == "a":
+            started.set()
+            return httpx.Response(429, json={"error": returned_error}, headers=unified(
+                u5=None, u7="0.69", oi="0.48" if ambiguous else "1",
+                oi_status="allowed" if ambiguous else "rejected", oi_reset=str(reset),
+                **{"retry-after": "0.05", "anthropic-ratelimit-unified-representative-claim": "seven_day"}))
+        if model == "claude-fable-5-2":
+            await asyncio.wait_for(opus_done.wait(), 2)
+        return httpx.Response(200, json={"content": [], "usage": {}}, headers=unified(
+            u5=None, u7="0.69", oi="0.12" if model == "claude-fable-5-2" else None, oi_reset=str(reset)))
+
+    use_upstream(respond)
+    with patch.object(R, "retry_wait", retry_wait):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=R.app), base_url="http://proxy") as client:
+            async def ask(model):
+                return await client.post(path, json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+                                         headers={"authorization": "Bearer devkey-1"})
+
+            fable_task = asyncio.create_task(ask("claude-fable-5-2"))
+            await asyncio.wait_for(started.wait(), 2)
+            opus = await ask("claude-opus-5")
+            opus_done.set()
+            fable = await asyncio.wait_for(fable_task, 2)
+            R.family_route("fable")["last_switch_ts"] = 0
+            still_fable = await ask("claude-fable-5-2")
+
+    fable_calls = [(account, seen) for model, account, seen in calls if "fable" in model]
+    audit_fable = next(rec for rec in audit_recs() if rec.get("rate_limits"))
+    return (all(r.status_code == 200 for r in (opus, fable, still_fable))
+            and opus.headers.get("x-rotate-account") == "a"
+            and fable.headers.get("x-rotate-account") == still_fable.headers.get("x-rotate-account") == "b"
+            and [account for account, _ in fable_calls] == (["a", "a", "b", "b"] if ambiguous else ["a", "b", "b"])
+            and (not ambiguous or fable_calls[1][1] - fable_calls[0][1] >= 0.04)
+            and audit_fable["retries"] == (2 if ambiguous else 1)
+            and [e["verdict"] for e in audit_fable["rate_limits"]] == (["burst", "switched"] if ambiguous else ["switched"])
+            and "default" not in R.STATE["accounts"]["a"].get("pace_by_family", {})
+            and R.STATE["active_account"] == "a")
+
+
+for path in ("/v1/messages", "/v1/chat/completions"):
+    for ambiguous in (False, True):
+        check(f"{path} keeps Opus on a during a {'repeated ambiguous' if ambiguous else 'Fable-only'} 429",
+              asyncio.run(family_replay(path, ambiguous)))
+
+
+async def late_stream():
+    fresh_state()
+    reading, finish = asyncio.Event(), asyncio.Event()
+    reset = time.time() + 10000
+    calls = []
+
+    class Paused(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            reading.set()
+            await finish.wait()
+            yield SSE.encode()
+
+    def respond(req):
+        model = json.loads(req.content)["model"]
+        account = req.headers["authorization"][-1]
+        calls.append((model, account))
+        limits = unified(u5=None, u7="0.69", oi="0.48", oi_reset=str(reset))
+        if len(calls) == 1:
+            return httpx.Response(200, stream=Paused(), headers=limits | {"content-type": "text/event-stream"})
+        if "fable" in model and account == "a":
+            return httpx.Response(429, json={"error": returned_error},
+                                  headers=unified(u5=None, u7="0.69", oi="1", oi_reset=str(reset)))
+        return httpx.Response(200, json={"usage": {}}, headers=limits if "fable" in model else unified(u5=None))
+
+    use_upstream(respond)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=R.app), base_url="http://proxy") as client:
+        async def ask(model):
+            return await client.post("/v1/messages", json={"model": model, "messages": []},
+                                     headers={"authorization": "Bearer devkey-1"})
+
+        slow = asyncio.create_task(ask("claude-fable-5"))
+        await asyncio.wait_for(reading.wait(), 2)
+        await ask("claude-fable-5")
+        await ask("claude-opus-5")
+        finish.set()
+        first = await asyncio.wait_for(slow, 2)
+        await ask("claude-fable-5")
+    return (first.text == SSE and R.claim_utilization("a", "7d_oi") == 1
+            and [account for _, account in calls] == ["a", "a", "b", "a", "b"])
+
+
+check("a late Fable stream close cannot restore old claim readings or reverse the switch", asyncio.run(late_stream()))
+
+fresh_state("a", {"a": {"util_7d": 1, "reset_7d": time.time() + 100},
+                  "b": {"util_7d": 1, "reset_7d": time.time() + 500}})
+
+
+def reject_dispatch(req):
+    raise AssertionError("blocked account was dispatched")
+
+
+use_upstream(reject_dispatch)
+local = call()
+chat_local = call(chat, body=chat_body)
+check("known blocks generate local 429 and chat 503 with Retry-After and no upstream attempt",
+      local.status_code == 429 and chat_local.status_code == 503 and 95 <= int(local.headers["retry-after"]) <= 100
+      and 95 <= int(chat_local.headers["retry-after"]) <= 100
+      and all(rec["local"] and "rate_limits" not in rec for rec in audit_recs()))
 
 # --- 8. admin endpoints ------------------------------------------------------
 fresh_state()

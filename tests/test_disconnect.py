@@ -76,7 +76,7 @@ async def main():
                     assert not server.server_state.tasks, "disconnected wait retained its task"
                     records = [json.loads(line) for line in r.AUDIT_PATH.read_text().splitlines()]
                     assert len(records) == 1 and records[0]["status"] == 499
-                    assert records[0]["path"] == path and records[0]["retries"] == 1
+                    assert records[0]["path"] == path and records[0].get("retries", 0) == 0
                     limits = records[0]["rate_limits"]
                     assert len(limits) == 1 and limits[0]["account"] == "a"
                     assert limits[0]["verdict"] == ("exhausted" if mode == "hold" else "burst")

@@ -609,7 +609,7 @@ async def main():
         "input_tokens": 300, "input_tokens_details": {"cached_tokens": 100}, "output_tokens": 40}})
     await call("POST", "/lan/v1/messages", content=js({"model": "lan-model"}))
     await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
-    R.STATE["active_account"] = "lan"
+    R.family_route("default").update(active_account="lan", last_switch_ts=time.time())
     r, new = await call("POST", "/v1/messages", content=js({"model": "claude-x"}))
     check("the Claude request rides the account named like the provider",
           r.status_code == 200 and one(new).get("account") == "lan" and "provider" not in one(new))

@@ -308,7 +308,6 @@ def sync_legacy_claims(info: dict) -> None:
 
 
 def seed_routes(state: dict) -> None:
-    # Legacy routing remains authoritative until the family routing change.
     active = state.get("active_account")
     if active not in ACCOUNTS:
         active = next(iter(ACCOUNTS))
@@ -351,6 +350,15 @@ def load_state() -> dict:
         seed_routes(state)
         if exists:
             write_state(state)
+    elif state.get("version") == STATE_VERSION:
+        # The offline rotate command still writes the legacy default route.
+        route = state["routes"]["default"]
+        if state.get("active_account") in ACCOUNTS and (
+                state["active_account"] != route["active_account"]
+                or state.get("last_switch_ts", 0) != route["last_switch_ts"]
+                or state.get("pinned") != route.get("manual_account")):
+            seed_routes(state)
+            write_state(state)
     return state
 
 
@@ -358,8 +366,6 @@ STATE = load_state()
 
 
 def save_state() -> None:
-    if STATE.get("version") == STATE_VERSION:
-        seed_routes(STATE)
     write_state(STATE)
 
 
@@ -495,42 +501,138 @@ def disabled(name: str) -> bool:
     return bool(ACCOUNTS[name].get("disabled"))
 
 
-def usable(name: str) -> bool:
-    return (not disabled(name)
-            and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
+RECHECK_S = 300
+
+
+def family_route(family: str) -> dict:
+    if "routes" not in STATE:
+        seed_routes(STATE)
+    return STATE["routes"][family]
+
+
+def project_default_route() -> None:
+    route = family_route("default")
+    STATE.update(active_account=route["active_account"], last_switch_ts=route["last_switch_ts"])
+    if route.get("manual_account"):
+        STATE["pinned"] = route["manual_account"]
+    else:
+        STATE.pop("pinned", None)
+
+
+def claim_readings(name: str, family: str) -> dict:
+    return applicable_claims(STATE["accounts"].get(name, {}), family)
+
+
+def current_util(reading: dict, now: float) -> float | None:
+    reset = reading.get("reset")
+    return None if reset is not None and reset <= now else reading.get("utilization")
+
+
+def blocker_deadline(name: str, family: str, now: float) -> float:
+    deadline = STATE["accounts"].get(name, {}).get("blocks_by_family", {}).get(family, {}).get("until", 0)
+    for reading in claim_readings(name, family).values():
+        reset = reading.get("reset", 0)
+        if reset > now and (reading.get("status") == "rejected" or reading.get("utilization", 0) >= 1):
+            deadline = max(deadline, reset)
+        if reading.get("status") == "rejected":
+            deadline = max(deadline, reading.get("recheck_at", 0))
+    return deadline
+
+
+def soft_limited(name: str, family: str, now: float) -> bool:
+    thresholds = {"5h": THRESHOLD, "7d": THRESHOLD_7D, "7d_oi": THRESHOLD_7D}
+    return any((current_util(reading, now) or 0) >= thresholds.get(claim, float("inf"))
+               for claim, reading in claim_readings(name, family).items())
+
+
+def usable(name: str, family: str = "default") -> bool:
+    now = time.time()
+    return not disabled(name) and blocker_deadline(name, family, now) <= now and not soft_limited(name, family, now)
 
 
 def weekly_reset(name: str) -> float:
     return claim_reading(name, "7d").get("reset") or float("inf")
 
 
-def earliest_relief() -> float:
-    """Soonest moment any account's 5h window resets (for hold-until-reset)."""
+def earliest_relief(family: str = "default", now: float | None = None) -> float:
+    now = time.time() if now is None else now
+    return min((max(now, blocker_deadline(name, family, now)) for name in ACCOUNTS if not disabled(name)),
+               default=now + RECHECK_S)
+
+
+def routing_util(name: str, family: str, now: float) -> float:
+    readings = claim_readings(name, family)
+    if (short := current_util(readings.get("5h", {}), now)) is not None:
+        return short
+    return max((current_util(reading, now) or 0 for reading in readings.values()), default=0)
+
+
+def ordered_pick(pool: list, family: str, now: float) -> str | None:
+    return min(pool, key=lambda name: (
+        priority(name), weekly_reset(name) if STRATEGY == "consume-first" else 0,
+        routing_util(name, family, now)), default=None)
+
+
+def route_pool(family: str, now: float) -> list:
+    return [name for name in ACCOUNTS if not disabled(name) and blocker_deadline(name, family, now) <= now]
+
+
+def pick_account(family: str = "default") -> str | None:
     now = time.time()
-    resets = [i.get("reset_5h") for i in STATE["accounts"].values()
-              if i.get("reset_5h") and i["reset_5h"] > now]
-    return min(resets) if resets else now + 300
+    pool = route_pool(family, now)
+    return ordered_pick([name for name in pool if not soft_limited(name, family, now)] or pool, family, now)
 
 
-def pick_account() -> str | None:
-    """Usable = not disabled, both windows under their thresholds (a passed
-    reset counts as 0). Priority tiers come first: a lower `priority` account
-    always beats a higher one, and the strategy orders accounts *within* a tier.
+def switch_route(family: str, target: str, reason: str, now: float) -> None:
+    route = family_route(family)
+    previous = route["active_account"]
+    route.update(active_account=target, last_switch_ts=now, manual_account=None)
+    STATE["events"].append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "switch",
+                            "family": family, "from": previous, "to": target, "reason": reason,
+                            "util": routing_util(previous, family, now)})
+    STATE["events"] = STATE["events"][-200:]
+    if family == "default":
+        project_default_route()
 
-    consume-first (default): burn the usable account whose weekly window resets
-    soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
-    least-used: lowest 5h utilization.
-    If nothing is usable, the non-disabled account whose 5h window resets soonest.
-    """
-    under = [n for n in ACCOUNTS if usable(n)]
-    if under:
-        if STRATEGY == "consume-first":
-            return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
-        return min(under, key=lambda n: (priority(n), utilization(n)))
-    pool = [n for n in ACCOUNTS if not disabled(n)]
+
+def select_account(family: str, now: float) -> str | None:
+    """Select an automatic account under the state lock."""
+    route = family_route(family)
+    current = route["active_account"]
+    pool = route_pool(family, now)
+    under = [name for name in pool if not soft_limited(name, family, now)]
+    if route.get("manual_account") and current not in under:
+        route["manual_account"] = None
+        if family == "default":
+            project_default_route()
+        save_state()
     if not pool:
         return None
-    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    if current not in pool:
+        target = ordered_pick(under or pool, family, now)
+        reason = "account_disabled" if current not in ACCOUNTS or disabled(current) else "quota_exhausted"
+    elif not under or route.get("manual_account") or now - route["last_switch_ts"] < COOLDOWN_S:
+        return current
+    else:
+        target = ordered_pick(under, family, now)
+        if current not in under:
+            readings = claim_readings(current, family)
+            weekly_over = any((current_util(readings.get(claim, {}), now) or 0) >= THRESHOLD_7D
+                              for claim in ("7d", "7d_oi"))
+            if (not weekly_over and priority(target) >= priority(current)
+                    and routing_util(target, family, now) > routing_util(current, family, now) - SWITCH_MARGIN):
+                return current
+            reason = f"utilization>={THRESHOLD}"
+        elif priority(target) < priority(current):
+            reason = "priority_recovery"
+        elif STRATEGY == "consume-first" and weekly_reset(target) < weekly_reset(current) - CF_MARGIN_S:
+            reason = "consume_first"
+        else:
+            return current
+    if target != current:
+        switch_route(family, target, reason, now)
+        save_state()
+    return target
 
 
 def parse_claims(headers: httpx.Headers) -> dict:
@@ -587,7 +689,7 @@ def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str 
             members.intersection_update(reported)
     count = sum(claim not in KNOWN_CLAIMS for claim in claims)
     for claim, fields in reported.items():
-        if not fields:
+        if not fields or (claim == "7d_oi" and family != "fable"):
             continue
         if claim not in KNOWN_CLAIMS:
             if family is None or (claim not in claims and count >= MAX_LEARNED_CLAIMS):
@@ -599,94 +701,73 @@ def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str 
                 and fields["reset"] > now):
             # A new window cannot inherit the old window's usage or rejection.
             reading.clear()
+        if ("status" not in fields and 200 <= status < 300
+                and fields.get("utilization", 1) < 1 and fields.get("reset", 0) > now):
+            reading.pop("status", None)
         reading.update(fields, seen_at=now)
+        if fields.get("status") == "rejected" and reading.get("reset", 0) <= now:
+            reading["recheck_at"] = now + RECHECK_S
+        elif reading.get("status") != "rejected" or reading.get("reset", 0) > now:
+            reading.pop("recheck_at", None)
     if family is not None:
         learned[family] = sorted(members)
     sync_legacy_claims(info)
 
 
-async def note_response(account: str, headers: httpx.Headers, status: int, *, family: str | None = "default") -> str | None:
-    """Update account state from unified rate-limit headers; maybe switch.
+def aggregate_recheck(info: dict, headers: httpx.Headers, family: str, now: float) -> float:
+    representative = headers.get("anthropic-ratelimit-unified-representative-claim", "").strip().lower()
+    if family == "fable" and (representative in ("seven_day_oi", "7d_oi") or "fable" in representative):
+        reading = account_claims(info).get("7d_oi", {})
+        for value in (reading.get("reset"), headers.get("anthropic-ratelimit-unified-reset")):
+            try:
+                reset = float(value)
+            except (TypeError, ValueError):
+                continue
+            if providers.number(reset) and reset > now:
+                return reset
+    return now + RECHECK_S
 
-    Returns what happened: "burst" (per-minute 429, paced — no rotation),
-    "switched" (active account changed, retry can ride it), "exhausted"
-    (quota gone and nowhere better to go), or None.
-    """
+
+async def note_response(account: str, headers: httpx.Headers, status: int, *, family: str | None = "default",
+                        repeated_burst: bool = False, automatic: bool = True) -> str | None:
+    """Observe headers once and classify an automatic 429 for its own family."""
     async with state_lock:
         info = STATE["accounts"].setdefault(account, {})
         now = time.time()
         observe_claims(info, headers, status, family, now)
-        if headers.get("anthropic-ratelimit-unified-status"):
-            info["status"] = headers["anthropic-ratelimit-unified-status"]
+        aggregate = headers.get("anthropic-ratelimit-unified-status")
+        if aggregate:
+            info["status"] = aggregate
         info["last_seen"] = now
-
-        quota_hit = info.get("status") == "rejected" or (
-            status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
-        if status == 429 and not quota_hit:
-            # Per-minute burst limit, not spent quota. Rotating would just move
-            # the burst to the next account and drop its warm prompt cache —
-            # pace this account briefly instead.
-            try:
-                pace = min(float(headers.get("retry-after", "")), 60.0)
-            except ValueError:
-                pace = 15.0
-            info["pace_until"] = now + pace
-            info["pace_by_family"] = dict.fromkeys(MODEL_FAMILIES, info["pace_until"])
+        if not automatic:
             save_state()
-            return "burst"
-
-        verdict = None
-        pin = STATE.get("pinned")
-        if pin != STATE["active_account"] or (pin == account and (quota_hit or not usable(account))):
-            STATE.pop("pinned", None)  # the pick ended: a threshold, the quota, or a move away
-        if STATE["active_account"] != account:
-            # Another request already rotated; a retry rides the new active.
-            verdict = "switched" if quota_hit else None
-        else:
-            cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
-            over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
-            nxt = pick_account()
-            reason = None
-            if nxt is not None and nxt != account:
-                if quota_hit:
-                    reason = "quota_exhausted"  # hard stop: no cooldown, no margin
-                elif disabled(account):
-                    reason = "account_disabled"  # hard rule: leave immediately
-                elif over and cooled:
-                    # Hysteresis: only move to a meaningfully better account, so
-                    # two accounts hovering at the line never ping-pong. A move
-                    # to a preferred tier, or off a week-exhausted account,
-                    # skips the margin.
-                    if (util_7d(account) >= THRESHOLD_7D
-                            or priority(nxt) < priority(account)
-                            or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
-                        reason = f"utilization>={THRESHOLD}"
-                elif cooled and usable(nxt) and STATE.get("pinned") != account:
-                    # A panel pick holds until a threshold, the quota or disabling ends it.
-                    if priority(nxt) < priority(account):
-                        # A preferred account has room again — pull traffic back.
-                        reason = "priority_recovery"
-                    elif (STRATEGY == "consume-first"
-                          and weekly_reset(nxt) < weekly_reset(account) - CF_MARGIN_S):
-                        # Use-it-or-lose-it: proactively jump to an account whose
-                        # weekly window expires clearly sooner than the active one's.
-                        reason = "consume_first"
-            if reason:
-                STATE["active_account"] = nxt
-                STATE["last_switch_ts"] = now
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "type": "switch",
-                    "from": account, "to": nxt,
-                    "reason": reason,
-                    "util": utilization(account),
-                })
-                STATE["events"] = STATE["events"][-200:]
-                verdict = "switched"
-            elif quota_hit:
-                verdict = "exhausted"
+            return None
+        family = family or "default"
+        route = family_route(family)
+        if status == 429 and blocker_deadline(account, family, now) <= now:
+            if aggregate == "rejected" or repeated_burst:
+                deadline = aggregate_recheck(info, headers, family, now) if aggregate == "rejected" else now + RECHECK_S
+                info.setdefault("blocks_by_family", {})[family] = {
+                    "until": deadline, "reason": "rejected" if aggregate == "rejected" else "repeated_429"}
+            else:
+                try:
+                    pace = float(headers.get("retry-after", ""))
+                except ValueError:
+                    pace = 15
+                pace = min(max(pace, 0), 60) if providers.number(pace) else 15
+                info.setdefault("pace_by_family", {})[family] = now + pace
+                save_state()
+                return "burst"
+        if status == 429:
+            target = select_account(family, now)
+            save_state()
+            return "switched" if target is not None and target != account else "exhausted"
+        if route["active_account"] == account:
+            target = select_account(family, now)
+            save_state()
+            return "switched" if target is not None and target != account else None
         save_state()
-        return verdict
+        return None
 
 
 # Cheapest call that returns the unified headers on a setup-token: /api/oauth/usage
@@ -717,7 +798,7 @@ async def refresh_idle_accounts() -> None:
             print(f"warning: usage refresh of {name} failed ({type(exc).__name__})", file=sys.stderr)
             continue
         if "anthropic-ratelimit-unified-status" in r.headers:
-            await note_response(name, r.headers, r.status_code)
+            await note_response(name, r.headers, r.status_code, automatic=False)
         else:
             # note_response would read a headerless 429 as a burst and pace the account.
             print(f"warning: usage refresh of {name}: HTTP {r.status_code} without usage headers",
@@ -1062,26 +1143,28 @@ async def rotate_switch(request: Request):
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
     async with state_lock:
-        current = STATE["active_account"]
         if body.get("auto"):
-            STATE.pop("pinned", None)
+            for family in MODEL_FAMILIES:
+                family_route(family)["manual_account"] = None
+            project_default_route()
             save_state()
-            return {"active_account": current, "pinned": None}
+            return {"active_account": STATE["active_account"], "pinned": None}
         target = body.get("account")
         if not isinstance(target, str) or target not in ACCOUNTS:
             return JSONResponse({"error": "unknown account"}, status_code=404)
-        if not usable(target):
+        eligible = [family for family in MODEL_FAMILIES if usable(target, family)]
+        if not eligible:
             return JSONResponse({"error": f"{target} is disabled or at a switch threshold"},
                                 status_code=409)
-        if target != current:
-            STATE["active_account"], STATE["last_switch_ts"] = target, time.time()
-            STATE["events"].append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "switch",
-                                    "from": current, "to": target, "reason": "manual",
-                                    "util": utilization(current) if current in ACCOUNTS else 0.0})
-            STATE["events"] = STATE["events"][-200:]
-        STATE["pinned"] = target
+        now = time.time()
+        for family in eligible:
+            route = family_route(family)
+            if target != route["active_account"]:
+                switch_route(family, target, "manual", now)
+            route["manual_account"] = target
+        project_default_route()
         save_state()
-    return {"active_account": target, "pinned": target}
+    return {"active_account": STATE["active_account"], "pinned": STATE.get("pinned")}
 
 
 def panel_allowed(request: Request) -> bool:
@@ -2145,43 +2228,75 @@ def add_claude_audit_fields(rec: dict, upstream: httpx.Response, account: str, r
     if retries:
         rec["retries"] = retries
     model = rec["model"]
-    if ((isinstance(model, str) and "fable" in model.lower())
-            or "anthropic-ratelimit-unified-5h-utilization" not in upstream.headers):
+    if not rec.get("local") and ((isinstance(model, str) and "fable" in model.lower())
+                                 or "anthropic-ratelimit-unified-5h-utilization" not in upstream.headers):
         rec["ratelimit"] = rate_limit_headers(upstream.headers)
 
 
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, rec: dict,
                         request: Request | None = None, *, family: str | None = None):
-    """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
-    pick the active account, pace bursts, retry through switches, optionally hold
-    until the soonest window reset. Returns (upstream, account, retries, noted,
-    verdict) and records 429s in rec. Noted means note_response already ran for the returned response;
-    verdict is note_response's word for the LAST 429 seen ("burst" / "switched" /
-    "exhausted" / None)."""
-    hold_deadline = time.time() + HOLD_MAX_S if HOLD_MAX_S else None
+    """Choose an account on every attempt and observe its headers before handing off the body."""
+    route_family = family or "default"
+    hold_deadline = time.monotonic() + HOLD_MAX_S
     retries = 0
-    noted = False
     verdict = None
+    account = None
+    pending = None
+    burst_accounts = set()
+    retrying = False
     try:
         while True:
             await retry_wait(0, request)
-            account = STATE.get("active_account")
-            if account not in ACCOUNTS or disabled(account):
-                account = pick_account()
+            remaining = hold_deadline - time.monotonic()
+            if pending and verdict == "exhausted" and remaining <= 0:
+                return pending[0], pending[1], retries, "exhausted"
+            now = time.time()
+            async with state_lock:
+                account = select_account(route_family, now)
                 if account is None:
-                    raise HTTPException(status_code=503, detail="no enabled accounts")
-                STATE["active_account"] = account
-                save_state()
-            fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
-            pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
+                    if not any(not disabled(name) for name in ACCOUNTS):
+                        raise HTTPException(status_code=503, detail="no enabled accounts")
+                    relief = earliest_relief(route_family, now)
+                    wait = min(relief - now, remaining)
+                    if wait > 0:
+                        source = family_route(route_family)["active_account"]
+                        STATE["events"].append({
+                            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold", "family": route_family,
+                            "from": source, "to": source, "reason": f"all accounts spent; holding {round(wait)}s"})
+                        STATE["events"] = STATE["events"][-200:]
+                        save_state()
+                else:
+                    info = STATE["accounts"].get(account, {})
+                    pace = info.get("pace_by_family", {}).get(route_family, info.get("pace_until", 0)) - now
+                    token = ACCOUNTS[account]["token"]
+            if account is None:
+                if wait > 0:
+                    await retry_wait(wait, request)
+                    continue
+                if pending:
+                    return pending[0], pending[1], retries, "exhausted"
+                rec["local"] = True
+                retry_after = str(max(1, round(relief - now)))
+                return httpx.Response(429, headers={"retry-after": retry_after}, json={
+                    "type": "error", "error": {"type": "rate_limit_error",
+                                              "message": "claude-rotate: every account's window is spent"}}), None, retries, "exhausted"
             if pace > 0:
                 await retry_wait(min(pace, 60), request)
+                continue
+            if retrying:
+                retries += 1
+            pending = None
+            fwd_headers["authorization"] = f"Bearer {token}"
             upstream = await client.send(
-                client.build_request(method, url, headers=fwd_headers, content=body),
-                stream=True)
+                client.build_request(method, url, headers=fwd_headers, content=body), stream=True)
+            try:
+                verdict = await note_response(account, upstream.headers, upstream.status_code, family=family,
+                                              repeated_burst=account in burst_accounts)
+            except BaseException:
+                await upstream.aclose()
+                raise
             if upstream.status_code != 429:
-                return upstream, account, retries, noted, verdict
-            verdict = await note_response(account, upstream.headers, 429, family=family)
+                return upstream, account, retries, verdict
             retry_after = upstream.headers.get("retry-after")
             entry = {"account": account, "verdict": verdict,
                      "retry_after": retry_after[:200] if retry_after is not None else None,
@@ -2190,30 +2305,22 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
             if len(entries) < MAX_RATE_LIMIT_ATTEMPTS:
                 entries.append(entry)
             else:
-                # Keep the initial attempts and the most recent one.
                 entries[-1] = entry
                 rec["rate_limits_omitted"] = rec.get("rate_limits_omitted", 0) + 1
-            wait = 0.0
-            retry = verdict in ("switched", "burst") and retries < 5
-            if not retry and verdict == "exhausted" and hold_deadline:
-                # Every account is spent: hold the request open until the soonest
-                # window reset instead of failing, so unattended runs finish.
-                wait = min(earliest_relief() + 5, hold_deadline) - time.time()
-                retry = wait > 0
+
+            retry = (verdict == "exhausted" and time.monotonic() < hold_deadline
+                     or verdict in ("switched", "burst") and retries < 5)
             if not retry:
-                noted = True
-                return upstream, account, retries, noted, verdict
-            rate_limit_error(entry, await bounded_response(upstream), upstream.headers)
-            retries += 1
-            if wait > 0:
-                async with state_lock:
-                    STATE["events"].append({
-                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
-                        "from": account, "to": account,
-                        "reason": f"all accounts spent; holding {round(wait)}s"})
-                    STATE["events"] = STATE["events"][-200:]
-                    save_state()
-                await retry_wait(wait, request)
+                return upstream, account, retries, verdict
+            content = await bounded_response(upstream)
+            rate_limit_error(entry, content, upstream.headers)
+            # Keep the actual 429 if the pool becomes blocked before the retry.
+            pending = (httpx.Response(429, content=content, headers=response_headers(upstream)), account)
+            if verdict == "burst":
+                burst_accounts.add(account)
+            else:
+                burst_accounts.discard(account)
+            retrying = True
     except (Exception, asyncio.CancelledError) as exc:
         if rec.get("rate_limits"):
             status = 500
@@ -2263,11 +2370,11 @@ async def openai_chat(request: Request):
            "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
     rec = {"device": device, "path": "/v1/chat/completions", "method": "POST", "model": abody.get("model")}
     family = model_family(rec["model"])
-    upstream, account, retries, noted, verdict = await send_upstream(
+    upstream, account, retries, verdict = await send_upstream(
         "POST", "/v1/messages", fwd, json.dumps(abody).encode(), rec, request, family=family)
 
     add_claude_audit_fields(rec, upstream, account, retries)
-    resp_headers = {"x-rotate-account": account}
+    resp_headers = {"x-rotate-account": account} if account else {}
     for h in ("anthropic-ratelimit-unified-5h-utilization",
               "anthropic-ratelimit-unified-7d-utilization",
               "anthropic-ratelimit-unified-5h-reset",
@@ -2276,8 +2383,10 @@ async def openai_chat(request: Request):
             resp_headers[h] = upstream.headers[h]
 
     if upstream.status_code == 429 and verdict == "exhausted":
-        rate_limit_error(rec["rate_limits"][-1], await bounded_response(upstream), upstream.headers)
-        retry_after = max(1, round(earliest_relief() - time.time()))
+        content = await bounded_response(upstream)
+        if not rec.get("local"):
+            rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
+        retry_after = max(1, round(earliest_relief(family) - time.time()))
         rec["status"] = 503
         audit(rec)
         return JSONResponse(
@@ -2303,16 +2412,13 @@ async def openai_chat(request: Request):
                 rec["util_5h"] = upstream.headers.get(
                     "anthropic-ratelimit-unified-5h-utilization")
                 audit(rec)
-                await note_response(account, upstream.headers, upstream.status_code, family=family)
 
         return StreamingResponse(relay(), status_code=200, headers=resp_headers,
                                  media_type="text/event-stream")
 
     content = await bounded_response(upstream)
-    if upstream.status_code == 429:
+    if upstream.status_code == 429 and not rec.get("local"):
         rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
-    if not noted:
-        await note_response(account, upstream.headers, upstream.status_code, family=family)
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     if upstream.status_code != 200:
         try:
@@ -2749,12 +2855,13 @@ async def proxy(request: Request, path: str):
     family = model_family(model) if request.method == "POST" and raw_path == "/v1/messages" else None
     url = upstream_url(UPSTREAM, raw_path, upstream_query(request))
     rec = {"device": device, "path": "/" + path, "method": request.method, "model": model}
-    upstream, account, retries, noted, _verdict = await send_upstream(
+    upstream, account, retries, _verdict = await send_upstream(
         request.method, url, fwd_headers, body, rec, request, family=family)
 
     add_claude_audit_fields(rec, upstream, account, retries)
     resp_headers = response_headers(upstream)
-    resp_headers["x-rotate-account"] = account
+    if account:
+        resp_headers["x-rotate-account"] = account
 
     if "text/event-stream" in upstream.headers.get("content-type", ""):
         usage_acc: dict = {}
@@ -2777,12 +2884,11 @@ async def proxy(request: Request, path: str):
                 rec["usage"] = summarize_usage(usage_acc)
                 rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
                 audit(rec)
-                await note_response(account, upstream.headers, upstream.status_code, family=family)
 
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
     content = await bounded_response(upstream)
-    if upstream.status_code == 429:
+    if upstream.status_code == 429 and not rec.get("local"):
         rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
     try:
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
@@ -2790,8 +2896,6 @@ async def proxy(request: Request, path: str):
         pass
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     audit(rec)
-    if not noted:
-        await note_response(account, upstream.headers, upstream.status_code, family=family)
     return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
 
 
