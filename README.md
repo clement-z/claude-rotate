@@ -623,8 +623,9 @@ series by provider.
 
 The proxy keeps up to 16 series per provider in `provider_quota_history.json`
 next to `state.json`. The latest reading in each UTC five-minute bucket
-wins. The proxy saves changes once a minute and on orderly shutdown. An abrupt
-stop can lose readings since the last successful save.
+wins. The proxy saves changes in the maintenance loop after any idle-account
+probes, and on orderly shutdown. Slow probes can delay a save. An abrupt stop
+can lose readings since the last successful save.
 
 ## Configuration (`config.json`)
 
@@ -816,11 +817,14 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
   include non-message upstream responses too. Storage-write failures are reported
   in the journal and `/rotate/status` `storage_errors`; requests continue, so
   audit/state persistence can be lost until storage is repaired.
-- **What to back up.** `tokens/` and `config.json` (`/etc/claude-rotate/` on
-  the Debian service) — that's the whole identity of the install. `state.json`
-  is disposable (quota state is re-learned from the first responses; you only
-  lose the events history), and `logs/` and `usage_history.json` are
-  disposable analytics. `device_usage.json` is rebuilt from `logs/` if lost,
+- **What to back up.** Keep a protected backup of `tokens/` and `config.json`
+  (under `/etc/claude-rotate/` on Debian) and of the state directory's private
+  `credentials/` subdirectory if you use OpenAI. On Debian, back up
+  `/var/lib/claude-rotate/credentials/` for the Sign in with ChatGPT and Codex
+  logins. The proxy can rebuild quota state from upstream responses if
+  `state.json` is lost, but the events history goes with it.
+  `logs/` and `usage_history.json` are disposable analytics.
+  `device_usage.json` is rebuilt from `logs/` if lost,
   but all-time totals and billing-period use older than the oldest kept log
   (and the 14 days of `usage_history.json`) go with it. The plan history
   lives in `config.json`. Keep `provider_quotas.json` and

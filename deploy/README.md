@@ -112,10 +112,11 @@ modes above and restarts the service. Do not run `setup.sh` inside
 `/etc/claude-rotate`: its `0600`/`0700` modes make the files unreadable to the
 service account. Relative token paths such as `tokens/acct-1.token` resolve
 against `/etc/claude-rotate`, the directory of the selected config, not the code
-directory. Keep a protected backup of `/etc/claude-rotate`. Neither secrets nor
-state belong in the release tree or source control. Renew an expired or revoked
-token with `claude-rotate-admin add-token NAME` for the existing account; it
-replaces the token file and restarts the service.
+directory. Keep a protected backup of `/etc/claude-rotate` and, if you use
+OpenAI, `/var/lib/claude-rotate/credentials/` for the Sign in with ChatGPT and
+Codex logins. Keep secrets and state outside the release tree and source control.
+Renew an expired or revoked token with `claude-rotate-admin add-token NAME` for
+the existing account. It replaces the token file and restarts the service.
 
 ## Runtime and operations
 
