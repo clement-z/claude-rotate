@@ -55,6 +55,7 @@ from starlette.datastructures import MutableHeaders
 
 import pricing
 import providers
+import quota_rate
 from oai_compat import SseToOai, anthropic_to_oai, claude_usage as summarize_usage, oai_to_anthropic
 from pricing import BUILTIN_PRICES, DEFAULT_PRICE
 from providers import ANTHROPIC, HISTORY_DAYS
@@ -76,7 +77,8 @@ PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip", "x-o
 
 @asynccontextmanager
 async def lifespan(app):
-    tasks = [asyncio.create_task(refresh_loop()), asyncio.create_task(providers.maintain_loop(PROVIDERS))]
+    tasks = [asyncio.create_task(refresh_loop()), asyncio.create_task(providers.maintain_loop(PROVIDERS)),
+             asyncio.create_task(quota_rate_loop())]
     try:
         yield
     finally:
@@ -225,7 +227,7 @@ class RequestAdmission:
     async def __call__(self, scope, receive, send):
         admin = (scope.get("method"), scope.get("path")) in {
             ("GET", "/rotate/status"), ("GET", "/rotate/stats"), ("GET", "/rotate/panel"),
-            ("GET", "/rotate/quota-history"), ("GET", "/rotate/ratelimits"),
+            ("GET", "/rotate/quota-history"), ("GET", "/rotate/quota-rate"), ("GET", "/rotate/ratelimits"),
             ("POST", "/rotate/switch"), ("POST", "/rotate/device-pin")}
         if scope["type"] != "http" or not self.limit or admin:
             return await self.app(scope, receive, send)
@@ -1398,6 +1400,13 @@ async def rotate_quota_history(request: Request):
     return {"as_of": now, "providers": quota_history_snapshot(now)}
 
 
+@app.get("/rotate/quota-rate")
+async def rotate_quota_rate(request: Request):
+    if not panel_allowed(request):
+        return JSONResponse({"error": "unknown device key"}, status_code=401)
+    return Response(QUOTA_RATE_REPORT, media_type="application/json")
+
+
 @app.get("/rotate/ratelimits")
 async def rotate_ratelimits(request: Request):
     if not panel_allowed(request):
@@ -1553,10 +1562,34 @@ def load_prices() -> dict:
 
 
 PRICES = load_prices()
+QUOTA_RATE_REPORT = b'{"computed_at":null,"summary":[],"fits":[]}'
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
     "util_warn": 0.8,
 })
+
+
+def compute_quota_rate():
+    accounts = {account["name"] for account in CFG["accounts"]}
+    report = quota_rate.read_report(AUDIT_PATH, HISTORY_PATH, QUOTA_HISTORY_PATH, accounts,
+                                    set(quota_histories()), PRICES, time.time())
+    if report["warnings"]:
+        raise ValueError("; ".join(report["warnings"]))
+    fits = [dict(row["fable_fit"], account=row["name"]) for row in report["series"]
+            if row.get("fable_fit", {}).get("fable_usd_per_percent") is not None]
+    return json.dumps({"computed_at": time.time(), "summary": report["summary"], "fits": fits},
+                      allow_nan=False).encode()
+
+
+async def quota_rate_loop(start_delay=2, interval=600):
+    global QUOTA_RATE_REPORT
+    await asyncio.sleep(start_delay)
+    while True:
+        try:
+            QUOTA_RATE_REPORT = await asyncio.to_thread(compute_quota_rate)
+        except Exception as exc:
+            storage_error("quota_rate", exc)
+        await asyncio.sleep(interval)
 
 
 def price_for(model: str | None, default=DEFAULT_PRICE) -> list[float] | None:
@@ -2068,6 +2101,11 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  table{border-collapse:collapse;width:100%} th,td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
  th{color:var(--muted);font-weight:500;font-size:12px} td:first-child,th:first-child,.l{text-align:left} tr:last-child td{border-bottom:0}
  td .sub{display:block;color:var(--muted);font-size:11px} tr.removed td{color:var(--muted)}
+ #quota-rates :is(th,td):nth-child(2){text-align:left}
+ #quota-rates td:nth-child(n+4):not(:last-child){order:0}
+ #quota-rates td:is(:nth-child(-n+2),:nth-child(7)){white-space:normal;overflow-wrap:anywhere}
+ #quota-rate-fits{overflow-wrap:anywhere}
+ #quota-rate-fits div{margin-top:6px}
  .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-left:auto}
  .seg button{background:none;border:0;color:var(--ink2);padding:4px 12px;font:inherit;font-size:12px;cursor:pointer} .seg button.on{background:var(--grid);color:var(--ink);font-weight:600}
  .split{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
@@ -2107,6 +2145,11 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <span><span class="key dash" style="border-color:var(--muted)"></span>Projected</span><span><span class="key band"></span>&#9940; Every account at its limit</span></span>
  <button class="linkbtn" id="tbl">Table</button></h2>
  <div id="weekly" class="muted">collecting data</div><div class="tip" id="tip"></div></section>
+<section class="card"><h2>Quota rates <span id="quota-rate-age" class="muted" style="font-weight:400"></span></h2>
+ <p id="quota-rate-empty" class="muted">Not enough data</p>
+ <table id="quota-rates" class="cards"></table><div id="quota-rate-fits" class="muted small"></div>
+ <p class="muted small">API list prices. Estimates skip detected outside-only rises and split at mid-window credits. See <code>claude-rotate-admin quota-rate</code> for details.</p>
+</section>
 <section class="card"><h2>Subscriptions <span class="muted" style="font-weight:400">billing periods &middot; USD list prices</span></h2><div id="billing"></div></section>
 <section class="card"><h2>Devices</h2><table id="devices" class="cards"></table></section>
 <section class="split">
@@ -2134,6 +2177,7 @@ history.replaceState(null, '', cleanURL.pathname + cleanURL.search + cleanURL.ha
 const $=id=>document.getElementById(id), H=3600, D=86400, PERIODS={'24 h':'24h','7 d':'7d','30 d':'30d','All time':'all'};
 let period='7 d', showTable=false, WK=null, ST={}, PENDING=null, weeklySelection=null;
 let quotaHistory=null, quotaHistoryFailed=false;
+let quotaRateComputedAt=null;
 const quotaCards=new Map();
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(n){n=n||0;return n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e4?0:1)+'k':''+Math.round(n)}
@@ -2283,6 +2327,46 @@ async function refreshQuotaHistory(){
     quotaHistoryFailed=true;
   }
   quotaCards.forEach((card,name)=>renderQuotaHistory(name,card));
+}
+function updateQuotaRateAge(){
+  if(quotaRateComputedAt!==null) $('quota-rate-age').textContent=
+    'computed '+Math.max(0,Math.floor((Date.now()/1000-quotaRateComputedAt)/60))+' min ago';
+}
+function quotaRateTime(t){
+  if(t?.lasts_until_reset===true&&Number.isFinite(t.reset_in_hours))
+    return "won't run out before the reset in "+(t.reset_in_hours/24).toFixed(2)+' d';
+  if(Number.isFinite(t?.hours)) return t.hours>48?(t.hours/24).toFixed(2)+' d':t.hours.toFixed(2)+' h';
+  return t?.pace_points_per_day===0?'no rise observed':'';
+}
+async function refreshQuotaRate(){
+  try{
+    const response=await panelFetch('/rotate/quota-rate');
+    if(!response.ok) return;
+    const data=await response.json();
+    if(!Number.isFinite(data?.computed_at)||!Array.isArray(data.summary)||data.computed_at<quotaRateComputedAt) return;
+    const columns=['Account','Limit','Used','$ / 1%','Output tok / 1%','$ left','Time left','Samples'];
+    const dollars=n=>'$'+n.toFixed(2), value=(n,format)=>Number.isFinite(n)?esc(format(n)):'&ndash;';
+    const none='<span class="muted small">Not enough data</span>';
+    const rows=data.summary.map(row=>{
+      const c=row.usd_per_percent;
+      const iqr=Number.isFinite(c?.q1)&&Number.isFinite(c?.q3)?
+        '<span class="sub">IQR '+esc(dollars(c.q1)+'–'+dollars(c.q3))+'</span>':'';
+      const cells=['<b>'+esc(row.account)+'</b>',esc(row.limit),value(row.used_percent,n=>n+'%'),
+        Number.isFinite(c?.median)?esc(dollars(c.median))+iqr:none,
+        value(row.output_tokens_per_percent,n=>Math.round(n).toLocaleString()),value(row.usd_left,dollars),
+        esc(quotaRateTime(row.time_left))||'&ndash;',value(row.samples,String)];
+      return '<tr>'+cells.map((cell,i)=>`<td data-l="${esc(columns[i])}">${cell}</td>`).join('')+'</tr>';
+    });
+    const fits=(Array.isArray(data.fits)?data.fits:[]).filter(f=>
+      Number.isFinite(f.fable_usd_per_percent)&&Number.isFinite(f.other_usd_per_percent)).map(f=>
+      '<div><b>'+esc(f.account)+'</b> &middot; '+esc('Fable '+dollars(f.fable_usd_per_percent)+
+        ' per 1%, other '+dollars(f.other_usd_per_percent)+' per 1%')+'</div>');
+    $('quota-rates').innerHTML=rows.length?'<tr>'+columns.map(c=>'<th scope="col">'+esc(c)+'</th>').join('')+'</tr>'+rows.join(''):'';
+    $('quota-rate-fits').innerHTML=fits.join('');
+    $('quota-rate-empty').hidden=rows.length>0;
+    quotaRateComputedAt=data.computed_at;
+    updateQuotaRateAge();
+  }catch(err){ /* keep the last report */ }
 }
 function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
   return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
@@ -2454,6 +2538,7 @@ $('pin-save').onclick=async()=>{
   }catch(err){$('pin-error').textContent='request failed'}finally{$('pin-save').disabled=false}
 };
 async function refresh(){
+  updateQuotaRateAge();
   const [st, stats] = await Promise.all([
     panelFetch('/rotate/status').then(r=>r.json()), panelFetch('/rotate/stats').then(r=>r.json())]);
   const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{}); ST=st;
@@ -2516,6 +2601,7 @@ async function refresh(){
 }
 refresh(); setInterval(refresh, 10000);
 refreshQuotaHistory(); setInterval(refreshQuotaHistory, 60000);
+refreshQuotaRate(); setInterval(refreshQuotaRate, 300000);
 window.addEventListener('resize',resizeQuotaPlots);
 </script></body></html>"""
 

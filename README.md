@@ -403,6 +403,9 @@ access as the panel. `GET /rotate/status` returns per-account `claims`,
 `active_by_family`, effective `device_pins` with their source, and switch
 events. The legacy `active_account` field projects the default route.
 `GET /rotate/stats` returns rollups, alerts, the longer `periods` and `billing`.
+`GET /rotate/quota-rate` returns the last computed quota-rate summary, its
+computation time in Unix seconds and the weekly Fable cost fits. It uses the same panel
+authorization and `Cache-Control: no-store`.
 Both panel writes require same-origin JSON. `POST /rotate/switch` takes
 `{"account": NAME}` or `{"auto": true}`. `POST /rotate/device-pin` takes
 `{"device": NAME, "account_pin": {"account": ACCOUNT, "mode": MODE}}`.
@@ -476,6 +479,13 @@ The same summary appears under `summary` in JSON. Remaining dollars and
 tokens use the latest reading and the median rates. The general weekly fit
 reports dollars per point for Fable and other models when both fitted rates
 are positive. JSON also retains the original coefficients.
+
+The panel's **Quota rates** section below the weekly chart shows the same
+summary and fits using the default lookback and minimum rise. The gateway
+computes it in a worker thread shortly after startup and every ten minutes,
+using the same bounded audit scan as the command. The panel fetches the report
+on open and every five minutes. A failed computation or fetch keeps the last
+successful result and its timestamp.
 
 Time left uses quota readings from the last 24 h, including usage outside the
 gateway. It adds the rise from the first to last reading within each segment,

@@ -95,9 +95,11 @@ const document = {
 };
 const timers=new Map();
 let historyOK=true;
+let quotaRateOK=true, quotaRate={computed_at:null,summary:[],fits:[]};
 const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fake-viewer-key',href:'http://proxy/rotate/panel?key=fake-viewer-key'},history:{replaceState:(_a,_b,url)=>replaced.push(url)},document,window:{addEventListener(){}},setInterval:(f,ms)=>timers.set(ms,f),fetch:async(url,opts)=>{
   urls.push({url,opts});
   if(url==='/rotate/quota-history') return {ok:historyOK,json:async()=>quotaHistory};
+  if(url==='/rotate/quota-rate') return {ok:quotaRateOK,json:async()=>quotaRate};
   return {ok:true,json:async()=>url==='/rotate/status'?status:stats};
 }});
 elements.tip=new Element();
@@ -108,6 +110,31 @@ elements.tip.parentNode=new Element();
   assert(replaced.every(url=>!url.includes('key=')));
   assert(urls.every(({url,opts})=>!url.includes('key=')&&opts.headers.Authorization==='Bearer fake-viewer-key'&&opts.cache==='no-store'));
   assert.equal(urls.filter(({url})=>url==='/rotate/quota-history').length,1,'history fetched on open and separately from status');
+  assert.equal(urls.filter(({url})=>url==='/rotate/quota-rate').length,1,'quota rates fetched on open and separately from status');
+  assert.equal(elements['quota-rates']?.innerHTML||'','','a pending report has no rows');
+  quotaRate={computed_at:receipt-125,summary:[
+    {account:value,limit:value,used_percent:82,usd_per_percent:{median:11.34,q1:10.24,q3:14.59},
+     output_tokens_per_percent:25000,usd_left:204.12,time_left:{hours:12.5},samples:21},
+    {account:'OpenAI',limit:'images 24h',used_percent:0,usd_per_percent:null,output_tokens_per_percent:null,
+     usd_left:value,time_left:null,samples:0}
+  ],fits:[{account:value,fable_usd_per_percent:9.03,other_usd_per_percent:21.05}]};
+  await timers.get(300000)();
+  const rates=elements['quota-rates'].innerHTML, fits=elements['quota-rate-fits'].innerHTML;
+  assert(!rates.includes('<mark')&&!fits.includes('<mark'));
+  assert(rates.includes('&lt;mark')&&fits.includes('&lt;mark'),'quota-rate account, limit and fit labels are escaped');
+  assert(rates.includes('$11.34')&&rates.includes('IQR $10.24–$14.59')&&rates.includes('$204.12')&&rates.includes('12.50 h'));
+  assert(rates.includes('>0%</td>')&&rates.includes('Not enough data')&&elements['quota-rate-empty'].hidden);
+  assert(fits.includes('Fable $9.03 per 1%, other $21.05 per 1%'));
+  assert.equal(elements['quota-rate-age'].textContent,'computed 2 min ago');
+  quotaRateOK=false;
+  await timers.get(300000)();
+  assert.equal(elements['quota-rates'].innerHTML,rates,'a failed fetch retains the report');
+  assert.equal(elements['quota-rate-fits'].innerHTML,fits);
+  quotaRateOK=true;
+  quotaRate={computed_at:receipt,summary:[],fits:[]};
+  await timers.get(300000)();
+  assert.equal(elements['quota-rates'].innerHTML,'','empty report clears the table');
+  assert(!elements['quota-rate-empty'].hidden&&!elements['quota-rate-fits'].innerHTML);
   assert(elements.weekly.innerHTML.includes('class="hit"'),'shortfall band not drawn');
   const {tip}=elements, scroll=()=>document.getElementById('wk-scroll');
   const touch=(x,y=30)=>({pointerType:'touch',pointerId:1,clientX:x,clientY:y});

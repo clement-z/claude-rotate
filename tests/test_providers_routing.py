@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -319,7 +320,7 @@ async def panel(c):
     for tailnet in (False, True):
         R.PANEL_TAILNET = tailnet
         mode = "tailnet on" if tailnet else "tailnet off"
-        for path in ("/rotate/panel", "/rotate/status", "/rotate/stats", "/rotate/quota-history",
+        for path in ("/rotate/panel", "/rotate/status", "/rotate/stats", "/rotate/quota-history", "/rotate/quota-rate",
                      "/rotate/ratelimits", "/rotate/switch"):
             codes = [await hit(path, KEY[d]) for d in ("claude", "allbox", "lanbox", "oaibox")]
             check(f"{mode} {path}: a key with the anthropic grant opens it, a provider-only key does not",
@@ -330,6 +331,51 @@ async def panel(c):
         codes = [await hit("/rotate/panel", KEY[d], query=True) for d in ("claude", "lanbox")]
         check(f"{mode} /rotate/panel?key=: the claude key opens it, lanbox's does not", codes == [200, 401])
     R.PANEL_TAILNET = False
+
+
+async def quota_rate_worker(c):
+    audit_path = tmp / "quota-rate-audit.jsonl"
+    audit_path.write_text("".join(json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(time.time() - age)),
+        "account": "acct", "path": "/v1/messages", "method": "POST", "model": "claude-opus-5",
+        "util": {"7d": used}, "usage": {"output_tokens": 200_000},
+    }) + "\n" for age, used in ((60, .1), (30, .2))))
+    loop = asyncio.get_running_loop()
+    main_thread = threading.get_ident()
+    resumed = asyncio.Event()
+    release = threading.Event()
+    threads = []
+    original = R.compute_quota_rate
+
+    def compute():
+        threads.append(threading.get_ident())
+        if len(threads) == 2:
+            raise RuntimeError("mock quota scan failure")
+        if len(threads) == 3:
+            loop.call_soon_threadsafe(resumed.set)
+            if not release.wait(3):
+                raise RuntimeError("test did not release the quota worker")
+            return b'{"computed_at":1,"summary":[],"fits":[]}'
+        return original()
+
+    with patch.multiple(R, compute_quota_rate=compute, AUDIT_PATH=audit_path, STORAGE_ERRORS={},
+                        QUOTA_RATE_REPORT=b'{"computed_at":null,"summary":[],"fits":[]}'):
+        task = asyncio.create_task(R.quota_rate_loop(start_delay=0, interval=.01))
+        try:
+            await asyncio.wait_for(resumed.wait(), 3)
+            response = await asyncio.wait_for(ask(c, "/rotate/quota-rate", "claude"), 1)
+            report = response.json()
+            row = next(row for row in report["summary"] if row["account"] == "acct")
+            check("quota-rate scans off the event loop and serves the last result while the next scan waits",
+                  len(threads) == 3 and main_thread not in threads and response.status_code == 200
+                  and response.headers["cache-control"] == "no-store" and report["computed_at"] > 0
+                  and row["usd_per_percent"]["median"] == .5 and row["samples"] == 1)
+            check("a failed quota-rate scan records a storage error and the loop retries",
+                  R.STORAGE_ERRORS.get("quota_rate", {}).get("count") == 1)
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def reporting(c):
@@ -533,6 +579,7 @@ async def main():
         await connection(c)
         await csp(c)
         await panel(c)
+        await quota_rate_worker(c)
         await reporting(c)
         check("no refresh was attempted", seen["auth"] == [])
         await connection_lines(c)

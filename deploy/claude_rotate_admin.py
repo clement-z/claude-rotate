@@ -12,7 +12,6 @@ empty on a real host.
 
 import argparse
 import base64
-import errno
 import fcntl
 import getpass
 import grp
@@ -50,9 +49,6 @@ STATE = STATE_DIR / "state.json"
 RATELIMIT_HEADERS = STATE_DIR / "ratelimit_headers.json"
 RATELIMIT_HEADERS_MAX_BYTES = 8 * 1024 * 1024
 AUDIT_PATH = P("/var/log/claude-rotate/audit.jsonl")
-AUDIT_TAIL_BYTES = 32 * 1024 * 1024
-AUDIT_TAIL_BACKUPS = 32
-AUDIT_TAIL_LINE_BYTES = 1024 * 1024
 OPT = P("/opt/claude-rotate")
 CURRENT = OPT / "current"
 RELEASES = OPT / "releases"
@@ -1589,28 +1585,6 @@ def cmd_status(args) -> int:
     return EXIT_OK
 
 
-def audit_tail(stream, end, size):
-    """Yield complete lines in reverse order, using None for an oversized line."""
-    start = end - size
-    pending = b""
-    while end > start:
-        offset = max(start, end - 64 * 1024)
-        stream.seek(offset)
-        parts = stream.read(end - offset).split(b"\n")
-        end = offset
-        if len(parts) > 1:
-            if pending is not None and len(parts[-1]) + len(pending) <= AUDIT_TAIL_LINE_BYTES:
-                yield parts[-1] + pending
-            else:
-                yield None
-            yield from reversed(parts[1:-1])
-            pending = parts[0]
-        elif pending is not None:
-            pending = parts[0] + pending if len(parts[0]) + len(pending) <= AUDIT_TAIL_LINE_BYTES else None
-    if pending is None or (not start and pending):
-        yield pending
-
-
 def entry_text(value, size):
     return value[:size] if isinstance(value, str) else None
 
@@ -1636,41 +1610,18 @@ def attempt_time(entry, record):
     return -1, timestamp
 
 
-def audit_log_lines(scan):
-    scan.update(limited=False, skipped_lines=0)
+def quota_rate_modules():
+    # The installed admin runs with -I. Load only from its trusted release directory.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
-        directory = os.open(AUDIT_PATH.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return
-    remaining = AUDIT_TAIL_BYTES
-    seen_files = set()
-    try:
-        for n in range(AUDIT_TAIL_BACKUPS + 1):
-            name = f"{AUDIT_PATH.name}.{n}" if n else AUDIT_PATH.name
-            try:
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-            except OSError as exc:
-                if exc.errno in (errno.ENOENT, errno.ELOOP):
-                    continue
-                raise
-            with os.fdopen(fd, "rb") as stream:
-                info = os.fstat(stream.fileno())
-                inode = info.st_dev, info.st_ino
-                if not stat.S_ISREG(info.st_mode) or inode in seen_files:
-                    continue
-                seen_files.add(inode)
-                size = min(info.st_size, remaining)
-                for line in audit_tail(stream, info.st_size, size):
-                    if line is None:
-                        scan["skipped_lines"] += 1
-                    elif line:
-                        yield line
-                remaining -= size
-                if not remaining:
-                    scan["limited"] = True
-                    break
+        import pricing
+        import quota_rate
     finally:
-        os.close(directory)
+        sys.dont_write_bytecode = bytecode
+        sys.path.pop(0)
+    return pricing, quota_rate
 
 
 def recent_rate_limits(count):
@@ -1679,7 +1630,8 @@ def recent_rate_limits(count):
     if not count:
         return attempts, False, 0
     scan = {}
-    for line in audit_log_lines(scan):
+    _, rates = quota_rate_modules()
+    for line in rates.audit_log_lines(AUDIT_PATH, scan):
         if b'"rate_limits"' not in line:
             continue
         try:
@@ -1796,71 +1748,10 @@ def cmd_ratelimits(args) -> int:
     return EXIT_OK
 
 
-def quota_history_file(path, default, warnings):
-    bound = 16 * 1024 * 1024
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > bound:
-                raise ValueError("invalid history file size or type")
-            data = stream.read(bound + 1)
-        if len(data) > bound:
-            raise ValueError("history file too large")
-        result = json.loads(data)
-        if not isinstance(result, type(default)):
-            raise ValueError("unexpected history file format")
-        return result
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError, RecursionError):
-        warnings.append(f"{path.name} could not be read")
-    return default
-
-
-def quota_audit_records(scan):
-    for line in audit_log_lines(scan):
-        try:
-            record = json.loads(line)
-        except (ValueError, RecursionError):
-            scan["skipped_lines"] += 1
-            continue
-        if isinstance(record, dict):
-            yield record
-
-
 def quota_token_text(tokens):
     return ", ".join(f"{label} {tokens[key]:,.0f}" for key, label in (
         ("input_tokens", "input"), ("output_tokens", "output"),
         ("cache_read_input_tokens", "cache read"), ("cache_creation_input_tokens", "cache write")))
-
-
-def quota_limit_label(row):
-    limit = {"7d_oi": "Fable 7d", "imagegen_premium": "images"}.get(row["limit"], row["limit"])
-    minutes = row["minutes"]
-    if minutes == 10080:
-        return f"{limit} 7d"
-    if minutes:
-        window = f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m"
-        return f"{limit} {window}"
-    return limit
-
-
-def quota_rate_summary(series):
-    summary = []
-    for row in series:
-        latest, remaining, tokens = row["latest"], row["remaining"], row["tokens_per_percent"]
-        summary.append({
-            "kind": row["kind"], "account": row["name"], "limit": quota_limit_label(row),
-            "used_percent": latest["used_percent"] if latest else None,
-            "usd_per_percent": row["usd_per_percent"],
-            "output_tokens_per_percent": tokens["output_tokens"] if tokens else None,
-            "usd_left": remaining["usd"] if remaining else None,
-            "time_left": {k: remaining[k] for k in ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day")}
-            if remaining else None,
-            "samples": row["cost_intervals"],
-        })
-    return summary
 
 
 def quota_time_text(projection):
@@ -1947,31 +1838,15 @@ def print_quota_rates(report):
 def cmd_quota_rate(args) -> int:
     if not 1 <= args.days <= 365 or not 0 < args.min_step <= 100:
         raise Refused("--days must be 1–365 and --min-step must be above 0 and at most 100")
-    # The installed admin runs with -I. Load only from its trusted release directory.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    bytecode = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        from pricing import load_prices
-        from quota_rate import DAY, analyse
-    finally:
-        sys.dont_write_bytecode = bytecode
-        sys.path.pop(0)
+    pricing, rates = quota_rate_modules()
     cfg = load_config()
     now = time.time()
     accounts = {account["name"] for account in cfg["accounts"]}
     providers = {name for name, spec in object_fields(cfg.get("providers")).items()
                  if object_fields(spec).get("kind") == "openai-siwc"}
-    scan, warnings = {}, []
-    history = quota_history_file(STATE_DIR / "usage_history.json", [], warnings)
-    provider_history = quota_history_file(STATE_DIR / "provider_quota_history.json", {}, warnings)
-    if provider_history and provider_history.get("version") != 1:
-        warnings.append("provider_quota_history.json has an unsupported version")
-        provider_history = {}
-    series, earliest = analyse(quota_audit_records(scan), history, provider_history, accounts, providers,
-                               now - args.days * DAY, now, args.min_step, load_prices(cfg.get("prices_per_mtok", {})))
-    report = {"days": args.days, "min_step": args.min_step, "audit": {"from": earliest, **scan},
-              "warnings": warnings, "summary": quota_rate_summary(series), "series": series}
+    report = rates.read_report(AUDIT_PATH, STATE_DIR / "usage_history.json", STATE_DIR / "provider_quota_history.json",
+                               accounts, providers, pricing.load_prices(cfg.get("prices_per_mtok", {})), now,
+                               days=args.days, min_step=args.min_step)
     if args.json:
         out(json.dumps(report, indent=2))
     else:
