@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -61,7 +62,11 @@ openai = {"gpt-6.2-astra": [8.0, 40.0, 0.4], "gpt-6.2-sol": [2.0, 10.0, 0.1], "g
           "gpt-6.1-terra": [1.0, 5.0, 0.05], "gpt-6-astra": [10.0, 50.0, 1.0], "gpt-6-sol": [2.0, 10.0, 0.2],
           "gpt-6-luna": [0.1, 0.5, 0.01], "gpt-5.6-sol": [4.0, 20.0, 0.4], "gpt-5.6-terra": [2.0, 12.0, 0.2],
           "gpt-5.6-luna": [0.2, 1.2, 0.02], "gpt-5.5": [5.0, 30.0, 0.5], "gpt-5.4": [2.5, 15.0, 0.25],
-          "gpt-5.4-mini": [0.75, 4.5, 0.075], "gpt-5.3-codex": [1.75, 14.0, 0.175]}
+          "gpt-5.4-mini": [0.75, 4.5, 0.075], "gpt-5.3-codex": [1.75, 14.0, 0.175],
+          "gpt-5.1": [1.25, 10.0, 0.125], "gpt-5.2": [1.75, 14.0, 0.175],
+          "gpt-5.2-pro": [21.0, 168.0], "gpt-6-cyber": [20.0, 100.0, 2.0],
+          "gpt-rosalind-research": [5.0, 25.0, 0.50], "chat-latest": [5.0, 30.0, 0.50],
+          "o3-pro": [20.0, 80.0], "text-embedding-3-large": [0.13, 0.0]}
 check("every OpenAI model on the list resolves to its own Standard short-context row",
       all(R.price_for(m, None) == p for m, p in openai.items()))
 claude = {"claude-fable-5-2": [8.0, 40.0, 0.20], "claude-mythos-5-2": [8.0, 40.0, 0.20],
@@ -69,16 +74,24 @@ claude = {"claude-fable-5-2": [8.0, 40.0, 0.20], "claude-mythos-5-2": [8.0, 40.0
           "claude-fable-5": [10.0, 50.0, 1.0], "claude-mythos-5": [10.0, 50.0, 1.0],
           "claude-mythos-1": [10.0, 50.0], "claude-opus-5-5": [4.0, 20.0, 0.20],
           "claude-opus-5": [5.0, 25.0, 0.50], "claude-opus-4-8": [5.0, 25.0, 0.50],
-          "claude-opus-4-7": [5.0, 25.0, 0.50], "claude-opus-3": [5.0, 25.0],
+          "claude-opus-4-7": [5.0, 25.0, 0.50], "claude-opus-4-6": [5.0, 25.0, 0.50],
+          "claude-opus-4-5": [5.0, 25.0, 0.50], "claude-opus-4-1": [15.0, 75.0, 1.50],
+          "claude-opus-4": [15.0, 75.0, 1.50], "claude-opus-3": [5.0, 25.0],
           "claude-sonnet-5-5": [2.0, 10.0, 0.10], "claude-sonnet-5": [2.0, 10.0, 0.20],
-          "claude-sonnet-4-6": [3.0, 15.0, 0.30], "claude-sonnet-4": [3.0, 15.0],
+          "claude-sonnet-4-6": [3.0, 15.0, 0.30], "claude-sonnet-4-5": [3.0, 15.0, 0.30],
+          "claude-sonnet-4": [3.0, 15.0, 0.30],
           "claude-haiku-5-5": [0.1, 0.5, 0.01], "claude-haiku-4-5": [1.0, 5.0, 0.10],
           "claude-haiku-3": [1.0, 5.0]}
 check("Claude models and their dated IDs select the same pricing row",
       all(R.price_for(m) == R.price_for(m + "-20261127") == p for m, p in claude.items()))
 check("an unknown Claude model takes the default price, an unknown provider model none",
-      R.price_for("claude-x") == R.DEFAULT_PRICE and R.price_for("gpt-6-cyber", None) is None
-      and cost("gpt-6-cyber", "openai") == 0.0 and cost("some-model", "lan") == 0.0)
+      R.price_for("claude-x") == R.DEFAULT_PRICE and R.price_for("custom", None) is None
+      and cost("custom", "openai") == 0.0 and cost("some-model", "lan") == 0.0)
+output_only = {"output_tokens": 1_000_000}
+check("historical Opus and GPT records use their published output rates",
+      R.api_cost("claude-opus-4-1-20250805", output_only) == 75.0
+      and R.api_cost("gpt-5.1-2025-11-13", output_only, "openai") == 10.0
+      and R.api_cost("gpt-5.2", output_only, "openai") == 14.0)
 check("the longest pattern wins: -mini, -nano and -pro are not priced as gpt-5.4",
       R.price_for("gpt-5.4-mini") == [0.75, 4.5, 0.075] and R.price_for("gpt-5.4-nano") == [0.2, 1.25, 0.02]
       and R.price_for("gpt-5.4-pro") == [30.0, 180.0] and R.price_for("gpt-5.5-pro") == [30.0, 180.0]
@@ -118,7 +131,7 @@ check("OpenAI keeps bounded raw details and removes cache writes from uncached i
       and openai_usage["output_tokens_details"] == {"reasoning_tokens": 42, "tag": "x" * 200}
       and openai_usage["input_tokens"] == 1_000_000 and openai_usage["cache_creation_input_tokens"] == 2_000_000)
 check("OpenAI prices reported 12-hour writes higher and uses 30 minutes for an unsplit count",
-      round(R.api_cost("gpt-6.2-sol", openai_usage, "openai"), 6) == 18.6
+      round(R.api_cost("gpt-6.2-sol", openai_usage, "openai"), 6) == 19.6
       and round(R.api_cost("gpt-6.2-sol", openai_usage | {"input_tokens_details": {}}, "openai"), 6) == 17.1)
 
 # The Claude-only copy that installs seeded from config.example.json still hold.
@@ -136,6 +149,12 @@ with_config({"gpt-6.2-sol": [3.0, 12.0, 0.3], "gpt-7-sol": [1.0, 2.0, 0.05], "gp
 check("an operator entry adds a model, overrides a built-in one, and the longest match still wins",
       R.price_for("gpt-7-sol", None) == [1.0, 2.0, 0.05] and R.price_for("gpt-6.2-sol", None) == [3.0, 12.0, 0.3]
       and R.price_for("gpt-5.4-mini-fast") == [1.5, 9.0] and R.price_for("gpt-5.4-mini") == [0.75, 4.5, 0.075])
+with_config({"claude-opus-4-5-2025": [9.0, 50.0], "opus-5-5": [8.0, 30.0]})
+check("only unmodified built-in patterns require a numeric boundary",
+      R.price_for("claude-opus-4-5-20251101") == [9.0, 50.0]
+      and R.price_for("claude-opus-5-5-preview") == [8.0, 30.0]
+      and R.price_for("claude-opus-5-50") == [8.0, 30.0]
+      and R.price_for("claude-fable-5-20251101") == [10.0, 50.0, 1.0])
 warnings = with_config({"x": [1.0], "y": "cheap", "z": [1, 2, 3, 4], "w": [-1, 2], "": [1, 2], "opus": [True, 1],
                         "ok": [1, 2]})
 check("malformed entries are skipped with a warning each; the built-in entry stays",
@@ -177,5 +196,55 @@ audited = asyncio.run(capture_claude_usage())
 check("both Claude endpoints audit speed and TTL splits in buffered and split streaming answers",
       len(audited) == 4 and all(u["speed"] == "fast" and u["cache_creation"] == split for u in audited)
       and [u["output_tokens"] for u in audited] == [1_000_000, 2_000_000] * 2)
+
+
+async def malformed_sse():
+    parts = [
+        b'data: {"type":{},"usage":{"input_tokens":30}}\n\n',
+        b'data: {"type":"message_delta","usage":{"output_tokens":50}}\n\n',
+        b'data: {"type":"message_stop"}\n\n',
+    ]
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for part in parts:
+                yield part
+
+    def upstream(req):
+        return httpx.Response(200, stream=Stream(), headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as R.client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=R.app), base_url="http://proxy") as proxy:
+            async def request():
+                return await proxy.post("/v1/messages", headers={"authorization": "Bearer dev-desk-fake-key"},
+                                        json={"model": "claude-opus-5", "stream": True})
+
+            r = await request()
+            usage = json.loads(R.AUDIT_PATH.read_text().splitlines()[-1])["usage"]
+            check("native SSE relays an object-valued type and meters the rest of the stream",
+                  r.status_code == 200 and r.content == b"".join(parts)
+                  and usage["input_tokens"] == 30 and usage["output_tokens"] == 50)
+            with patch.object(R.providers.SseUsage, "feed", side_effect=RuntimeError("test metering failure")):
+                r = await request()
+            check("an unexpected usage meter error leaves the native SSE stream intact",
+                  r.status_code == 200 and r.content == b"".join(parts)
+                  and R.STORAGE_ERRORS["usage_meter"]["count"] == 1)
+
+
+asyncio.run(malformed_sse())
+
+raw_details = {"cache_write_tokens_details": {"ttl_12h_tokens": 1_000_000, "ttl_30m_tokens": 1_000_000}}
+raw_details.update({f"optional_{i}": "x" * 200 for i in range(24)})
+large = R.providers.usage_of({"usage": {"input_tokens": 4_000_000, "output_tokens": 1_000_000,
+                                        "input_tokens_details": raw_details, "output_tokens_details": {"tag": "x"}}})
+with patch.object(R, "AUDIT_MAX_BYTES", 4096), patch.object(R, "AUDIT_PATH", tmp / "compact.jsonl"):
+    rec = {"model": "gpt-6.2-sol", "provider": "openai", "usage": large}
+    R._write_audit(rec)
+    saved = json.loads(R.AUDIT_PATH.read_bytes())
+    check("a small audit file keeps compact usage, including the cost of long cache writes",
+          len(R.AUDIT_PATH.read_bytes()) <= 4096 and saved["usage_details_truncated"]
+          and "input_tokens_details" not in saved["usage"] and "output_tokens_details" not in saved["usage"]
+          and R.api_cost("gpt-6.2-sol", saved["usage"], "openai") == R.api_cost("gpt-6.2-sol", large, "openai")
+          and "input_tokens_details" in rec["usage"])
 
 print(f"\nall {PASS} checks passed")

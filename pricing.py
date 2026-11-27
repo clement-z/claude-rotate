@@ -35,13 +35,13 @@ BUILTIN_PRICES = {
     "fable-5": [10.0, 50.0, 1.0], "mythos-5": [10.0, 50.0, 1.0],
     "opus-5-5": [4.0, 20.0, 0.20], "opus-5": [5.0, 25.0, 0.50],
     "opus-4-8": [5.0, 25.0, 0.50], "opus-4-7": [5.0, 25.0, 0.50],
+    "opus-4-6": [5.0, 25.0, 0.50], "opus-4-5": [5.0, 25.0, 0.50],
+    "opus-4-1": [15.0, 75.0, 1.50], "opus-4": [15.0, 75.0, 1.50],
     "sonnet-5-5": [2.0, 10.0, 0.10], "sonnet-5": [2.0, 10.0, 0.20], "sonnet-4-6": [3.0, 15.0, 0.30],
+    "sonnet-4-5": [3.0, 15.0, 0.30], "sonnet-4": [3.0, 15.0, 0.30],
     "haiku-5-5": [0.10, 0.50, 0.01], "haiku-4-5": [1.0, 5.0, 0.10],
-    # OpenAI Standard short-context (up to 272K) rates from
-    # https://developers.openai.com/api/docs/pricing. The 2026-11-27 page confirms
-    # gpt-6.2-astra, gpt-6.2-sol, gpt-6-astra and gpt-6.1-sol in Standard, and
-    # lists gpt-6.1-terra and gpt-6-luna under Flex. Other Standard values retain
-    # the 2026-11-19 reading, including gpt-5.6-sol's promotion through Nov 30.
+    # OpenAI Standard short-context token rates from the expanded tables in
+    # https://developers.openai.com/api/docs/pricing, read 2026-11-27.
     "gpt-6.2-astra": [8.0, 40.0, 0.4], "gpt-6.2-sol": [2.0, 10.0, 0.1],
     "gpt-6.1-sol": [2.0, 10.0, 0.1], "gpt-6.1-terra": [1.0, 5.0, 0.05],
     "gpt-6-astra": [10.0, 50.0, 1.0], "gpt-6-sol": [2.0, 10.0, 0.2], "gpt-6-luna": [0.1, 0.5, 0.01],
@@ -50,7 +50,43 @@ BUILTIN_PRICES = {
     "gpt-5.4": [2.5, 15.0, 0.25], "gpt-5.4-mini": [0.75, 4.5, 0.075], "gpt-5.4-nano": [0.2, 1.25, 0.02],
     "gpt-5.4-pro": [30.0, 180.0],
     "gpt-5.3-codex": [1.75, 14.0, 0.175],
+    "gpt-5.2": [1.75, 14.0, 0.175], "gpt-5.2-pro": [21.0, 168.0],
+    "gpt-5.1": [1.25, 10.0, 0.125], "gpt-5": [1.25, 10.0, 0.125],
+    "gpt-5-mini": [0.25, 2.0, 0.025], "gpt-5-nano": [0.05, 0.4, 0.005],
+    "gpt-5-pro": [15.0, 120.0], "gpt-5-search-api": [1.25, 10.0, 0.125],
+    "chat-latest": [5.0, 30.0, 0.50],
+    "gpt-4.1": [2.0, 8.0, 0.50], "gpt-4.1-mini": [0.40, 1.60, 0.10],
+    "ft:gpt-4.1": [3.0, 12.0, 0.75], "ft:gpt-4.1-mini": [0.80, 3.20, 0.20],
+    "gpt-4o": [2.50, 10.0, 1.25], "gpt-4o-mini": [0.15, 0.60, 0.075],
+    "ft:gpt-4o": [3.75, 15.0, 1.875], "ft:gpt-4o-mini": [0.30, 1.20, 0.15],
+    "o3": [2.0, 8.0, 0.50], "o3-pro": [20.0, 80.0],
+    "gpt-6-cyber": [20.0, 100.0, 2.0], "gpt-5.6-cyber": [12.5, 75.0, 1.25],
+    "gpt-5.5-cyber-preview": [12.5, 75.0, 1.25],
+    "gpt-6-rosalind": [10.0, 50.0, 1.0], "gpt-rosalind-research": [5.0, 25.0, 0.50],
+    "gpt-rosalind-discovery": [5.0, 25.0, 0.50],
+    "gpt-6.2-astra-law": [8.0, 40.0, 0.40], "gpt-6-astra-law": [10.0, 50.0, 1.0],
+    "gpt-6.2-astra-healthcare": [8.0, 40.0, 0.40], "gpt-6.2-sol-healthcare": [2.0, 10.0, 0.10],
+    "gpt-6-astra-healthcare": [10.0, 50.0, 1.0], "gpt-6.1-sol-healthcare": [2.0, 10.0, 0.10],
+    "text-embedding-3-small": [0.02, 0.0], "text-embedding-3-large": [0.13, 0.0],
+    "text-embedding-ada-002": [0.10, 0.0], "omni-moderation-latest": [0.0, 0.0],
+    # Text-token rates for media models. Media-specific units are not metered.
+    "gpt-image-2.6-sunburst": [5.0, 0.0, 1.25], "gpt-image-2.6-flare": [5.0, 0.0, 1.25],
+    "gpt-image-2.5-sunburst": [5.0, 0.0, 1.25], "gpt-image-2.5-flare": [5.0, 0.0, 1.25],
+    "gpt-image-2": [5.0, 0.0, 1.25], "gpt-image-1.5": [5.0, 10.0, 1.25],
+    "gpt-image-1-mini": [2.0, 0.0, 0.20], "chatgpt-image-latest": [5.0, 10.0, 1.25],
+    "gpt-realtime-2.1": [4.0, 24.0, 0.40], "gpt-realtime-2": [4.0, 24.0, 0.40],
+    "gpt-realtime-2.1-mini": [0.60, 2.40, 0.06], "gpt-realtime-mini": [0.60, 2.40, 0.06],
+    "gpt-realtime-1.5": [4.0, 16.0, 0.40], "gpt-realtime": [4.0, 16.0, 0.40],
+    "gpt-audio-1.5": [2.50, 10.0], "gpt-audio": [2.50, 10.0], "gpt-audio-mini": [0.60, 2.40],
+    "gpt-4o-transcribe": [2.50, 10.0], "gpt-4o-transcribe-diarize": [2.50, 10.0],
+    "gpt-4o-mini-transcribe": [1.25, 5.0], "gpt-4o-mini-tts": [0.60, 0.0],
 }
+
+
+class PriceTable(dict):
+    def __init__(self):
+        super().__init__(BUILTIN_PRICES)
+        self.operator_patterns = set()
 
 
 def load_prices(extra) -> dict:
@@ -58,11 +94,12 @@ def load_prices(extra) -> dict:
     entry, so an install whose config holds an older copy still gets new entries. A
     malformed entry is reported and skipped: costs are analytics, never a reason to
     stop the proxy."""
-    table = dict(BUILTIN_PRICES)
+    table = PriceTable()
     for pattern, price in (extra.items() if isinstance(extra, dict) else []):
         if (isinstance(pattern, str) and pattern and isinstance(price, list) and len(price) in (2, 3)
                 and all(type(v) in (int, float) and 0 <= v < 1e6 for v in price)):
             table[pattern] = price
+            table.operator_patterns.add(pattern)
         else:
             print(f"warning: prices_per_mtok entry {pattern!r} ignored: it needs [input, output] or "
                   "[input, output, cached input], in $ per MTok", file=sys.stderr)
@@ -73,7 +110,6 @@ def load_prices(extra) -> dict:
 
 DEFAULT_PRICE = [5.0, 25.0]
 FAST_PRICE_MODELS = ("fable-5-2", "mythos-5-2", "opus-5", "opus-4-8")
-
 
 
 def price_pattern_matches(pattern: str, model: str) -> bool:
@@ -87,7 +123,10 @@ def price_for(model: str | None, prices: dict, default=DEFAULT_PRICE) -> list[fl
     priced as gpt-5.4 whatever the order of the table."""
     if not isinstance(model, str):
         return default
-    pattern = max((pat for pat in prices if price_pattern_matches(pat, model)), key=len, default=None)
+    overrides = getattr(prices, "operator_patterns", ())
+    pattern = max((pat for pat in prices if (
+        pat in model if pat in overrides or pat not in BUILTIN_PRICES else price_pattern_matches(pat, model)
+    )), key=len, default=None)
     return prices[pattern] if pattern else default
 
 
@@ -103,13 +142,19 @@ def api_cost(model: str | None, usage: dict, provider=None, *, prices=None) -> f
     input_tokens = usage.get("input_tokens", 0)
     read_tokens = usage.get("cache_read_input_tokens", 0)
     write_tokens = usage.get("cache_creation_input_tokens", 0)
-    long_writes = 0
+    long_writes, long_rate = 0, 2.0
     if isinstance(split := usage.get("cache_creation"), dict):
         long_writes = token_count(split.get("ephemeral_1h_input_tokens"))
         write_tokens = max(write_tokens, long_writes + token_count(split.get("ephemeral_5m_input_tokens")))
-    elif isinstance(details := usage.get("input_tokens_details"), dict):
-        total, long_writes = openai_cache_writes(details)
-        write_tokens = max(write_tokens, total)
+    else:
+        details = usage.get("input_tokens_details")
+        long_writes = token_count(usage.get("cache_write_12h_input_tokens"))
+        if isinstance(details, dict):
+            total, reported_long = openai_cache_writes(details)
+            long_writes = max(long_writes, reported_long)
+            write_tokens = max(write_tokens, total)
+        write_tokens = max(write_tokens, long_writes)
+        long_rate = 2.5
     scale = 1
     if isinstance(model, str):
         if price_pattern_matches("haiku-5-5", model) and input_tokens + read_tokens + write_tokens > 100_000:
@@ -120,5 +165,5 @@ def api_cost(model: str | None, usage: dict, provider=None, *, prices=None) -> f
         input_tokens * p_in
         + usage.get("output_tokens", 0) * p_out
         + read_tokens * (cached[0] if cached else p_in * 0.1)
-        + ((write_tokens - long_writes) * 1.25 + long_writes * 2) * p_in
+        + ((write_tokens - long_writes) * 1.25 + long_writes * long_rate) * p_in
     ) / 1_000_000

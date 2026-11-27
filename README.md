@@ -386,13 +386,17 @@ The 24 h figures come from the audit log. Longer periods come from
 `device_usage.json` next to `state.json`: daily totals per device and model for
 31 days plus all-time totals, and per account for 400 days (requests, cost,
 weekly-quota use and time at the limit) for the billing periods. It is updated
-with every request and saved every minute. On first start it is rebuilt once
-from `audit.jsonl` and its rotated copies, and the weekly-quota part from
-`usage_history.json`, so all time reaches back as far as those files do.
+with every request and saved every minute. When the file is missing at startup,
+the gateway rebuilds it from `audit.jsonl` and its rotated copies, and the
+weekly-quota part from `usage_history.json`, so all time reaches back as far
+as those files do.
 The 24 h view prices retained audit records at read time. Daily and all-time
 totals, the device trend, and billing periods use stored costs, so they mix
-old and new prices after an upgrade. Older audit records without speed or
-cache-write duration use standard speed and the short cache-write rate.
+old and new prices after an upgrade. A rebuild uses current prices for retained
+records and can change daily, all-time and billing costs. Older audit records
+without speed or cache-write duration use standard speed and the short
+cache-write rate. The estimate does not cover media-specific charges such as
+image tokens, audio minutes or characters.
 
 The panel's JSON endpoints use the same Claude device key or enabled tailnet
 access as the panel. `GET /rotate/status` returns per-account `claims`,
@@ -736,9 +740,11 @@ Claude prices use the 2026-11-27 list. The audit retains `usage.speed` and
 the cache-write split when Anthropic reports them. Fast mode doubles the
 covered models' rates. Haiku 5.5 uses its higher tier above 100,000 prompt
 tokens, including cache reads and writes, on each request. Claude cache
-writes cost 1.25× input for five minutes and 2× for an hour. OpenAI uses
-the same multipliers for 30 minutes and 12 hours. An unsplit write count
-uses the short rate.
+writes cost 1.25× input for five minutes and 2× for an hour. OpenAI writes
+cost 1.25× for 30 minutes and 2.5× for 12 hours. An unsplit write count uses
+the short rate. If the audit size limit requires dropping raw OpenAI usage
+details, the record marks this with `usage_details_truncated` and retains
+the counts used to price cache writes.
 
 ### Rotation policy
 

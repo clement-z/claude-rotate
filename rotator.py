@@ -448,6 +448,20 @@ def _write_audit(rec: dict) -> None:
     # A single process writes synchronously, so rollover cannot interleave with
     # another request. Each append reopens the path; external rename also works.
     line = (json.dumps(rec) + "\n").encode("utf-8")
+    usage = rec.get("usage")
+    if len(line) > AUDIT_MAX_BYTES and isinstance(usage, dict) and (
+            "input_tokens_details" in usage or "output_tokens_details" in usage):
+        details = usage.get("input_tokens_details")
+        compact = {key: value for key, value in usage.items()
+                   if key not in ("input_tokens_details", "output_tokens_details")}
+        if isinstance(details, dict):
+            written, long_writes = pricing.openai_cache_writes(details)
+            if written:
+                compact["cache_creation_input_tokens"] = max(written, compact.get("cache_creation_input_tokens", 0))
+            if long_writes:
+                compact["cache_write_12h_input_tokens"] = long_writes
+        rec = dict(rec, usage=compact, usage_details_truncated=True)
+        line = (json.dumps(rec) + "\n").encode("utf-8")
     if len(line) > AUDIT_MAX_BYTES:
         # A client-controlled model/path must not defeat the disk bound.
         rec = dict(rec, model=str(rec.get("model", ""))[:256],
@@ -2098,7 +2112,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <div class="card"><h2>By model <span class="seg" id="period"></span></h2><table id="models"></table></div>
  <div class="card"><h2>By account, 24 h</h2><table id="by-account"></table><h2 style="margin-top:20px">Recent switches</h2><div class="timeline" id="events"></div></div>
 </section>
-<p class="muted small">Cost-equivalent uses API list prices. The 24 h view uses current prices. Stored totals and billing periods keep the prices used when each request was recorded.</p>
+<p class="muted small">Cost-equivalent uses API list prices. The 24 h view uses current prices. Stored daily and all-time totals and billing periods keep prices from when requests were recorded. If the usage file is lost, startup rebuilds these figures from retained audit logs at current prices.</p>
 </main>
 <dialog id="confirm"><div id="cf-text"></div><div class="small" id="cf-err" style="color:var(--crit)"></div>
  <div class="acts"><button class="linkbtn" id="cf-no">Cancel</button><button class="linkbtn primary" id="cf-yes">Switch</button></div></dialog>
@@ -3029,15 +3043,20 @@ async def forward(request: Request, prov, device: str, path: str, body: bytes, h
     # cannot decide. Only a sized answer is buffered, so only it meets max_response_bytes.
     if request.method != "HEAD" and ("text/event-stream" in upstream.headers.get("content-type", "")
                                      or "content-length" not in upstream.headers):
-        meter = providers.StreamUsage()
-
         async def relay():
+            meter = providers.StreamUsage()
             done = ended = False
             try:
                 async for chunk in upstream.aiter_bytes():
-                    meter.feed(chunk)
+                    if meter is not None:
+                        try:
+                            meter.feed(chunk)
+                        except Exception as exc:
+                            storage_error("usage_meter", exc)
+                            meter = None
                     yield chunk
-                    ended = meter.ended  # set only once the client has been handed it
+                    if meter is not None:
+                        ended = meter.ended  # set only once the client has been handed it
                 done = True
             except httpx.HTTPError as exc:
                 if not ended:
@@ -3051,7 +3070,10 @@ async def forward(request: Request, prov, device: str, path: str, body: bytes, h
                     rec["interrupted"] = "client"
                 await upstream.aclose()
                 hold.release()
-                rec["usage"] = meter.usage
+                try:
+                    rec["usage"] = meter.usage if meter is not None else None
+                except Exception as exc:
+                    storage_error("usage_meter", exc)
                 audit(rec)
 
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
@@ -3207,9 +3229,8 @@ async def proxy(request: Request, path: str):
         resp_headers["x-rotate-account"] = account
 
     if "text/event-stream" in upstream.headers.get("content-type", ""):
-        meter = providers.SseUsage(claude=True)
-
         async def relay():
+            meter = providers.SseUsage(claude=True)
             error_body = bytearray() if upstream.status_code == 429 else None
             try:
                 async for chunk in upstream.aiter_bytes():
@@ -3218,13 +3239,18 @@ async def proxy(request: Request, path: str):
                             error_body.extend(chunk)
                         else:
                             error_body = None
-                    meter.feed(chunk)
+                    if meter is not None:
+                        try:
+                            meter.feed(chunk)
+                        except Exception as exc:
+                            storage_error("usage_meter", exc)
+                            meter = None
                     yield chunk
                 if error_body is not None:
                     rate_limit_error(rec["rate_limits"][-1], error_body, upstream.headers)
             finally:
                 await upstream.aclose()
-                rec["usage"] = meter.usage
+                rec["usage"] = meter.usage if meter is not None else None
                 audit(rec)
 
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)

@@ -1016,7 +1016,8 @@ class SseUsage:
                     event = json.loads(data)
                 except (ValueError, RecursionError):
                     continue
-                if isinstance(event, dict) and event.get("type") in TERMINAL:
+                kind = event.get("type") if isinstance(event, dict) else None
+                if isinstance(kind, str) and kind in TERMINAL:
                     self.terminal = True
                 usage = usage_of(event, claude=self.claude)
                 if usage:
