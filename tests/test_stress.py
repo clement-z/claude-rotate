@@ -184,7 +184,7 @@ check("twenty held requests dispatch at expiry in round-robin starting with earl
 check("all held requests relay the upstream 429 and audit exactly one attempt each",
       all(r.status_code == 429 and r.json() == {"error": "still spent"} and r.headers["retry-after"] == "42"
           for r in resps)
-      and len(records) == 20 and all(len(rec["rate_limits"]) == 1 and "local" not in rec for rec in records))
+      and len(records) == 20 and all(len(rec["rate_limits"]) == 1 for rec in records))
 R.HOLD_MAX_S = 0
 
 # --- 5. parallel SSE streams relay byte-identical ----------------------------

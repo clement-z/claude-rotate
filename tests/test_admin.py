@@ -320,15 +320,16 @@ def test_status_live_query_uses_header(f):
     pin = {"account": "acct-2", "mode": "strict"}
     original_config = f.config.read_bytes()
     original_state = f.state.read_bytes() if f.state.exists() else None
+    live_payload = {"active_account": active["default"], "active_by_family": active,
+                    "storage_errors": {"state_write": {"count": 3}},
+                    "accounts": {"acct-1": {"claims": live_claims, "eligible_by_family": available}},
+                    "device_pins": {device: {"account_pin": None, "source": "runtime"}}}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             seen["path"] = self.path
             seen["auth"] = self.headers.get("Authorization")
-            body = json.dumps({"active_account": active["default"], "active_by_family": active,
-                               "storage_errors": {"state_write": {"count": 3}},
-                               "accounts": {"acct-1": {"claims": live_claims, "eligible_by_family": available}},
-                               "device_pins": {device: {"account_pin": None, "source": "runtime"}}}).encode()
+            body = json.dumps(live_payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -371,6 +372,28 @@ def test_status_live_query_uses_header(f):
         assert "5h" not in human.stdout and "5h" not in offline.stdout
         assert "acct-2, strict (config)" in offline.stdout
         assert "auto until restart (runtime)" in human.stdout
+
+        # Partial readings and malformed optional fields are diagnostic data.
+        del live_claims["7d"]["families"]
+        live_claims["learned"].update(families=7, effective_utilization="???", status=False, freshness=None)
+        human = f.run("status")
+        assert human.returncode == 0 and "General weekly: 42% used, default/fable" in human.stdout, human
+        assert "learned: awaiting reading" in human.stdout
+
+        # 8249184 has one route and legacy utilization and reset fields.
+        live_payload = {"active_account": "acct-2", "pinned": None, "switch_threshold": 0.8,
+                        "switch_threshold_7d": 0.98, "strategy": "consume-first", "hold_max_s": 0,
+                        "accounts": {"acct-1": {"effective_util_5h": 0.0, "effective_util_7d": 0.64,
+                                                "util_7d": 0.64, "reset_7d": reset, "last_seen": now,
+                                                "priority": 100, "disabled": False}},
+                        "recent_events": [], "storage_errors": {}, "weekly": {}, "providers": {}}
+        human = f.run("status")
+        assert human.returncode == 0 and "default acct-2, fable acct-2" in human.stdout, human
+        assert "General weekly: 64% used" in human.stdout and "Fable weekly:" not in human.stdout
+        assert "5h:" not in human.stdout and "acct-2, strict (config)" in human.stdout
+        r = f.run("status", "--json")
+        assert r.returncode == 0, r
+        assert set(json.loads(r.stdout)["live"]["accounts"]["acct-1"]["claims"]) == {"7d"}
     finally:
         server.shutdown()
         server.server_close()
@@ -380,6 +403,29 @@ def test_status_live_query_uses_header(f):
             f.state.unlink(missing_ok=True)
         else:
             f.state.write_bytes(original_state)
+
+
+def test_status_reports_malformed_config_pin(f):
+    original_config = f.config.read_bytes()
+    cfg = f.cfg()
+    device = next(iter(cfg["devices"]))
+    key = cfg["devices"][device]
+    cfg["devices"][device] = {"key": key, "account_pin": {"account": "acct-2"}}
+    f.set_active(False)
+    try:
+        f.config.write_text(json.dumps(cfg))
+        human = f.run("status")
+        problem = f"device '{device}': account_pin needs a configured account, mode strict or fallback"
+        assert human.returncode == 0 and "setup needed" in human.stdout and problem in human.stdout, human
+        assert "invalid config pin" in human.stdout and key not in human.stdout
+        r = f.run("status", "--json")
+        assert r.returncode == 0, r
+        report = json.loads(r.stdout)
+        assert not report["ready"] and any(p.startswith(problem) for p in report["problems"])
+        assert report["device_pins"][device] == {"account_pin": None, "source": "config"}
+        assert key not in r.stdout
+    finally:
+        f.config.write_bytes(original_config)
 
 
 def write_state(f, state):
@@ -585,7 +631,7 @@ def main():
              "test_add_token_and_renewal", "test_add_user_activation_and_duplicates",
              "test_readiness_needs_enabled_nonempty_token", "test_inherited_lock_descriptor",
              "test_restart_failure_is_reported", "test_concurrent_add_users_are_serialized",
-             "test_status_has_no_secrets", "test_status_live_query_uses_header",
+             "test_status_has_no_secrets", "test_status_live_query_uses_header", "test_status_reports_malformed_config_pin",
              "test_rotate_rejections_do_not_mutate", "test_rotate_refuses_split_route_noop",
              "test_rotate_switches_after_stop_and_preserves_state",
              "test_remove_token_and_setup_needed", "test_set_url_and_symlinked_config"]

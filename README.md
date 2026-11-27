@@ -77,7 +77,7 @@ Apple-silicon dev machine — run it on yours):
 | 300 concurrent requests | every one served, audit complete, **~3,500 req/s** proxy overhead ceiling |
 | Quota limit hit with **100 requests in flight** (50 ms simulated upstream RTT) | **exactly 1 switch** — the in-flight herd hits the dying account once each (they were already on the wire), then every request retries **once** onto the survivor; all 100 recover |
 | 50 burst-429s across 100 concurrent requests | **0 rotations** — paced on the same account, prompt caches kept warm |
-| All accounts spent, 20 requests arrive | all park via hold-until-reset and release **together** at the window reset |
+| All accounts spent, 20 requests arrive, hold deadline before the reset | at hold expiry each sends one upstream request and relays its 429 |
 | 50 parallel SSE streams | byte-identical relay, usage audited on every stream |
 | 50,000-row audit log | analytics rollup in **0.42 s** |
 

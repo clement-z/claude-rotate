@@ -560,7 +560,7 @@ def disabled(name: str) -> bool:
 
 
 RECHECK_S = 300
-LAST_BLOCKED_ACCOUNT: dict[str, str] = {}
+LAST_BLOCKED_ACCOUNT: dict[str | None, str] = {}
 
 
 def family_route(family: str) -> dict:
@@ -623,12 +623,12 @@ def earliest_relief(family: str = "default", now: float | None = None) -> float:
                default=now + RECHECK_S)
 
 
-def next_blocked_account(family: str, enabled: list[str], now: float) -> str:
+def next_blocked_account(family: str | None, enabled: list[str], now: float) -> str:
     previous = LAST_BLOCKED_ACCOUNT.get(family)
     if previous in enabled:
         account = enabled[(enabled.index(previous) + 1) % len(enabled)]
     else:
-        account = min(enabled, key=lambda name: blocker_deadline(name, family, now))
+        account = min(enabled, key=lambda name: blocker_deadline(name, family or "default", now))
     LAST_BLOCKED_ACCOUNT[family] = account
     return account
 
@@ -2005,7 +2005,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
 <header><h1>claude-rotate</h1><span class="muted" id="host"></span><span id="pills"></span><span class="spacer"></span><span class="muted small" id="upd"></span></header>
 <div id="alerts"></div>
 <section class="kpis">
- <div class="card hero"><div class="label">Every account spent in</div><div class="v" id="hero">–</div><div class="muted" id="hero-sub"></div></div>
+ <div class="card hero"><div class="label">General weekly quota runs out in</div><div class="v" id="hero">–</div><div class="muted" id="hero-sub"></div></div>
  <div class="card tile"><div class="label">Weekly quota left</div><div class="v" id="k-left">–</div><div class="muted small" id="k-left-sub"></div></div>
  <div class="card tile"><div class="label">Burn rate</div><div class="v" id="k-rate">–</div><div class="muted small">of a weekly quota per day</div></div>
  <div class="card tile"><div class="label">Requests, 24 h</div><div class="v" id="k-req">–</div><div class="muted small" id="k-req-sub"></div></div>
@@ -2057,8 +2057,9 @@ function observed(ts){return new Date(ts*1000).toLocaleString([],{dateStyle:'med
 function dur(s){return s<5400?Math.round(s/60)+' min':s<2*D?(s/H).toFixed(s<10*H?1:0)+' h':(s/D).toFixed(1)+' d'}
 function ago(min){return min==null?'never':min<1?'just now':min<60?min+' min ago':(min/60).toFixed(1)+' h ago'}
 function cell(b,l){return b?`<td data-l="${l}">${money(b.cost_usd)}<span class="sub">${fmt(tok(b))} tok &middot; ${fmt(b.requests)} req</span></td>`:`<td data-l="${l}" class="muted">&ndash;</td>`}
-function meter(label,u,thr,reset){
-  const sev=u>=1?['var(--crit)',' &#10005; limit reached']:thr!=null&&u>=thr?['var(--warn)',' &#9888; past switch point']:['var(--s1)',''];
+function meter(label,u,thr,reset,block){
+  const sev=block==='rejected'?['var(--crit)',' &#10005; rejected']
+    :block||u>=1?['var(--crit)',' &#10005; limit reached']:thr!=null&&u>=thr?['var(--warn)',' &#9888; past switch point']:['var(--s1)',''];
   const fill=u==null?'':`<i style="width:${Math.min(100,u*100)}%;background:${sev[0]}"></i>`;
   const tick=thr==null?'':`<span class="tick" style="left:${thr*100}%"></span>`;
   return `<div class="meter-row"><span class="muted">${label}</span><div class="meter">${fill}${tick}</div>`
@@ -2068,12 +2069,11 @@ function claimMeters(account,now){
   const rows=Object.entries(account.claims||{}).map(([id,c])=>{
     const meta=[(c.families||[]).map(familyLabel).join(' / ')];
     if(c.freshness==='awaiting_reading')meta.push('awaiting reading');
-    else if(c.status)meta.push(c.status);
+    else if(c.status&&!c.block_reason)meta.push(c.status);
     if(c.reset)meta.push(c.reset>now?'resets in '+dur(c.reset-now):'reset '+when(c.reset));
-    if(c.block_reason)meta.push(c.block_reason===c.status?'blocked':'blocked · '+c.block_reason);
     if(c.blocked_until&&c.blocked_until!==c.reset)meta.push('recheck '+when(c.blocked_until));
     if(c.seen_at)meta.push('seen '+ago(Math.round((now-c.seen_at)/60)));
-    return meter(esc(c.label||id),c.effective_utilization,c.threshold,esc(meta.filter(Boolean).join(' · ')))});
+    return meter(esc(c.label||id),c.effective_utilization,c.threshold,esc(meta.filter(Boolean).join(' · ')),c.block_reason)});
   for(const [f,b] of Object.entries(account.blocks_by_family||{}))
     rows.push(`<div class="small muted">${familyLabel(f)} blocked until ${esc(when(b.until))} · ${b.reason==='repeated_429'?'repeated 429s':'rejected'}</div>`);
   return `<div class="claim-meter">${rows.join('')||'<span class="muted">Awaiting quota readings</span>'}</div>`;
@@ -2370,9 +2370,9 @@ async function refresh(){
     panelFetch('/rotate/status').then(r=>r.json()), panelFetch('/rotate/stats').then(r=>r.json())]);
   const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{}); ST=st;
   const active=st.active_by_family||{}, manual=st.manual_by_family||{};
-  const canSelect=(name,a)=>eligible(a).some(f=>active[f]!==name);
+  const canRotate=(name,a)=>eligible(a).some(f=>active[f]!==name);
   const i=accts.findIndex(([n])=>n===active.default);
-  const nxt=accts.slice(i+1).concat(accts.slice(0,i+1)).find(([n,a])=>canSelect(n,a))?.[0];
+  const nxt=accts.slice(i+1).concat(accts.slice(0,i+1)).find(([n,a])=>canRotate(n,a))?.[0];
   $('host').textContent=location.host||'';
   $('pills').innerHTML=Object.entries(active).map(([f,n])=>`<span class="pill">${familyLabel(f)}: ${esc(n||'–')}</span>`).join('')
     +`<button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is eligible"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`
@@ -2395,7 +2395,7 @@ async function refresh(){
       +(bl?`<span class="badge">${esc(bl.plan)}${bl.renews?' &middot; renews '+esc(day(Date.parse(bl.renews+'T00:00')/1000)):''}</span>`:'')
       +(a.disabled?'<span class="badge">disabled</span>':'')+(a.priority!==100?`<span class="badge">prio ${esc(a.priority)}</span>`:'')
       +`<span class="acct-side"><span class="muted small">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span>`
-      +(canSelect(name,a)?`<button class="linkbtn" data-sw="${esc(name)}">Select</button>`:'')
+      +(eligible(a).some(f=>manual[f]!==name)?`<button class="linkbtn" data-sw="${esc(name)}">Select</button>`:'')
       +(Object.values(manual).includes(name)?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
       +claimMeters(a,Date.now()/1000)+'</div>'}).join('');
   refreshQuotaCards(st);
@@ -2536,9 +2536,9 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                         STATE["events"] = STATE["events"][-200:]
                         save_state()
                     else:
-                        account = next_blocked_account(route_family, enabled, now)
+                        account = next_blocked_account(family, enabled, now)
                 elif policy != "strict":
-                    LAST_BLOCKED_ACCOUNT.pop(route_family, None)
+                    LAST_BLOCKED_ACCOUNT.pop(family, None)
                 if account is not None:
                     info = STATE["accounts"].get(account, {})
                     pace = (0 if policy == "strict" or all_blocked else
@@ -2576,11 +2576,9 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                 entries[-1] = entry
                 rec["rate_limits_omitted"] = rec.get("rate_limits_omitted", 0) + 1
 
-            if all_blocked:
-                return upstream, account, retries, "exhausted"
             retry = (verdict == "exhausted" and time.monotonic() < hold_deadline
                      or verdict in ("switched", "burst") and retries < 5)
-            if not retry:
+            if all_blocked or not retry:
                 return upstream, account, retries, verdict
             content = await bounded_response(upstream)
             rate_limit_error(entry, content, upstream.headers)
@@ -2649,7 +2647,7 @@ async def openai_chat(request: Request):
               "anthropic-ratelimit-unified-status"):
         if upstream.headers.get(h):
             resp_headers[h] = upstream.headers[h]
-    if verdict == "strict" and upstream.headers.get("retry-after") is not None:
+    if upstream.status_code == 429 and upstream.headers.get("retry-after") is not None:
         resp_headers["retry-after"] = upstream.headers["retry-after"]
 
     if upstream.status_code == 429 and verdict == "exhausted":

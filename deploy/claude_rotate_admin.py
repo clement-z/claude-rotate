@@ -248,6 +248,11 @@ def device_pin(entry):
     return entry.get("account_pin") if isinstance(entry, dict) else None
 
 
+def valid_pin_shape(pin):
+    return (isinstance(pin, dict) and set(pin) == {"account", "mode"}
+            and isinstance(pin["account"], str) and pin["mode"] in ("strict", "fallback"))
+
+
 def device_entry(key: str, names: list, pin=None):
     if names == [ANTHROPIC]:
         return key if pin is None else {"key": key, "account_pin": pin}
@@ -417,9 +422,7 @@ def readiness(cfg: dict):
                             f"of names from: {', '.join(sorted(known))}")
         if isinstance(v, dict) and "account_pin" in v:
             pin = device_pin(v)
-            if (not isinstance(pin, dict) or set(pin) != {"account", "mode"}
-                    or not isinstance(pin["account"], str) or pin["account"] not in account_names
-                    or pin["mode"] not in ("strict", "fallback")
+            if (not valid_pin_shape(pin) or pin["account"] not in account_names
                     or not isinstance(names, list) or ANTHROPIC not in names):
                 problems.append(f"device '{k}': account_pin needs a configured account, "
                                 "mode strict or fallback, and the anthropic grant")
@@ -491,6 +494,14 @@ def state_number(value):
     return value if type(value) in (float, int) and 0 <= value < 1e15 else None
 
 
+def object_fields(value):
+    return value if isinstance(value, dict) else {}
+
+
+def claim_status(value):
+    return value if isinstance(value, str) and CLAIM_ID.fullmatch(value) else None
+
+
 def status_claims(cfg: dict, info: dict, now: float) -> dict:
     thresholds = {"5h": cfg.get("switch_threshold", 0.8), "7d": cfg.get("switch_threshold_7d", 0.98),
                   "7d_oi": cfg.get("switch_threshold_7d", 0.98)}
@@ -500,16 +511,17 @@ def status_claims(cfg: dict, info: dict, now: float) -> dict:
                           "seen_at": info.get("last_seen")}
                   for claim in ("5h", "7d") if state_number(info.get(f"util_{claim}")) is not None
                   or state_number(info.get(f"reset_{claim}"))}
-    learned = info.get("learned_claims") or {}
+    learned = object_fields(info.get("learned_claims"))
     result = {}
     for claim, reading in claims.items():
         if not CLAIM_ID.fullmatch(claim) or not isinstance(reading, dict):
             continue
         families = [f for f in MODEL_FAMILIES
-                    if f in KNOWN_CLAIMS.get(claim, ()) or claim in (learned.get(f) or ())]
+                    if f in KNOWN_CLAIMS.get(claim, ())
+                    or (isinstance(learned.get(f), list) and claim in learned[f])]
         reset = state_number(reading.get("reset")) or None
         utilization = state_number(reading.get("utilization"))
-        status = reading.get("status")
+        status = claim_status(reading.get("status"))
         expired = reset is not None and reset <= now
         current = None if expired else utilization
         until = max(reset or 0, state_number(reading.get("recheck_at")) or 0)
@@ -530,7 +542,7 @@ def status_claims(cfg: dict, info: dict, now: float) -> dict:
 
 
 def active_family_blocks(info: dict, now: float) -> dict:
-    return {f: block for f, block in (info.get("blocks_by_family") or {}).items()
+    return {f: block for f, block in object_fields(info.get("blocks_by_family")).items()
             if f in MODEL_FAMILIES and isinstance(block, dict) and (state_number(block.get("until")) or 0) > now}
 
 
@@ -1274,7 +1286,8 @@ def cmd_rotate(args) -> int:
 def live_status(cfg: dict):
     # The status endpoint needs a key with the Claude grant.
     keys = [device_key(v) for v in cfg["devices"].values() if (device_key(v) or "").strip()
-            and PLACEHOLDER not in device_key(v) and ANTHROPIC in (device_providers(v) or [])]
+            and PLACEHOLDER not in device_key(v) and isinstance(names := device_providers(v), list)
+            and ANTHROPIC in names]
     if not keys:
         return None, "no device key available for an authenticated query"
     host, port = bind_address(cfg)
@@ -1282,7 +1295,10 @@ def live_status(cfg: dict):
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {keys[0]}"})
     try:
         with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 loopback only
-            return json.loads(response.read().decode("utf-8")), None
+            payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                return None, "expected a status object"
+            return payload, None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return None, f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
 
@@ -1301,21 +1317,39 @@ def release_info():
     return info
 
 
-def live_account_view(account: dict) -> dict:
+def live_claim_view(claim: str, reading: dict) -> dict:
+    families = reading.get("families")
+    if not isinstance(families, list):
+        families = KNOWN_CLAIMS.get(claim, ())
+    out = {k: state_number(reading.get(k)) for k in ("utilization", "effective_utilization", "reset",
+                                                     "seen_at", "threshold", "blocked_until")}
+    return out | {"label": CLAIM_LABELS.get(claim, claim),
+                  "families": [f for f in MODEL_FAMILIES if f in families],
+                  "freshness": claim_status(reading.get("freshness")),
+                  "status": claim_status(reading.get("status")),
+                  "block_reason": claim_status(reading.get("block_reason"))}
+
+
+def live_account_view(cfg: dict, account: dict, now: float) -> dict:
     out = {k: account[k] for k in ("effective_util_5h", "effective_util_7d", "last_seen", "status",
-                                   "disabled", "eligible_by_family") if k in account}
-    if "claims" in account:
-        out["claims"] = {claim: {k: reading.get(k) for k in (
-            "families", "utilization", "effective_utilization", "reset", "seen_at", "status", "freshness",
-            "threshold", "block_reason", "blocked_until")} | {"label": CLAIM_LABELS.get(claim, claim)}
-            for claim, reading in account["claims"].items() if CLAIM_ID.fullmatch(claim) and isinstance(reading, dict)}
-        out["blocks_by_family"] = {f: {k: b.get(k) for k in ("until", "reason")}
-                                   for f, b in account.get("blocks_by_family", {}).items() if f in MODEL_FAMILIES}
+                                   "disabled") if k in account}
+    if isinstance(account.get("eligible_by_family"), dict):
+        out["eligible_by_family"] = {f: account["eligible_by_family"].get(f) is True for f in MODEL_FAMILIES}
+    if isinstance(claims := account.get("claims"), dict):
+        out["claims"] = {claim: live_claim_view(claim, reading) for claim, reading in claims.items()
+                         if CLAIM_ID.fullmatch(claim) and isinstance(reading, dict)}
+    else:
+        # Older servers always emitted effective gauges. Only raw fields
+        # distinguish a zero reading from an absent sample in that format.
+        out["claims"] = status_claims(cfg, account, now)
+    out["blocks_by_family"] = {f: {"until": b["until"], "reason": claim_status(b.get("reason"))}
+                               for f, b in active_family_blocks(account, now).items()}
     return out
 
 
 def pin_view(pin, source):
-    return {"account_pin": {k: pin[k] for k in ("account", "mode")} if pin else None, "source": source}
+    return {"account_pin": pin if valid_pin_shape(pin) else None,
+            "source": source if source in ("config", "runtime", "automatic") else "unknown"}
 
 
 def collect_status():
@@ -1366,29 +1400,36 @@ def collect_status():
                 account[f"reset_{claim}"] = claims[claim]["reset"]
         accounts.append(account)
     report["accounts"] = accounts
-    report["devices"] = [{"name": k, "key_suffix": (device_key(v)[-4:] if len(device_key(v) or "") >= 8 else None),
-                          "placeholder": PLACEHOLDER in (device_key(v) or ""),
-                          "providers": device_providers(v) or []}
-                         for k, v in cfg["devices"].items()]
-    report["device_pins"] = {name: pin_view(device_pin(entry), "config" if device_pin(entry) else "automatic")
-                             for name, entry in cfg["devices"].items() if ANTHROPIC in (device_providers(entry) or ())}
+    report["devices"], report["device_pins"] = [], {}
+    for name, entry in cfg["devices"].items():
+        key = device_key(entry) or ""
+        grants = device_providers(entry)
+        grants = [g for g in grants if isinstance(g, str)] if isinstance(grants, list) else []
+        report["devices"].append({"name": name, "key_suffix": key[-4:] if len(key) >= 8 else None,
+                                  "placeholder": PLACEHOLDER in key, "providers": grants})
+        if ANTHROPIC in grants:
+            source = "config" if "account_pin" in object_fields(entry) else "automatic"
+            report["device_pins"][name] = pin_view(device_pin(entry), source)
     report["recent_events"] = (state.get("events") or [])[-5:]
     report["live"] = None
     if report["unit"].get("ActiveState") == "active":
         live, problem = live_status(cfg)
         if live is not None:
             report["live"] = {"active_account": live.get("active_account"),
-                              "active_by_family": {f: live["active_by_family"].get(f) for f in MODEL_FAMILIES}
-                              if "active_by_family" in live else
-                              dict.fromkeys(MODEL_FAMILIES, live.get("active_account")),
-                              "device_pins": {n: pin_view(p.get("account_pin"), p["source"])
-                                              for n, p in live.get("device_pins", report["device_pins"]).items()},
+                              "active_by_family": {f: object_fields(live.get("active_by_family")).get(
+                                  f, live.get("active_account")) for f in MODEL_FAMILIES},
+                              "device_pins": {n: pin_view(p.get("account_pin"), p.get("source"))
+                                              for n, p in object_fields(
+                                                  live.get("device_pins", report["device_pins"])).items()
+                                              if isinstance(p, dict)},
                               "storage_errors": live.get("storage_errors"),
                               "providers": {n: {k: p.get(k) for k in (
                                   "kind", "prefix", "state", "reason", "unsaved", "last_error", "client_id", "host_id",
                                   "access_token_min", "refresh_token_days", "images", "quotas")}
-                                  for n, p in (live.get("providers") or {}).items() if isinstance(p, dict)},
-                              "accounts": {n: live_account_view(a) for n, a in (live.get("accounts") or {}).items()}}
+                                  for n, p in object_fields(live.get("providers")).items() if isinstance(p, dict)},
+                              "accounts": {n: live_account_view(cfg, a, now)
+                                           for n, a in object_fields(live.get("accounts")).items()
+                                           if isinstance(a, dict)}}
         else:
             report["live_error"] = problem
     return report
@@ -1406,14 +1447,15 @@ def fmt_time(ts):
 def claim_line(claim):
     utilization = claim["effective_utilization"]
     reading = "awaiting reading" if claim["freshness"] == "awaiting_reading" else (
-        f"{utilization:.0%} used" if utilization is not None else claim["status"])
+        f"{utilization:.0%} used" if utilization is not None else claim["status"] or "awaiting reading")
     fields = [reading, "/".join(claim["families"])]
     if claim["reset"]:
         fields.append(f"reset {fmt_time(claim['reset'])}")
     if claim["seen_at"]:
         fields.append(f"seen {fmt_time(claim['seen_at'])}")
     if claim["block_reason"]:
-        fields.append(f"{claim['block_reason']} until {fmt_time(claim['blocked_until'])}")
+        reason = claim["block_reason"]
+        fields.append(f"{reason} until {fmt_time(claim['blocked_until'])}" if claim["blocked_until"] else reason)
     return f"    {claim['label']}: " + ", ".join(filter(None, fields))
 
 
@@ -1470,6 +1512,8 @@ def cmd_status(args) -> int:
         route = pin.get("account_pin")
         if route:
             routing = f"{route['account']}, {route['mode']} ({pin['source']})"
+        elif pin.get("source") == "config":
+            routing = "invalid config pin"
         else:
             routing = "auto until restart (runtime)" if pin.get("source") == "runtime" else "automatic"
         out(f"  {device['name']}: key ...{device['key_suffix'] or '????'}"

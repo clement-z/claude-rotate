@@ -413,7 +413,9 @@ def spent_answer():
 
 def stale_block(req):
     account = req.headers["authorization"][-1]
-    calls.append(account)
+    calls.append((req.url.path, account))
+    if req.url.path == "/v1/messages/count_tokens":
+        return httpx.Response(200, json={"input_tokens": 8})
     if account == "a":
         return spent_answer()
     return httpx.Response(200, json={"content": []}, headers=unified(u5=None))
@@ -421,15 +423,28 @@ def stale_block(req):
 
 use_upstream(stale_block)
 first = call(body={"model": "claude-opus-5"})
+count = call("/v1/messages/count_tokens", body={"model": "claude-opus-5"})
 fable = call(body={"model": "claude-fable-5"})
 second = call(body={"model": "claude-opus-5"})
+count_again = call("/v1/messages/count_tokens", body={"model": "claude-opus-5"})
 third = call(body={"model": "claude-opus-5"})
-check("each family starts at earliest relief and round-robin reaches the account with a stale block",
+check("alternating inference and count_tokens still reaches the stale-blocked account for inference",
       [r.status_code for r in (first, fable, second, third)] == [429, 429, 200, 200]
-      and calls == ["a", "a", "b", "b"] and "5h" not in R.STATE["accounts"]["b"]["claims"])
+      and count.json() == count_again.json() == {"input_tokens": 8}
+      and calls == [("/v1/messages", "a"), ("/v1/messages/count_tokens", "a"), ("/v1/messages", "a"),
+                    ("/v1/messages", "b"), ("/v1/messages/count_tokens", "b"), ("/v1/messages", "b")]
+      and "5h" not in R.STATE["accounts"]["b"]["claims"])
 
 fresh_state("a", {"a": spent["a"].copy()})
 calls = []
+
+
+def still_spent(req):
+    calls.append((req.url.path, req.headers["authorization"][-1]))
+    return spent_answer()
+
+
+use_upstream(still_spent)
 with patch.dict(R.ACCOUNTS, {"a": R.ACCOUNTS["a"]}, clear=True):
     start = time.monotonic()
     with patch.object(R, "HOLD_MAX_S", 0.05):
@@ -439,10 +454,28 @@ with patch.dict(R.ACCOUNTS, {"a": R.ACCOUNTS["a"]}, clear=True):
 check("count_tokens holds once, then relays the lone spent account's upstream 429",
       opaque.status_code == 429 and opaque.json() == {"error": returned_error}
       and opaque.headers["retry-after"] == "19" and elapsed >= 0.05
-      and calls == ["a", "a"] and [e["type"] for e in R.STATE["events"]] == ["hold"])
+      and calls == [("/v1/messages/count_tokens", "a"), ("/v1/messages", "a")]
+      and [e["type"] for e in R.STATE["events"]] == ["hold"])
 check("chat converts the lone blocked account's upstream 429 to 503 with the relief deadline",
       exhausted.status_code == 503 and int(exhausted.headers["retry-after"]) in range(95, 101)
       and [rec["rate_limits"][0]["error"] for rec in audit_recs()] == [returned_error, returned_error])
+
+fresh_state("a", {name: reading.copy() for name, reading in spent.items()})
+calls = []
+
+
+def recovered_but_paced(req):
+    calls.append(req.headers["authorization"])
+    return httpx.Response(429, json={"error": burst_error}, headers=unified(u5="0.20", **{"retry-after": "30"}))
+
+
+use_upstream(recovered_but_paced)
+r = call(chat, body=chat_body)
+rec = audit_recs()[-1]
+check("a blocked-pool dispatch that returns a burst relays chat 429 and Retry-After without retrying",
+      calls == ["Bearer tok-a"] and r.status_code == 429 and r.headers["retry-after"] == "30"
+      and r.json()["error"]["message"] == "upstream: " + burst_error["message"]
+      and rec["status"] == 429 and rec["rate_limits"][0]["verdict"] == "burst")
 
 
 def hold_handler(req):

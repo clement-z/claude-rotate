@@ -11,6 +11,7 @@ def main():
     tree = ast.parse((Path(__file__).resolve().parent.parent / "rotator.py").read_text())
     panel = next(ast.literal_eval(n.value) for n in tree.body
                  if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PANEL_HTML" for t in n.targets))
+    assert "General weekly quota runs out in" in panel
     assert re.search(r'<div id="weekly"[^>]*>[^<]*</div>\s*<div class="tip" id="tip">', panel), \
         "the tooltip must be outside the chart so its taps do not reach the chart"
     node = shutil.which("node")
@@ -41,7 +42,7 @@ status.pin_targets={[value]:true,[value+'2']:true,[value+'3']:false};
 status.device_pins={[value]:{account_pin:{account:value,mode:'strict'},source:'config'}};
 Object.assign(status.accounts[value],{eligible_by_family:{default:true,fable:false},claims:{
   '7d':{label:'General weekly',families:['default','fable'],effective_utilization:.3,threshold:.98,freshness:'current',reset:receipt+D},
-  '7d_oi':{label:'Fable weekly',families:['fable'],effective_utilization:1,threshold:.98,freshness:'current',block_reason:'exhausted',reset:receipt+2*D},
+  '7d_oi':{label:'Fable weekly',families:['fable'],effective_utilization:1,threshold:.98,freshness:'current',status:'rejected',block_reason:'rejected',reset:receipt+2*D},
   [value]:{families:['default'],effective_utilization:null,freshness:'awaiting_reading',reset:receipt-D}
 }});
 status.accounts[value+'2'].eligible_by_family={default:true,fable:true};
@@ -222,11 +223,21 @@ elements.tip.parentNode=new Element();
   assert(elements.accounts.innerHTML.includes('Resume auto')&&elements.accounts.innerHTML.includes('>Select<'),'account buttons missing');
   const claims=elements.accounts.innerHTML;
   assert.equal((claims.match(/class="meter-row"/g)||[]).length,3,'one meter for each reported claim');
-  assert(claims.includes('Fable weekly')&&claims.includes('blocked · exhausted')&&claims.includes('awaiting reading'));
+  assert(claims.includes('Fable weekly')&&claims.includes('awaiting reading'));
+  assert.equal(claims.match(/rejected/g)?.length,1);
+  assert(!claims.includes('limit reached')&&!claims.includes('blocked'));
   assert(!claims.includes('>5h<')&&!claims.includes('<b>0%</b>'),'absent and expired usage do not show zero');
   const pills=elements.pills.innerHTML;
   assert(pills.includes('Default: ')&&pills.includes('Fable: ')&&pills.includes('&lt;/mark&gt;2</span>'));
   assert(elements.devices.innerHTML.includes('strict (config)')&&elements.devices.innerHTML.includes('data-pin='));
+  status.active_by_family={default:value+'2',fable:value+'2'};
+  status.manual_by_family={default:null,fable:null};
+  status.accounts[value].eligible_by_family.default=false;
+  await timers.get(10000)();
+  assert.equal((elements.accounts.innerHTML.match(/>Select</g)||[]).length,1,
+    'the only eligible account has Select even though it is active for both families');
+  assert(elements.pills.innerHTML.includes('disabled title="no other account is eligible"'),
+    'Rotate cannot select the same account');
   elements.accounts.onclick({target:{closest:()=>({dataset:{sw:value+'2'}})}});
   assert(elements.confirm.open,'confirmation not shown');
   assert(!elements['cf-text'].innerHTML.includes('<mark')&&elements['cf-text'].innerHTML.includes('&lt;mark'),'confirmation not escaped');
@@ -235,6 +246,9 @@ elements.tip.parentNode=new Element();
   assert(post&&post.opts.method==='POST'&&JSON.parse(post.opts.body).account===value+'2'
     &&post.opts.headers.Authorization==='Bearer fake-viewer-key'&&post.opts.headers['Content-Type']==='application/json','switch request');
   assert(!elements.confirm.open,'confirmation stays open after a switch');
+  status.manual_by_family={default:value+'2',fable:value+'2'};
+  await timers.get(10000)();
+  assert(elements.accounts.innerHTML.includes('Resume auto')&&!elements.accounts.innerHTML.includes('>Select<'));
   const edit=()=>elements.devices.onclick({target:{closest:()=>({dataset:{pin:value}})}});
   edit();
   assert(elements['pin-form'].open&&elements['pin-target'].hidden&&elements['pin-mode'].value==='use_config');
