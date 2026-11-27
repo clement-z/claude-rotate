@@ -432,7 +432,7 @@ async def device_pins(c):
               and status["active_account"] == "backup"
               and status["manual_by_family"] == {"default": "backup", "fable": None})
         check("status shows the applicable blocked claim without a synthetic 5h",
-              fable["label"] == "Fable weekly" and fable["families"] == ["fable"]
+              fable["label"] == "Fable 7d" and fable["families"] == ["fable"]
               and fable["utilization"] == fable["effective_utilization"] == 1
               and fable["reset"] == fable["blocked_until"] == reset and fable["seen_at"] > 0
               and fable["freshness"] == "current" and fable["block_reason"] == "exhausted"
@@ -444,8 +444,8 @@ async def device_pins(c):
               and "oaibox" not in status["device_pins"] and status["pin_targets"]["missing"] is False
               and not any(k in r.text for k in KEY.values()))
         stats = (await ask(c, "/rotate/stats", "claude")).json()
-        check("stats warns for a spent Fable weekly claim",
-              any("backup Fable weekly window at 100%" in a["text"] for a in stats["alerts"]))
+        check("stats warns for a spent Fable 7d claim",
+              any("backup Fable 7d window at 100%" in a["text"] for a in stats["alerts"]))
         R.STATE["accounts"]["backup"]["claims"]["7d_oi"]["reset"] = time.time() - 1
         r = await ask(c, "/rotate/status", "claude")
         expired = r.json()["accounts"]["backup"]["claims"]["7d_oi"]

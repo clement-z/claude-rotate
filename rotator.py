@@ -294,7 +294,7 @@ STATE_VERSION = 1
 MODEL_FAMILIES = ("default", "fable")
 GENERAL_CLAIMS = ("5h", "7d")
 KNOWN_CLAIMS = {"5h": MODEL_FAMILIES, "7d": MODEL_FAMILIES, "7d_oi": ("fable",)}
-CLAIM_LABELS = {"5h": "5h", "7d": "General weekly", "7d_oi": "Fable weekly"}
+CLAIM_LABELS = {"5h": "5h", "7d": "7d", "7d_oi": "Fable 7d"}
 CLAIM_HEADER = re.compile(r"anthropic-ratelimit-unified-([a-z0-9][a-z0-9_-]{0,31})-(utilization|status|reset)")
 CLAIM_STATUS = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MAX_LEARNED_CLAIMS = 29
@@ -760,12 +760,13 @@ def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str 
     learned = info.setdefault("learned_claims", {}) if family is not None else {}
     members = set(learned.get(family, ()))
     weekly = reported.get("7d", {})
+    weekly_snapshot = "utilization" in weekly and weekly.get("reset", 0) > now
+    if 200 <= status < 300 and weekly_snapshot and "5h" not in reported:
+        claims.pop("5h", None)
     if family is not None and 200 <= status < 300:
         info.setdefault("last_success_claims", {})[family] = sorted(reported)
-        if "utilization" in weekly and weekly.get("reset", 0) > now:
+        if weekly_snapshot:
             info.get("blocks_by_family", {}).pop(family, None)
-            if "5h" not in reported:
-                claims.pop("5h", None)
             if family == "fable" and "7d_oi" not in reported:
                 claims.pop("7d_oi", None)
             for claim in members - reported.keys():
@@ -1962,7 +1963,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .meter-row{display:grid;grid-template-columns:28px 1fr 250px;gap:10px;align-items:center;margin:8px 0}
  .meter{position:relative;height:8px;border-radius:4px;background:var(--track)} .meter i{position:absolute;inset:0 auto 0 0;border-radius:4px}
  .meter .tick{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink2);opacity:.6}
- .claim-meter .meter-row{grid-template-columns:112px minmax(48px,1fr) minmax(130px,1.4fr);row-gap:4px}
+ .claim-meter .meter-row{grid-template-columns:66px minmax(48px,1fr) minmax(130px,1.4fr);row-gap:4px}
  .claim-meter .meter-row>span{overflow-wrap:anywhere}
  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--ink2);font-weight:400;margin-left:auto}
  .key{display:inline-block;width:16px;border-top:2px solid;vertical-align:4px;margin-right:6px}
@@ -2000,7 +2001,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
   .cards td[data-l]::before{content:attr(data-l);display:block;color:var(--muted);font-size:11px}}
  @media (max-width:600px){main{padding:12px 12px 32px;gap:12px}.card{padding:14px}.cards tr{grid-template-columns:repeat(2,minmax(0,1fr))}
   th,td{padding:8px 6px} .split :is(th,td):nth-child(4){display:none}}
- @media (max-width:900px){.claim-meter .meter-row{grid-template-columns:112px 1fr}}
+ @media (max-width:900px){.claim-meter .meter-row{grid-template-columns:66px 1fr}}
 </style></head><body><main>
 <header><h1>claude-rotate</h1><span class="muted" id="host"></span><span id="pills"></span><span class="spacer"></span><span class="muted small" id="upd"></span></header>
 <div id="alerts"></div>
@@ -2066,13 +2067,12 @@ function meter(label,u,thr,reset,block){
     +`<span>${u==null?'':`<b>${Math.round(u*100)}%</b> `}<span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
 const familyLabel=family=>family==='fable'?'Fable':'Default';
 function claimMeters(account,now){
-  const rows=Object.entries(account.claims||{}).map(([id,c])=>{
-    const meta=[(c.families||[]).map(familyLabel).join(' / ')];
-    if(c.freshness==='awaiting_reading')meta.push('awaiting reading');
-    else if(c.status&&!c.block_reason)meta.push(c.status);
+  const rows=Object.entries(account.claims||{}).filter(([,c])=>c.freshness!=='awaiting_reading').map(([id,c])=>{
+    const meta=[];
+    if(c.status&&c.status!=='allowed'&&!c.block_reason)meta.push(c.status);
     if(c.reset)meta.push(c.reset>now?'resets in '+dur(c.reset-now):'reset '+when(c.reset));
     if(c.blocked_until&&c.blocked_until!==c.reset)meta.push('recheck '+when(c.blocked_until));
-    if(c.seen_at)meta.push('seen '+ago(Math.round((now-c.seen_at)/60)));
+    if(c.seen_at&&account.last_seen-c.seen_at>600)meta.push('seen '+ago(Math.round((now-c.seen_at)/60)));
     return meter(esc(c.label||id),c.effective_utilization,c.threshold,esc(meta.filter(Boolean).join(' · ')),c.block_reason)});
   for(const [f,b] of Object.entries(account.blocks_by_family||{}))
     rows.push(`<div class="small muted">${familyLabel(f)} blocked until ${esc(when(b.until))} · ${b.reason==='repeated_429'?'repeated 429s':'rejected'}</div>`);

@@ -485,7 +485,7 @@ def effective_utilization(info: dict, now: float):
     return util_5h, util_7d
 
 
-CLAIM_LABELS = {"5h": "5h", "7d": "General weekly", "7d_oi": "Fable weekly"}
+CLAIM_LABELS = {"5h": "5h", "7d": "7d", "7d_oi": "Fable 7d"}
 KNOWN_CLAIMS = {"5h": MODEL_FAMILIES, "7d": MODEL_FAMILIES, "7d_oi": ("fable",)}
 CLAIM_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
@@ -1443,19 +1443,30 @@ def fmt_time(ts):
         return str(ts)
 
 
-def claim_line(claim):
+def fmt_duration(seconds):
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    if seconds < 2 * 86400:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 86400:.1f} d"
+
+
+def claim_line(claim, last_seen, now):
     utilization = claim["effective_utilization"]
-    reading = "awaiting reading" if claim["freshness"] == "awaiting_reading" else (
-        f"{utilization:.0%} used" if utilization is not None else claim["status"] or "awaiting reading")
-    fields = [reading, "/".join(claim["families"])]
-    if claim["reset"]:
-        fields.append(f"reset {fmt_time(claim['reset'])}")
-    if claim["seen_at"]:
-        fields.append(f"seen {fmt_time(claim['seen_at'])}")
-    if claim["block_reason"]:
-        reason = claim["block_reason"]
-        fields.append(f"{reason} until {fmt_time(claim['blocked_until'])}" if claim["blocked_until"] else reason)
-    return f"    {claim['label']}: " + ", ".join(filter(None, fields))
+    status = claim["status"]
+    if claim["freshness"] == "awaiting_reading" or (utilization is None and not status and not claim["block_reason"]):
+        return None
+    fields = [f"{utilization:.0%} used"] if utilization is not None else []
+    reason = claim["block_reason"] or status
+    if reason and reason != "allowed":
+        fields.append(reason)
+    if claim["reset"] and claim["reset"] > now:
+        fields.append(f"resets in {fmt_duration(claim['reset'] - now)}")
+    if claim["blocked_until"] and claim["blocked_until"] != claim["reset"]:
+        fields.append(f"recheck in {fmt_duration(max(0, claim['blocked_until'] - now))}")
+    if claim["seen_at"] and (state_number(last_seen) or 0) - claim["seen_at"] > 600:
+        fields.append(f"seen {fmt_duration(max(0, now - claim['seen_at']))} ago")
+    return f"    {claim['label']}: " + ", ".join(fields) if fields else None
 
 
 def cmd_status(args) -> int:
@@ -1485,6 +1496,7 @@ def cmd_status(args) -> int:
     source = "live" if live else report["active_account_source"]
     out(f"active accounts (from {source}): " + ", ".join(f"{f} {active[f] or 'none'}" for f in MODEL_FAMILIES))
     out("accounts (token validity is only visible through real upstream traffic):")
+    now = time.time()
     for acct in report["accounts"]:
         flags = []
         view = {**acct, **(live or {}).get("accounts", {}).get(acct["name"], {})}
@@ -1502,7 +1514,8 @@ def cmd_status(args) -> int:
             f"upstream status {view.get('status', view['upstream_status']) or 'n/a'}"
             + (f" [{', '.join(flags)}]" if flags else ""))
         for reading in view["claims"].values():
-            out(claim_line(reading))
+            if line := claim_line(reading, view["last_seen"], now):
+                out(line)
         for family, block in view["blocks_by_family"].items():
             out(f"    {family} blocked until {fmt_time(block['until'])} ({block['reason']})")
     out("devices:")

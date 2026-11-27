@@ -40,10 +40,11 @@ status.active_by_family={default:value,fable:value+'2'};
 status.manual_by_family={default:value,fable:null};
 status.pin_targets={[value]:true,[value+'2']:true,[value+'3']:false};
 status.device_pins={[value]:{account_pin:{account:value,mode:'strict'},source:'config'}};
-Object.assign(status.accounts[value],{eligible_by_family:{default:true,fable:false},claims:{
-  '7d':{label:'General weekly',families:['default','fable'],effective_utilization:.3,threshold:.98,freshness:'current',reset:receipt+D},
-  '7d_oi':{label:'Fable weekly',families:['fable'],effective_utilization:1,threshold:.98,freshness:'current',status:'rejected',block_reason:'rejected',reset:receipt+2*D},
-  [value]:{families:['default'],effective_utilization:null,freshness:'awaiting_reading',reset:receipt-D}
+Object.assign(status.accounts[value],{last_seen:receipt,eligible_by_family:{default:true,fable:false},claims:{
+  '5h':{label:'5h',families:['default','fable'],effective_utilization:null,freshness:'awaiting_reading',reset:receipt-D},
+  '7d':{label:'7d',families:['default','fable'],effective_utilization:.3,threshold:.98,freshness:'current',status:'allowed',reset:receipt+D,seen_at:receipt-600},
+  '7d_oi':{label:'Fable 7d',families:['fable'],effective_utilization:1,threshold:.98,freshness:'current',status:'rejected',block_reason:'rejected',reset:receipt+2*D,seen_at:receipt-720},
+  [value]:{families:['default'],effective_utilization:.2,freshness:'current',status:'limited',reset:receipt+D}
 }});
 status.accounts[value+'2'].eligible_by_family={default:true,fable:true};
 const quotaHistory={as_of:now,providers:{[value]:[
@@ -222,8 +223,10 @@ elements.tip.parentNode=new Element();
   assert(elements.pills.innerHTML.includes('>Rotate<')&&!elements.pills.innerHTML.includes('disabled'),'rotate button missing');
   assert(elements.accounts.innerHTML.includes('Resume auto')&&elements.accounts.innerHTML.includes('>Select<'),'account buttons missing');
   const claims=elements.accounts.innerHTML;
-  assert.equal((claims.match(/class="meter-row"/g)||[]).length,3,'one meter for each reported claim');
-  assert(claims.includes('Fable weekly')&&claims.includes('awaiting reading'));
+  assert.equal((claims.match(/class="meter-row"/g)||[]).length,3,'one meter for each current claim');
+  assert(claims.includes('Fable 7d')&&claims.includes('>7d<')&&claims.includes('resets in')&&claims.includes('limited'));
+  assert(claims.includes('seen 12 min ago')&&!claims.includes('seen 10 min ago'),'only notably older readings show their age');
+  assert(!claims.includes('Default / Fable')&&!claims.includes('allowed')&&!claims.includes('awaiting reading'));
   assert.equal(claims.match(/rejected/g)?.length,1);
   assert(!claims.includes('limit reached')&&!claims.includes('blocked'));
   assert(!claims.includes('>5h<')&&!claims.includes('<b>0%</b>'),'absent and expired usage do not show zero');

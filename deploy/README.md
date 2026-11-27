@@ -124,8 +124,8 @@ the existing account. It replaces the token file and restarts the service.
 family, quota readings by claim, and each device's effective pin and source.
 It uses live status when the service is reachable. Offline status uses the
 persisted routes and readings and the pins in config. The legacy JSON field
-`active_account` represents the default route. The Fable route tracks its own
-weekly claim alongside the general weekly claim shared with default traffic.
+`active_account` represents the default route. The Fable route tracks
+**Fable 7d** alongside **7d**, which it shares with default traffic.
 
 ```sh
 sudo claude-rotate-admin pin-device laptop acct-1 --mode fallback
@@ -350,11 +350,13 @@ config separately with the admin command; restart is required for
 configuration/token changes.
 
 Before upgrading to the release with Claude family routing and device pins,
-stop the service and back up `/var/lib/claude-rotate/state.json` and
-`/etc/claude-rotate/config.json`. The one-way state migration runs on first
-start. To roll back, restore both backups with the service stopped before
-starting the older release, which rejects `account_pin` in config.
-Panel device-pin overrides clear on every restart.
+copy `/var/lib/claude-rotate/state.json` and `/etc/claude-rotate/config.json`
+while the service runs. State is replaced atomically, so the copy is consistent.
+Then run `sudo ./install.sh`, which restarts into the new release and runs the
+one-way state migration. A rollback loses changes made between the copy and
+that restart. To roll back, stop the service, restore both copies, switch
+`current` back, and start the older release, which rejects `account_pin` in
+config. Panel device-pin overrides clear on every restart.
 
 For a manual promotion or a rollback to a kept release, as root, stop the
 service, then replace the root-owned `current` symlink atomically on the same

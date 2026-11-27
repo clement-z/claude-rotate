@@ -303,10 +303,12 @@ def test_status_live_query_uses_header(f):
     now = round(time.time())
     reset = now + 3600
     active = {"default": "acct-1", "fable": "acct-2"}
-    claims = {"7d": {"utilization": 0.42, "status": "allowed", "reset": reset, "seen_at": now},
-              "7d_oi": {"utilization": 1, "status": "rejected", "reset": reset, "seen_at": now},
+    claims = {"5h": {"utilization": 0.75, "reset": now - 60, "seen_at": now - 900},
+              "7d": {"utilization": 0.42, "status": "allowed", "reset": reset, "seen_at": now - 600},
+              "7d_oi": {"utilization": 1, "status": "rejected", "reset": reset, "seen_at": now - 720},
               "learned": {"utilization": 0.8, "reset": now - 60, "seen_at": now - 3600}}
     live_claims = {
+        "5h": claims["5h"] | {"families": ["default", "fable"], "freshness": "awaiting_reading", "threshold": 0.8},
         "7d": claims["7d"] | {"families": ["default", "fable"], "freshness": "current",
                               "threshold": 0.98, "effective_utilization": 0.42},
         "7d_oi": claims["7d_oi"] | {"families": ["fable"], "freshness": "current", "threshold": 0.98,
@@ -322,7 +324,7 @@ def test_status_live_query_uses_header(f):
     original_state = f.state.read_bytes() if f.state.exists() else None
     live_payload = {"active_account": active["default"], "active_by_family": active,
                     "storage_errors": {"state_write": {"count": 3}},
-                    "accounts": {"acct-1": {"claims": live_claims, "eligible_by_family": available}},
+                    "accounts": {"acct-1": {"claims": live_claims, "eligible_by_family": available, "last_seen": now}},
                     "device_pins": {device: {"account_pin": None, "source": "runtime"}}}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -347,7 +349,7 @@ def test_status_live_query_uses_header(f):
         f.config.write_text(json.dumps(cfg))
         write_state(f, {"active_account": "acct-1", "routes": {f: {"active_account": a} for f, a in active.items()},
                         "accounts": {"acct-1": {"claims": claims, "learned_claims": {"default": ["learned"]},
-                                                "util_5h": 0.75}}, "events": []})
+                                                "last_seen": now}}, "events": []})
         f.set_active(False)
         offline = f.run("status")
         f.set_active(True)
@@ -360,16 +362,17 @@ def test_status_live_query_uses_header(f):
         disk, live = report["accounts"][0], report["live"]["accounts"]["acct-1"]
         assert disk["claims"] == live["claims"]
         assert disk["eligible_by_family"] == live["eligible_by_family"] == available
-        assert "util_5h" not in disk and "effective_util_5h" not in live and TOKEN not in r.stdout
+        assert disk["claims"]["5h"]["freshness"] == "awaiting_reading" and TOKEN not in r.stdout
         assert report["device_pins"][device] == {"account_pin": pin, "source": "config"}
         assert report["live"]["device_pins"][device] == {"account_pin": None, "source": "runtime"}
         assert report["live"]["storage_errors"] == {"state_write": {"count": 3}}
         human = f.run("status")
         assert "storage_errors" in human.stdout and seen["auth"][7:] not in human.stdout
-        for snippet in ("default acct-1, fable acct-2", "General weekly: 42% used, default/fable",
-                        "Fable weekly: 100% used, fable", "learned: awaiting reading"):
-            assert snippet in offline.stdout and snippet in human.stdout
-        assert "5h" not in human.stdout and "5h" not in offline.stdout
+        for text in (human.stdout, offline.stdout):
+            assert "default acct-1, fable acct-2" in text
+            assert "    7d: 42% used, resets in 60 min" in text
+            assert "    Fable 7d: 100% used, rejected, resets in 60 min, seen 12 min ago" in text
+            assert all(word not in text for word in ("5h:", "learned:", "allowed", "default/fable", "seen 10 min ago"))
         assert "acct-2, strict (config)" in offline.stdout
         assert "auto until restart (runtime)" in human.stdout
 
@@ -377,8 +380,8 @@ def test_status_live_query_uses_header(f):
         del live_claims["7d"]["families"]
         live_claims["learned"].update(families=7, effective_utilization="???", status=False, freshness=None)
         human = f.run("status")
-        assert human.returncode == 0 and "General weekly: 42% used, default/fable" in human.stdout, human
-        assert "learned: awaiting reading" in human.stdout
+        assert human.returncode == 0 and "    7d: 42% used, resets in " in human.stdout, human
+        assert "learned:" not in human.stdout
 
         # 8249184 has one route and legacy utilization and reset fields.
         live_payload = {"active_account": "acct-2", "pinned": None, "switch_threshold": 0.8,
@@ -389,7 +392,7 @@ def test_status_live_query_uses_header(f):
                         "recent_events": [], "storage_errors": {}, "weekly": {}, "providers": {}}
         human = f.run("status")
         assert human.returncode == 0 and "default acct-2, fable acct-2" in human.stdout, human
-        assert "General weekly: 64% used" in human.stdout and "Fable weekly:" not in human.stdout
+        assert "    7d: 64% used" in human.stdout and "Fable 7d:" not in human.stdout
         assert "5h:" not in human.stdout and "acct-2, strict (configured, inactive on running version)" in human.stdout
         r = f.run("status", "--json")
         assert r.returncode == 0, r

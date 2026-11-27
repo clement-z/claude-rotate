@@ -686,12 +686,16 @@ asyncio.run(R.refresh_idle_accounts())
 check("refresh sends one 1-token request, to the idle account only",
       probes == [("/v1/messages", "Bearer tok-b", 1)])
 check("refresh records the idle account's real usage", R.STATE["accounts"]["b"]["util_7d"] == 0.69)
+check("refresh records 5h when the plan reports it", R.STATE["accounts"]["b"]["util_5h"] == 0.14)
 check("refresh never changes the active account", R.STATE["active_account"] == "a")
 asyncio.run(R.refresh_idle_accounts())
 check("a just-refreshed account is not probed again", len(probes) == 1)
 
+expired = time.time() - 60
 fresh_state(active="a", accounts={"a": {"last_seen": time.time()}, "b": {
-    "util_5h": 0.14, "claims": {"5h": {"utilization": 0.14}, "ordinary": {"utilization": 0.65}},
+    "util_5h": 0.14, "reset_5h": expired, "claims": {
+        "5h": {"utilization": 0.14, "reset": expired}, "ordinary": {"utilization": 0.65},
+        "7d_oi": {"utilization": 0.24}},
     "learned_claims": {"default": ["ordinary"]}, "last_success_claims": {"default": ["5h", "ordinary"]}}})
 probes.clear()
 R._REFRESH_TRIED.clear()
@@ -705,9 +709,11 @@ def weekly_probe(req):
 use_upstream(weekly_probe)
 asyncio.run(R.refresh_idle_accounts())
 info = R.STATE["accounts"]["b"]
-check("a weekly-only Haiku idle probe updates 7d without retiring live model claims",
-      probes == ["claude-haiku-4-5"] and info["util_7d"] == 0.69 and info["util_5h"] == 0.14
-      and info["claims"]["ordinary"]["utilization"] == 0.65
+check("a weekly-only Haiku idle probe retires 5h and keeps family-specific claims",
+      probes == ["claude-haiku-4-5"] and info["util_7d"] == 0.69
+      and "5h" not in info["claims"] and "util_5h" not in info and "reset_5h" not in info
+      and info["claims"]["ordinary"] == {"utilization": 0.65}
+      and info["claims"]["7d_oi"] == {"utilization": 0.24}
       and info["learned_claims"] == {"default": ["ordinary"]}
       and info["last_success_claims"] == {"default": ["5h", "ordinary"]})
 

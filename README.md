@@ -330,14 +330,16 @@ Live per-account quota gauges, straight from Anthropic's rate-limit headers:
 
 ![account quota gauges with reset countdowns](screenshots/accounts.png)
 
-- **Headline** — time until every account is spent, with when it happens and
+- **Headline** — time until general weekly quota runs out, with when it happens and
   which reset brings quota back; tiles for weekly quota left, burn rate,
   requests in the last 24 h and the 7-day cost-equivalent. Alerts (device over
   N tokens/hour, account near the switch threshold; thresholds in
   `config.json`) sit in a banner above it.
-- **Accounts** — one meter per reported quota claim, including **Fable weekly**
-  where available. Each meter shows which families use it, the reading and its
-  reset, and any block. After a reset it shows *awaiting reading*. Each family
+- **Accounts** — one meter per current quota reading, labelled **5h**, **7d**
+  or **Fable 7d** for those windows. Each shows utilization, time until reset,
+  and any rejection or block. A row shows its age if its reading is more
+  than 10 minutes older than the account's last answer. After a reset the
+  meter returns when a fresh reading arrives. Each family
   has its own active account. **Select** and **Rotate** set a preference for
   the eligible automatic routes. Each route keeps its preference until the
   account reaches a threshold, runs out of quota or is disabled. **Resume auto**
@@ -668,7 +670,7 @@ can lose readings since the last successful save.
 | `plans{}` | extra or corrected plans: `name → {"price": USD a month, "weight": weekly quota relative to Max}`. Built in: `pro` (20, 0.2), `max` (100, 1), `ultra` (200, 2); Anthropic states Max as 5 times Pro every week and Ultra as 10 times. |
 | `accounts[].weight` | weekly capacity relative to a Max account, for accounts without `billing` (default 1): an Ultra is `2`, a Pro `0.2`. With `billing`, the plan sets it. |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
-| `switch_threshold_7d` | preferred switching threshold for the general and Fable weekly claims (default 0.98) |
+| `switch_threshold_7d` | preferred switching threshold for the 7d and Fable 7d claims (default 0.98) |
 | `strategy` | `consume-first` (default) or `least-used` — see below |
 | `switch_cooldown_s` | min seconds between voluntary switches (default 300); hard limits ignore it |
 | `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
@@ -682,9 +684,10 @@ can lose readings since the last successful save.
 ### Rotation policy
 
 Automatic traffic has two routes. A model ID containing `fable` (case-insensitive)
-uses the Fable route. All other requests use the default route. General weekly
-quota and any reported 5h quota apply to both. Fable weekly quota applies to
-Fable. Other reported claims are learned per account and family. Routes and
+uses the Fable route. All other requests use the default route. The 7d and
+any reported 5h quotas apply to both families. Fable 7d applies to Fable.
+A successful weekly snapshot without a 5h header retires that window, including
+on idle refresh. Other claims are learned per account and family. Routes and
 readings survive restarts in `state.json`.
 
 Automatic routing prefers accounts below each applicable switch threshold.
