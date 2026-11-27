@@ -408,13 +408,25 @@ the proxy retried. Each entry records the account, rotation verdict, raw
 available. The audit keeps the first nine and the latest attempt if there are
 more than ten, and counts omitted attempts in `rate_limits_omitted`.
 
-`ratelimit` captures the final answer's rate-limit headers for Fable requests
-and for answers without the unified 5-hour utilization header. These snapshots
-help identify model-specific limits and explain missing utilization readings.
-Both fields keep up to 40 `anthropic-ratelimit-*` headers, with the prefix removed,
-names capped at 100 characters, and values capped at 200. If the audit record
-would exceed the file limit, the proxy strips these snapshots and marks it
-`ratelimit_truncated`.
+`util` records the last upstream answer's valid utilization readings as
+numbers by claim ID. An answer without utilization has an empty object.
+`ratelimit` records raw headers for the final answer when it is a Fable
+answer or when its reported claim IDs differ from the previous answer for
+that account and model family. A retried 429 keeps its headers in
+`rate_limits`. Raw snapshots keep up to 40 `anthropic-ratelimit-*` headers,
+with the prefix removed, names capped at 100 characters, and values capped
+at 200. If the audit record would exceed the file limit, the proxy strips
+raw snapshots and marks it `ratelimit_truncated`.
+
+On Debian, run `sudo claude-rotate-admin ratelimits [--json] [--last N]` after
+the first Fable-only 429. Compare its headers and verdict with the latest
+Fable and default model answers to see which claim Anthropic reported.
+The command shows the latest answer per account and model, including idle
+probes, and five recent upstream 429 attempts by default. Use `--last` to
+change that count. The gateway saves the latest table with each existing
+atomic state write, keeping the 16 most recently seen models per account.
+The admin reads the table live or from `state.json` and identifies the source.
+See [deployment notes](deploy/README.md#runtime-and-operations).
 
 ## OpenAI-compatible endpoint
 

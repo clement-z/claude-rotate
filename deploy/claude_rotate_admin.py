@@ -12,6 +12,7 @@ empty on a real host.
 
 import argparse
 import base64
+import errno
 import fcntl
 import getpass
 import grp
@@ -44,6 +45,10 @@ CONFIG = ETC / "config.json"
 TOKENS = ETC / "tokens"
 STATE_DIR = P("/var/lib/claude-rotate")
 STATE = STATE_DIR / "state.json"
+AUDIT_PATH = P("/var/log/claude-rotate/audit.jsonl")
+AUDIT_TAIL_BYTES = 32 * 1024 * 1024
+AUDIT_TAIL_BACKUPS = 32
+AUDIT_TAIL_LINE_BYTES = 1024 * 1024
 OPT = P("/opt/claude-rotate")
 CURRENT = OPT / "current"
 RELEASES = OPT / "releases"
@@ -1283,7 +1288,7 @@ def cmd_rotate(args) -> int:
 # ---------------------------------------------------------------- status
 
 
-def live_status(cfg: dict):
+def live_status(cfg: dict, path="/rotate/status"):
     # The status endpoint needs a key with the Claude grant.
     keys = [device_key(v) for v in cfg["devices"].values() if (device_key(v) or "").strip()
             and PLACEHOLDER not in device_key(v) and isinstance(names := device_providers(v), list)
@@ -1291,7 +1296,7 @@ def live_status(cfg: dict):
     if not keys:
         return None, "no device key available for an authenticated query"
     host, port = bind_address(cfg)
-    url = f"http://{host}:{port}/rotate/status"
+    url = f"http://{host}:{port}{path}"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {keys[0]}"})
     try:
         with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 loopback only
@@ -1579,6 +1584,164 @@ def cmd_status(args) -> int:
     return EXIT_OK
 
 
+def audit_tail(stream, end, size):
+    """Yield complete lines in reverse order, joining lines split across reads."""
+    start = end - size
+    pending = b""
+    while end > start:
+        offset = max(start, end - 64 * 1024)
+        stream.seek(offset)
+        parts = stream.read(end - offset).split(b"\n")
+        end = offset
+        if len(parts) > 1:
+            if pending is not None and len(parts[-1]) + len(pending) <= AUDIT_TAIL_LINE_BYTES:
+                yield parts[-1] + pending
+            yield from reversed(parts[1:-1])
+            pending = parts[0]
+        elif pending is not None:
+            pending = parts[0] + pending if len(parts[0]) + len(pending) <= AUDIT_TAIL_LINE_BYTES else None
+    if not start and pending:
+        yield pending
+
+
+def entry_text(value, size):
+    return value[:size] if isinstance(value, str) else None
+
+
+def header_view(headers):
+    return {name[:100]: value[:200] for name, value in list(object_fields(headers).items())[:40]
+            if isinstance(value, str)}
+
+
+def recent_rate_limits(count):
+    attempts = []
+    if not count:
+        return attempts, False
+    try:
+        directory = os.open(AUDIT_PATH.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return attempts, False
+    remaining = AUDIT_TAIL_BYTES
+    seen_files = set()
+    try:
+        for n in range(AUDIT_TAIL_BACKUPS + 1):
+            name = f"{AUDIT_PATH.name}.{n}" if n else AUDIT_PATH.name
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ELOOP):
+                    continue
+                raise
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                inode = info.st_dev, info.st_ino
+                if not stat.S_ISREG(info.st_mode) or inode in seen_files:
+                    continue
+                seen_files.add(inode)
+                size = min(info.st_size, remaining)
+                for line in audit_tail(stream, info.st_size, size):
+                    if b'"rate_limits"' not in line:
+                        continue
+                    try:
+                        record = object_fields(json.loads(line))
+                    except (ValueError, RecursionError):
+                        continue
+                    entries = record.get("rate_limits")
+                    if not isinstance(entries, list):
+                        continue
+                    for entry in reversed(entries[-10:]):
+                        if not isinstance(entry, dict):
+                            continue
+                        error = object_fields(entry.get("error"))
+                        attempts.append({
+                            "time": entry_text(record.get("ts"), 40),
+                            "device": entry_text(record.get("device"), 64),
+                            "model": entry_text(record.get("model"), 256),
+                            "account": entry_text(entry.get("account"), 64),
+                            "verdict": entry_text(entry.get("verdict"), 40),
+                            "retry_after": entry_text(entry.get("retry_after"), 200),
+                            "headers": header_view(entry.get("headers")),
+                            "error": {k: entry_text(error[k], cap) for k, cap in (("type", 100), ("message", 300))
+                                      if isinstance(error.get(k), str)},
+                        })
+                        if len(attempts) == count:
+                            return attempts, False
+                remaining -= size
+                if not remaining:
+                    return attempts, True
+    finally:
+        os.close(directory)
+    return attempts, False
+
+
+def latest_ratelimits(cfg):
+    detail = None
+    if unit_properties().get("ActiveState") == "active":
+        live, detail = live_status(cfg)
+        if live is not None:
+            # Older gateways may forward unknown paths to Anthropic.
+            if live.get("ratelimits_available") is not True:
+                return {}, "unavailable", "the running gateway does not report a rate-limit table"
+            live, detail = live_status(cfg, "/rotate/ratelimits")
+            if live is not None and isinstance(live.get("latest_ratelimits"), dict):
+                return live["latest_ratelimits"], "live", None
+            detail = detail or "the live rate-limit table is invalid"
+    try:
+        state = read_state()
+    except Refused as exc:
+        return {}, "unavailable", str(exc)
+    if state is not None and isinstance(state.get("latest_ratelimits"), dict):
+        return state["latest_ratelimits"], "state.json", detail
+    return {}, "unavailable", detail or "state.json has no rate-limit table yet"
+
+
+def diagnostic_text(value):
+    return json.dumps(str(value), ensure_ascii=True)[1:-1]
+
+
+def cmd_ratelimits(args) -> int:
+    if not 0 <= args.last <= 100:
+        raise Refused("--last must be between 0 and 100")
+    cfg = load_config()
+    latest, source, detail = latest_ratelimits(cfg)
+    accounts = {}
+    for account in cfg["accounts"]:
+        name = account["name"]
+        models = object_fields(latest.get(name))
+        if models:
+            accounts[name] = {model[:256]: {"time": state_number(row.get("time")),
+                                            "status": state_number(row.get("status")),
+                                            "path": entry_text(row.get("path"), 1024),
+                                            "headers": header_view(row.get("headers"))}
+                              for model, row in list(models.items())[-16:] if isinstance(row, dict)}
+    attempts, limited = recent_rate_limits(args.last)
+    if args.json:
+        out(json.dumps({"source": source, "detail": detail, "latest_ratelimits": accounts,
+                        "rate_limits": attempts, "audit_limited": limited}, indent=2))
+        return EXIT_OK
+    out(f"Latest rate-limit headers ({source})" + (f" — {detail}" if detail else ""))
+    for account, models in accounts.items():
+        for model, row in models.items():
+            out(diagnostic_text(f"{account} / {model or '(no model)'}  {fmt_time(row['time'])}  "
+                                f"HTTP {row['status'] or '?'}  {row['path'] or '?'}"))
+            for name, value in row["headers"].items():
+                out("  " + diagnostic_text(f"{name}: {value}"))
+    if not accounts and source != "unavailable":
+        out("  No answers recorded")
+    out("Recent upstream 429s" + (" (audit scan limit reached)" if limited else ""))
+    for entry in attempts:
+        out(diagnostic_text(f"{entry['time'] or '?'}  {entry['device'] or '?'} / {entry['model'] or '(no model)'}"
+                            f" / {entry['account'] or '?'}  {entry['verdict'] or '?'}"
+                            f"  Retry-After {entry['retry_after'] or '-'}"))
+        for name, value in entry["headers"].items():
+            out("  " + diagnostic_text(f"{name}: {value}"))
+        for name, value in entry["error"].items():
+            out("  " + diagnostic_text(f"{name}: {value}"))
+    if not attempts:
+        out("  No 429s found" if args.last else "  Skipped (--last 0)")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- entry point
 
 
@@ -1603,6 +1766,9 @@ def build_parser():
 
     add("status", cmd_status, "show service, configuration and rotation state").add_argument(
         "--json", action="store_true", help="machine-readable output")
+    p = add("ratelimits", cmd_ratelimits, "show Claude rate-limit headers and recent upstream 429s")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--last", type=int, default=5, metavar="N", help="maximum 429 entries (default 5, range 0–100)")
     p = add("add-token", cmd_add_token, "store an account token (hidden prompt, stdin or --token-file); "
             "an existing account gets its token replaced", aliases=("add-account",))
     p.add_argument("name", metavar="NAME")

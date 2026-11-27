@@ -439,6 +439,115 @@ def write_state(f, state):
     f.state.write_text(json.dumps(state))
 
 
+def test_ratelimits_live_offline_and_rotated(f):
+    original_config = f.config.read_bytes()
+    original_state = f.state.read_bytes() if f.state.exists() else None
+    paths = []
+    now = round(time.time())
+    table = {"acct-1": {"claude-fable-5": {"time": now, "status": 429, "path": "/v1/messages",
+                                          "headers": {"unified-7d_oi-utilization": "1"}}}}
+    advertised = True
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.headers.get("Authorization", "").startswith("Bearer dev-")
+            paths.append(self.path)
+            if self.path == "/rotate/status":
+                payload = {"active_account": "acct-1"}
+                if advertised:
+                    payload["ratelimits_available"] = True
+            else:
+                assert advertised and self.path == "/rotate/ratelimits"
+                payload = {"latest_ratelimits": table}
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    audit = f.prefix / "var/log/claude-rotate/audit.jsonl"
+    audit.parent.mkdir(parents=True)
+
+    def record(*labels, **extra):
+        return json.dumps({"ts": "2026-11-27T10:00:00+0100", "device": "laptop", "model": "claude-fable-5",
+                           "rate_limits": [{"account": "acct-1", "verdict": "burst", "retry_after": "30",
+                                            "headers": {"fable": "spent"},
+                                            "error": {"message": label, "type": "rate_limit_error"}}
+                                           for label in labels], **extra}) + "\n"
+
+    try:
+        cfg = f.cfg()
+        cfg["port"] = server.server_address[1]
+        f.config.write_text(json.dumps(cfg))
+        write_state(f, {"latest_ratelimits": {"acct-1": {"claude-opus-5":
+                       {"time": now, "status": 200, "path": "/v1/messages", "headers": {"unified-status": "allowed"}}}}})
+        audit.with_suffix(".jsonl.2").write_text(record("oldest", "old", "older"))
+        audit.with_suffix(".jsonl.1").write_text(record("rotated", padding="x" * 80_000))
+        audit.write_text(record("retry", "returned") + '{"status":429}\n{truncated\n')
+        os.link(audit.with_suffix(".jsonl.2"), audit.with_suffix(".jsonl.3"))
+        f.set_active(True)
+        result = f.run("ratelimits", "--json")
+        assert result.returncode == 0, result
+        report = json.loads(result.stdout)
+        assert report["source"] == "live" and report["latest_ratelimits"] == table
+        assert paths == ["/rotate/status", "/rotate/ratelimits"]
+        entries = report["rate_limits"]
+        assert [e["error"]["message"] for e in entries] == ["returned", "retry", "rotated", "older", "old"]
+        assert entries[0] == {"time": "2026-11-27T10:00:00+0100", "device": "laptop", "model": "claude-fable-5",
+                              "account": "acct-1", "verdict": "burst", "retry_after": "30",
+                              "headers": {"fable": "spent"},
+                              "error": {"type": "rate_limit_error", "message": "returned"}}
+        human = f.run("ratelimits", "--last", "1")
+        assert human.returncode == 0 and "acct-1 / claude-fable-5" in human.stdout
+        assert "HTTP 429  /v1/messages" in human.stdout and "Retry-After 30" in human.stdout
+        assert "message: returned" in human.stdout and "message: retry" not in human.stdout
+
+        advertised = False
+        paths.clear()
+        old = f.run("ratelimits", "--json", "--last", "1")
+        assert old.returncode == 0, old
+        report = json.loads(old.stdout)
+        assert report["source"] == "unavailable" and "does not report" in report["detail"]
+        assert not report["latest_ratelimits"] and report["rate_limits"] == entries[:1]
+        assert paths == ["/rotate/status"]  # Never send the newer path to an older gateway.
+
+        f.set_active(False)
+        offline = f.run("ratelimits", "--json", "--last", "3")
+        assert offline.returncode == 0, offline
+        report = json.loads(offline.stdout)
+        assert report["source"] == "state.json" and list(report["latest_ratelimits"]["acct-1"]) == ["claude-opus-5"]
+        assert report["rate_limits"] == entries[:3]
+        rotated = f.run("ratelimits", "--json", "--last", "100")
+        assert rotated.returncode == 0, rotated
+        assert len(json.loads(rotated.stdout)["rate_limits"]) == 6
+
+        with audit.open("wb") as stream:
+            stream.truncate(33 * 1024 * 1024)
+        limited = f.run("ratelimits", "--json", "--last", "1")
+        assert limited.returncode == 0, limited
+        report = json.loads(limited.stdout)
+        assert report["audit_limited"] and not report["rate_limits"]
+
+        for path in audit.parent.glob("audit.jsonl*"):
+            path.unlink()
+        empty = f.run("ratelimits")
+        assert empty.returncode == 0 and "No 429s found" in empty.stdout and "(state.json)" in empty.stdout
+    finally:
+        server.shutdown()
+        server.server_close()
+        f.set_active(False)
+        f.config.write_bytes(original_config)
+        if original_state is None:
+            f.state.unlink(missing_ok=True)
+        else:
+            f.state.write_bytes(original_state)
+
+
 def test_rotate_rejections_do_not_mutate(f):
     cfg = f.cfg()
     cfg["accounts"] = [{"name": "acct-1", "token_file": "tokens/acct-1.token"},
@@ -638,6 +747,7 @@ def main():
              "test_readiness_needs_enabled_nonempty_token", "test_inherited_lock_descriptor",
              "test_restart_failure_is_reported", "test_concurrent_add_users_are_serialized",
              "test_status_has_no_secrets", "test_status_live_query_uses_header", "test_status_reports_malformed_config_pin",
+             "test_ratelimits_live_offline_and_rotated",
              "test_rotate_rejections_do_not_mutate", "test_rotate_refuses_split_route_noop",
              "test_rotate_switches_after_stop_and_preserves_state",
              "test_remove_token_and_setup_needed", "test_set_url_and_symlinked_config"]

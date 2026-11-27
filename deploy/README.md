@@ -127,6 +127,22 @@ persisted routes and readings and the pins in config. The legacy JSON field
 `active_account` represents the default route. The Fable route tracks
 **Fable 7d** alongside **7d**, which it shares with default traffic.
 
+After the first Fable-only 429, run `sudo claude-rotate-admin ratelimits`
+to compare that attempt with the latest Claude headers by account and model.
+The gateway saves those headers with each answer's atomic state write and
+keeps 16 models per account, including idle probes. The command uses the
+authenticated `GET /rotate/ratelimits` on supported running releases or reads
+`state.json` when offline. It reports the source and can still show audit
+entries when the running release has no table. Use `--json` for structured
+output and `--last N` for up to 100 attempts (default 5, or 0 for the table
+alone). The command scans newest first, up to 32 MiB across the current
+`audit.jsonl` and numbered rotations through `.32`.
+
+Claude audit lines store `util` as numeric utilization by claim ID.
+`ratelimit` captures Fable answers and claim-set changes per account and
+family. `rate_limits` retains upstream 429 attempts and their verdicts,
+including attempts the proxy retried.
+
 ```sh
 sudo claude-rotate-admin pin-device laptop acct-1 --mode fallback
 sudo claude-rotate-admin unpin-device laptop

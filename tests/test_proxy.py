@@ -80,7 +80,9 @@ def call(path="/v1/messages", key="devkey-1", body=None, headers=None, method="P
 
 
 def audit_recs():
-    return [json.loads(l) for l in R.AUDIT_PATH.read_text().splitlines() if l.strip()]
+    records = [json.loads(l) for l in R.AUDIT_PATH.read_text().splitlines() if l.strip()]
+    assert all(isinstance(rec.get("util"), dict) and "util_5h" not in rec for rec in records)
+    return records
 
 
 class Chunks(httpx.AsyncByteStream):
@@ -132,7 +134,10 @@ recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
       and recs[-1]["usage"]["input_tokens"] == 7 and recs[-1]["model"] == "claude-opus-5")
-check("ordinary answer with 5h utilization has no rate-limit snapshot", "ratelimit" not in recs[-1])
+check("first set of claims records a snapshot and numeric utilization",
+      recs[-1]["ratelimit"]["unified-5h-utilization"] == "0.5" and recs[-1]["util"] == {"5h": 0.5, "7d": 0.2})
+call()
+check("stable Opus claim set omits raw headers", "ratelimit" not in audit_recs()[-1])
 
 # --- 3. SSE relay ------------------------------------------------------------
 fresh_state()
@@ -257,8 +262,10 @@ use_upstream(lambda req: httpx.Response(200, headers=unified(**extra), json={"us
 r = call(body={"model": "Claude-FaBlE-5", "messages": []},
          headers={"anthropic-ratelimit-request-only": "request-header-marker"})
 snapshot = audit_recs()[-1]["ratelimit"]
+call(body={"model": "Claude-FaBlE-5", "messages": []})
 check("Fable captures only response rate-limit headers, truncated and capped at forty",
       r.status_code == 200 and len(snapshot) == 40 and snapshot["fable"] == "x" * 200
+      and "ratelimit" in audit_recs()[-1]
       and all(k == "fable" or k.startswith(("unified-", "test-")) for k in snapshot)
       and not any(s in R.AUDIT_PATH.read_text() for s in (
           "response-secret-marker", "ignored-header-marker", "request-header-marker", "tok-a", "devkey-1")))
@@ -267,9 +274,22 @@ use_upstream(lambda req: httpx.Response(200, content=SSE.encode(), headers={
     **unified(u5=None), "content-type": "text/event-stream"}))
 r = call()
 rec = audit_recs()[-1]
-check("a non-Fable stream without 5h utilization records the other headers",
-      r.text == SSE and rec["util_5h"] is None and rec["ratelimit"]["unified-7d-utilization"] == "0.2"
-      and "unified-5h-utilization" not in rec["ratelimit"])
+check("the first weekly-only Opus stream records headers even after Fable was observed",
+      r.text == SSE and rec["util"] == {"7d": 0.2} and rec["ratelimit"]["unified-7d-utilization"] == "0.2")
+call()
+check("stable weekly-only Opus answers omit the raw snapshot",
+      "ratelimit" not in audit_recs()[-1] and audit_recs()[-1]["util"] == {"7d": 0.2})
+extra = {f"anthropic-ratelimit-unified-added-{i}-utilization": "0.30" for i in range(40)}
+extra["anthropic-ratelimit-unified-invalid-utilization"] = "NaN"
+extra["anthropic-ratelimit-unified-negative-utilization"] = "-1"
+use_upstream(lambda req: httpx.Response(200, json={}, headers=unified(u5=None, u7="0.0", **extra)))
+call()
+call()
+changed, stable = audit_recs()[-2:]
+check("claim-set changes log once and utilization has valid bounded samples including zero",
+      "ratelimit" in changed and "ratelimit" not in stable and changed["util"] == stable["util"]
+      and stable["util"]["7d"] == 0 and len(stable["util"]) == 1 + R.MAX_LEARNED_CLAIMS
+      and not ({"invalid", "negative"} & stable["util"].keys()))
 
 fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 long_error = {"type": "rate_limit_error", "message": "m" * 350, "extra": "ignored-error-marker"}
@@ -309,7 +329,8 @@ r = call(chat, body=chat_body)
 rec = audit_recs()[-1]
 check("OpenAI chat stream audits a retried burst and the Fable answer",
       r.status_code == 200 and "[DONE]" in r.text and rec["retries"] == 1
-      and rec["rate_limits"][0]["error"] == burst_error and rec["ratelimit"]["unified-status"] == "allowed")
+      and rec["rate_limits"][0]["error"] == burst_error and rec["ratelimit"]["unified-status"] == "allowed"
+      and rec["util"] == {"5h": 0.5, "7d": 0.2})
 
 fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 use_upstream(lambda req: httpx.Response(429, json={"error": returned_error},
@@ -322,6 +343,10 @@ check("OpenAI chat still maps exhaustion to 503 and audits the upstream 429 and 
       and rec["status"] == 503 and rec["rate_limits"][0]["error"] == returned_error
       and rec["rate_limits"][0]["verdict"] == "exhausted" and rec["ratelimit"]["unified-status"] == "rejected"
       and "unified-5h-utilization" not in rec["ratelimit"])
+answer = call("/rotate/ratelimits", method="GET").json()["latest_ratelimits"]["a"]["claude-opus-5"]
+check("the latest table records chat 429s at the actual upstream path",
+      answer["status"] == 429 and answer["path"] == "/v1/messages" and answer["headers"] == rec["ratelimit"]
+      and answer["time"] <= time.time())
 
 fresh_state()
 use_upstream(lambda req: httpx.Response(429, json={"error": burst_error},
@@ -725,6 +750,27 @@ asyncio.run(R.refresh_idle_accounts())
 asyncio.run(R.refresh_idle_accounts())
 check("headerless 429 (retired model) neither paces nor gets retried before the interval",
       "pace_until" not in R.STATE["accounts"].get("b", {}) and len(probes) == 1)
+check("even a headerless idle probe replaces the model's latest answer",
+      R.STATE["latest_ratelimits"]["b"][R.REFRESH_MODEL]["status"] == 429
+      and R.STATE["latest_ratelimits"]["b"][R.REFRESH_MODEL]["headers"] == {})
+
+# The table is bounded independently for each account and kept out of status.
+fresh_state()
+use_upstream(lambda req: httpx.Response(200, json={}, headers=unified(u5=None)))
+for i in range(16):
+    call(body={"model": f"claude-test-{i}"})
+call(body={"model": "claude-test-0"})
+long_model = "claude-test-" + "x" * 300
+with patch.object(R, "STATE_PATH", tmp / "diagnostic-state.json"), patch.object(R, "save_state", lambda: R.write_state(R.STATE)):
+    call("/v1/messages?ignore=query-marker", body={"model": long_model})
+    saved = R.load_state()
+models = saved["latest_ratelimits"]["a"]
+check("latest answers persist, evict by last use, cap model IDs and omit the query",
+      len(models) == 16 and "claude-test-1" not in models and "claude-test-0" in models
+      and long_model[:256] in models and models[long_model[:256]]["path"] == "/v1/messages")
+panel_status = call("/rotate/status", method="GET").json()
+check("status advertises the table without embedding its records",
+      panel_status["ratelimits_available"] is True and "latest_ratelimits" not in json.dumps(panel_status))
 
 # --- 10. panel_tailnet: Tailscale Serve identity opens the panel, not the proxy
 ts = {"tailscale-user-login": "alice@example.com"}

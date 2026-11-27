@@ -221,7 +221,8 @@ class RequestAdmission:
     async def __call__(self, scope, receive, send):
         admin = (scope.get("method"), scope.get("path")) in {
             ("GET", "/rotate/status"), ("GET", "/rotate/stats"), ("GET", "/rotate/panel"),
-            ("GET", "/rotate/quota-history"), ("POST", "/rotate/switch"), ("POST", "/rotate/device-pin")}
+            ("GET", "/rotate/quota-history"), ("GET", "/rotate/ratelimits"),
+            ("POST", "/rotate/switch"), ("POST", "/rotate/device-pin")}
         if scope["type"] != "http" or not self.limit or admin:
             return await self.app(scope, receive, send)
         # One event loop, with no await between the check and increment.
@@ -751,9 +752,38 @@ def parse_claims(headers: httpx.Headers, existing: dict) -> dict:
     return claims
 
 
-def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str | None, now: float) -> None:
-    claims = account_claims(info)
-    reported = parse_claims(headers, claims)
+def remember_ratelimits(account: str, model: str | None, path: str, status: int, headers: dict, now: float) -> None:
+    models = STATE.setdefault("latest_ratelimits", {}).setdefault(account, {})
+    key = (model or "")[:256]
+    models.pop(key, None)
+    models[key] = {"time": now, "status": status, "path": path[:1024], "headers": headers}
+    while len(models) > 16:
+        del models[next(iter(models))]
+
+
+def audit_claude_answer(rec: dict, account: str, family: str | None, reported: dict, headers: dict) -> None:
+    claims = {}
+    unfamiliar = 0
+    for claim, fields in reported.items():
+        if not fields:
+            continue
+        if claim not in KNOWN_CLAIMS:
+            if unfamiliar >= MAX_LEARNED_CLAIMS:
+                continue
+            unfamiliar += 1
+        claims[claim] = fields
+    rec["util"] = {claim: fields["utilization"] for claim, fields in claims.items() if "utilization" in fields}
+    claim_ids = sorted(claims)
+    previous = STATE.setdefault("audit_claim_ids", {}).setdefault(account, {})
+    scope = family or "non_inference"
+    if model_family(rec["model"]) == "fable" or previous.get(scope, []) != claim_ids:
+        rec["ratelimit"] = headers
+    else:
+        rec.pop("ratelimit", None)
+    previous[scope] = claim_ids
+
+
+def observe_claims(info: dict, claims: dict, reported: dict, status: int, family: str | None, now: float) -> None:
     if not reported:
         return
     info["claims"] = claims
@@ -818,12 +848,20 @@ def aggregate_recheck(info: dict, headers: httpx.Headers, family: str, now: floa
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int, *, family: str | None = "default",
-                        repeated_burst: bool = False, policy: str = "automatic") -> str | None:
+                        repeated_burst: bool = False, policy: str = "automatic",
+                        model: str | None = None, path: str | None = None, rec: dict | None = None) -> str | None:
     """Observe headers once and classify an automatic 429 for its own family."""
     async with state_lock:
         info = STATE["accounts"].setdefault(account, {})
         now = time.time()
-        observe_claims(info, headers, status, family, now)
+        claims = account_claims(info)
+        reported = parse_claims(headers, claims)
+        if path is not None:
+            raw = rate_limit_headers(headers)
+            remember_ratelimits(account, model, path, status, raw, now)
+            if rec is not None:
+                audit_claude_answer(rec, account, family, reported, raw)
+        observe_claims(info, claims, reported, status, family, now)
         aggregate = headers.get("anthropic-ratelimit-unified-status")
         if aggregate:
             info["status"] = aggregate
@@ -864,7 +902,8 @@ async def note_response(account: str, headers: httpx.Headers, status: int, *, fa
 # Cheapest call that returns the unified headers on a setup-token: /api/oauth/usage
 # needs the user:profile scope and count_tokens omits them. A model the plan
 # can't use answers 429 with no headers, so replace this one when it retires.
-REFRESH_BODY = json.dumps({"model": "claude-haiku-4-5", "max_tokens": 1,
+REFRESH_MODEL = "claude-haiku-4-5"
+REFRESH_BODY = json.dumps({"model": REFRESH_MODEL, "max_tokens": 1,
                            "messages": [{"role": "user", "content": "."}]}).encode()
 _REFRESH_TRIED: dict = {}
 
@@ -889,9 +928,13 @@ async def refresh_idle_accounts() -> None:
             print(f"warning: usage refresh of {name} failed ({type(exc).__name__})", file=sys.stderr)
             continue
         if "anthropic-ratelimit-unified-status" in r.headers:
-            await note_response(name, r.headers, r.status_code, family=None, policy="observe")
+            await note_response(name, r.headers, r.status_code, family=None, policy="observe",
+                                model=REFRESH_MODEL, path="/v1/messages")
         else:
-            # note_response would read a headerless 429 as a burst and pace the account.
+            async with state_lock:
+                remember_ratelimits(name, REFRESH_MODEL, "/v1/messages", r.status_code,
+                                    rate_limit_headers(r.headers), time.time())
+                save_state()
             print(f"warning: usage refresh of {name}: HTTP {r.status_code} without usage headers",
                   file=sys.stderr)
 
@@ -1250,6 +1293,7 @@ async def rotate_status(request: Request):
         "accounts": accounts,
         "recent_events": STATE["events"][-10:],
         "storage_errors": STORAGE_ERRORS,
+        "ratelimits_available": True,
         "weekly": weekly_outlook(now),
         "providers": {name: p.status() for name, p in PROVIDERS.items()},
     }
@@ -1261,6 +1305,14 @@ async def rotate_quota_history(request: Request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
     now = time.time()
     return {"as_of": now, "providers": quota_history_snapshot(now)}
+
+
+@app.get("/rotate/ratelimits")
+async def rotate_ratelimits(request: Request):
+    if not panel_allowed(request):
+        return JSONResponse({"error": "unknown device key"}, status_code=401)
+    latest = STATE.get("latest_ratelimits", {})
+    return {"latest_ratelimits": {name: latest[name] for name in ACCOUNTS if name in latest}}
 
 
 @app.post("/rotate/switch")
@@ -2489,10 +2541,6 @@ def add_claude_audit_fields(rec: dict, upstream: httpx.Response, account: str, r
     rec.update(account=account, status=upstream.status_code)
     if retries:
         rec["retries"] = retries
-    model = rec["model"]
-    if ((isinstance(model, str) and "fable" in model.lower())
-            or "anthropic-ratelimit-unified-5h-utilization" not in upstream.headers):
-        rec["ratelimit"] = rate_limit_headers(upstream.headers)
 
 
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, rec: dict,
@@ -2557,7 +2605,8 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                 client.build_request(method, url, headers=fwd_headers, content=body), stream=True)
             try:
                 verdict = await note_response(account, upstream.headers, upstream.status_code, family=family,
-                                              repeated_burst=account in burst_accounts, policy=policy)
+                                              repeated_burst=account in burst_accounts, policy=policy,
+                                              model=rec["model"], path=upstream.request.url.path, rec=rec)
             except BaseException:
                 await upstream.aclose()
                 raise
@@ -2677,8 +2726,6 @@ async def openai_chat(request: Request):
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(tr.usage)
-                rec["util_5h"] = upstream.headers.get(
-                    "anthropic-ratelimit-unified-5h-utilization")
                 audit(rec)
 
         return StreamingResponse(relay(), status_code=200, headers=resp_headers,
@@ -2687,7 +2734,6 @@ async def openai_chat(request: Request):
     content = await bounded_response(upstream)
     if upstream.status_code == 429:
         rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
-    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     if upstream.status_code != 200:
         try:
             msg = json.loads(content).get("error", {}).get("message") \
@@ -3150,7 +3196,6 @@ async def proxy(request: Request, path: str):
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(usage_acc)
-                rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
                 audit(rec)
 
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
@@ -3162,7 +3207,6 @@ async def proxy(request: Request, path: str):
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
         pass
-    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     audit(rec)
     return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
 

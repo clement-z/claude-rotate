@@ -319,7 +319,8 @@ async def panel(c):
     for tailnet in (False, True):
         R.PANEL_TAILNET = tailnet
         mode = "tailnet on" if tailnet else "tailnet off"
-        for path in ("/rotate/panel", "/rotate/status", "/rotate/stats", "/rotate/quota-history", "/rotate/switch"):
+        for path in ("/rotate/panel", "/rotate/status", "/rotate/stats", "/rotate/quota-history",
+                     "/rotate/ratelimits", "/rotate/switch"):
             codes = [await hit(path, KEY[d]) for d in ("claude", "allbox", "lanbox", "oaibox")]
             check(f"{mode} {path}: a key with the anthropic grant opens it, a provider-only key does not",
                   codes == [200, 200, 401, 401])
