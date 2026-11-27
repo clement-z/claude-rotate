@@ -13,13 +13,11 @@ from __future__ import annotations
 import json
 import time
 
+from pricing import token_count
+
 _FINISH = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length"}
 USAGE_COUNTS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 CACHE_CREATION_COUNTS = ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
-
-
-def token_count(value) -> int:
-    return value if type(value) is int and 0 <= value < 10**15 else 0
 
 
 def claude_usage(usage) -> dict | None:

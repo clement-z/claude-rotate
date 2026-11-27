@@ -53,8 +53,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.datastructures import MutableHeaders
 
+import pricing
 import providers
-from oai_compat import SseToOai, anthropic_to_oai, claude_usage as summarize_usage, oai_to_anthropic, token_count
+from oai_compat import SseToOai, anthropic_to_oai, claude_usage as summarize_usage, oai_to_anthropic
+from pricing import BUILTIN_PRICES, DEFAULT_PRICE
 from providers import ANTHROPIC, HISTORY_DAYS
 
 ROOT = Path(__file__).parent
@@ -1531,111 +1533,23 @@ async def buffered_search(request: Request, upstream: httpx.Response) -> bytes:
         await upstream.aclose()
 
 
-# API list prices per MTok, [input, output] or [input, output, cached input], matched
-# by the longest pattern found in the model id. Without a cached-input price a cache
-# read costs 0.1x input. Claude prices read 2026-11-27 from
-# https://platform.claude.com/docs/en/about-claude/pricing.md. Cost columns are
-# *API-equivalent* dollars: what this usage would cost pay-per-token.
-BUILTIN_PRICES = {
-    "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
-    "opus": [5.0, 25.0],
-    "sonnet": [3.0, 15.0],
-    "haiku": [1.0, 5.0],
-    "fable-5-2": [8.0, 40.0, 0.20], "mythos-5-2": [8.0, 40.0, 0.20],
-    "fable-5-1": [10.0, 50.0, 0.25], "mythos-5-1": [10.0, 50.0, 0.25],
-    "fable-5": [10.0, 50.0, 1.0], "mythos-5": [10.0, 50.0, 1.0],
-    "opus-5-5": [4.0, 20.0, 0.20], "opus-5": [5.0, 25.0, 0.50],
-    "opus-4-8": [5.0, 25.0, 0.50], "opus-4-7": [5.0, 25.0, 0.50],
-    "sonnet-5-5": [2.0, 10.0, 0.10], "sonnet-5": [2.0, 10.0, 0.20], "sonnet-4-6": [3.0, 15.0, 0.30],
-    "haiku-5-5": [0.10, 0.50, 0.01], "haiku-4-5": [1.0, 5.0, 0.10],
-    # OpenAI Standard tier, short context (up to 272K input tokens), read 2026-11-27 from
-    # https://developers.openai.com/api/docs/pricing. gpt-5.6-sol is a promotional
-    # price until 2026-11-30. The -pro and -nano rows keep those models from taking
-    # the price of the shorter name they contain.
-    "gpt-6.2-astra": [8.0, 40.0, 0.4], "gpt-6.2-sol": [2.0, 10.0, 0.1],
-    "gpt-6.1-sol": [2.0, 10.0, 0.1], "gpt-6.1-terra": [1.0, 5.0, 0.05],
-    "gpt-6-astra": [10.0, 50.0, 1.0], "gpt-6-sol": [2.0, 10.0, 0.2], "gpt-6-luna": [0.1, 0.5, 0.01],
-    "gpt-5.6-sol": [4.0, 20.0, 0.4], "gpt-5.6-terra": [2.0, 12.0, 0.2], "gpt-5.6-luna": [0.2, 1.2, 0.02],
-    "gpt-5.5": [5.0, 30.0, 0.5], "gpt-5.5-pro": [30.0, 180.0],
-    "gpt-5.4": [2.5, 15.0, 0.25], "gpt-5.4-mini": [0.75, 4.5, 0.075], "gpt-5.4-nano": [0.2, 1.25, 0.02],
-    "gpt-5.4-pro": [30.0, 180.0],
-    "gpt-5.3-codex": [1.75, 14.0, 0.175],
-}
-
-
 def load_prices() -> dict:
-    """The built-in table with config.json's prices_per_mtok laid over it entry by
-    entry, so an install whose config holds an older copy still gets new entries. A
-    malformed entry is reported and skipped: costs are analytics, never a reason to
-    stop the proxy."""
-    table = dict(BUILTIN_PRICES)
-    extra = CFG.get("prices_per_mtok", {})
-    for pattern, price in (extra.items() if isinstance(extra, dict) else []):
-        if (isinstance(pattern, str) and pattern and isinstance(price, list) and len(price) in (2, 3)
-                and all(type(v) in (int, float) and 0 <= v < 1e6 for v in price)):
-            table[pattern] = price
-        else:
-            print(f"warning: prices_per_mtok entry {pattern!r} ignored: it needs [input, output] or "
-                  "[input, output, cached input], in $ per MTok", file=sys.stderr)
-    if not isinstance(extra, dict):
-        print("warning: prices_per_mtok ignored: it must map model patterns to prices", file=sys.stderr)
-    return table
+    return pricing.load_prices(CFG.get("prices_per_mtok", {}))
 
 
 PRICES = load_prices()
-DEFAULT_PRICE = [5.0, 25.0]
-FAST_PRICE_MODELS = ("fable-5-2", "mythos-5-2", "opus-5", "opus-4-8")
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
     "util_warn": 0.8,
 })
 
 
-def price_pattern_matches(pattern: str, model: str) -> bool:
-    # A date starting with 2 is not the -2 revision of a model.
-    return pattern in model and (not pattern[-1].isdigit()
-                                 or re.search(re.escape(pattern) + r"(?![0-9])", model) is not None)
-
-
 def price_for(model: str | None, default=DEFAULT_PRICE) -> list[float] | None:
-    """The entry of the longest pattern found in the model id, so gpt-5.4-mini is not
-    priced as gpt-5.4 whatever the order of the table."""
-    if not isinstance(model, str):
-        return default
-    pattern = max((pat for pat in PRICES if price_pattern_matches(pat, model)), key=len, default=None)
-    return PRICES[pattern] if pattern else default
+    return pricing.price_for(model, PRICES, default)
 
 
 def api_cost(model: str | None, usage: dict, provider=None) -> float:
-    """API-equivalent $ for one request, including prompt length, speed and cache TTL.
-    Another provider's model costs 0 unless prices_per_mtok names it: the Claude
-    default price would be invented."""
-    price = price_for(model, None if provider else DEFAULT_PRICE)
-    if price is None:
-        return 0.0
-    p_in, p_out, *cached = price
-    input_tokens = usage.get("input_tokens", 0)
-    read_tokens = usage.get("cache_read_input_tokens", 0)
-    write_tokens = usage.get("cache_creation_input_tokens", 0)
-    long_writes = 0
-    if isinstance(split := usage.get("cache_creation"), dict):
-        long_writes = token_count(split.get("ephemeral_1h_input_tokens"))
-        write_tokens = max(write_tokens, long_writes + token_count(split.get("ephemeral_5m_input_tokens")))
-    elif isinstance(details := usage.get("input_tokens_details"), dict):
-        total, long_writes = providers.openai_cache_writes(details)
-        write_tokens = max(write_tokens, total)
-    scale = 1
-    if isinstance(model, str):
-        if price_pattern_matches("haiku-5-5", model) and input_tokens + read_tokens + write_tokens > 100_000:
-            scale = 5
-        elif usage.get("speed") == "fast" and any(price_pattern_matches(pat, model) for pat in FAST_PRICE_MODELS):
-            scale = 2
-    return scale * (
-        input_tokens * p_in
-        + usage.get("output_tokens", 0) * p_out
-        + read_tokens * (cached[0] if cached else p_in * 0.1)
-        + ((write_tokens - long_writes) * 1.25 + long_writes * 2) * p_in
-    ) / 1_000_000
+    return pricing.api_cost(model, usage, provider, prices=PRICES)
 
 
 # Incremental, bounded tail of the current audit file. Counts become partial

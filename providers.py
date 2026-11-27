@@ -31,7 +31,8 @@ from pathlib import Path
 
 import httpx
 
-from oai_compat import claude_usage, merge_usage, token_count
+from oai_compat import claude_usage, merge_usage
+from pricing import openai_cache_writes, token_count
 
 ANTHROPIC = "anthropic"  # the rotated Claude accounts on the bare root
 # First path segments the Claude passthrough, the admin endpoints and FastAPI's own
@@ -888,18 +889,6 @@ OPENAI_CACHE_FIELDS = ("cached_tokens", "cache_write_tokens", "cache_write_token
                        "cache_write_30m_tokens", "cache_write_tokens_30m",
                        "cache_write_12h_tokens", "cache_write_tokens_12h")
 OPENAI_CACHE_TTLS = ("ttl_30m_tokens", "ttl_12h_tokens")
-
-
-def openai_cache_writes(details: dict) -> tuple[int, int]:
-    """Total write tokens and the subset explicitly reported as 12-hour writes."""
-    total = token_count(details.get("cache_write_tokens"))
-    split = details.get("cache_write_tokens_details")
-    split = split if isinstance(split, dict) else {}
-    short = max(token_count(split.get("ttl_30m_tokens")), token_count(details.get("cache_write_30m_tokens")),
-                token_count(details.get("cache_write_tokens_30m")))
-    long = max(token_count(split.get("ttl_12h_tokens")), token_count(details.get("cache_write_12h_tokens")),
-               token_count(details.get("cache_write_tokens_12h")))
-    return max(total, short + long), long
 
 
 def bounded_usage_details(details, preferred=(), limit=32) -> dict | None:

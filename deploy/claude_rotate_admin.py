@@ -1636,16 +1636,12 @@ def attempt_time(entry, record):
     return -1, timestamp
 
 
-def recent_rate_limits(count):
-    attempts = []
-    skipped = 0
-    sequence = 0
-    if not count:
-        return attempts, False, skipped
+def audit_log_lines(scan):
+    scan.update(limited=False, skipped_lines=0)
     try:
         directory = os.open(AUDIT_PATH.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return attempts, False, skipped
+        return
     remaining = AUDIT_TAIL_BYTES
     seen_files = set()
     try:
@@ -1666,47 +1662,58 @@ def recent_rate_limits(count):
                 size = min(info.st_size, remaining)
                 for line in audit_tail(stream, info.st_size, size):
                     if line is None:
-                        skipped += 1
-                        continue
-                    if b'"rate_limits"' not in line:
-                        continue
-                    try:
-                        record = object_fields(json.loads(line))
-                    except (ValueError, RecursionError):
-                        continue
-                    entries = record.get("rate_limits")
-                    if not isinstance(entries, list):
-                        continue
-                    for entry in reversed(entries[-10:]):
-                        if not isinstance(entry, dict):
-                            continue
-                        at, timestamp = attempt_time(entry, record)
-                        sequence -= 1
-                        if len(attempts) == count and at <= attempts[0][0]:
-                            continue
-                        error = object_fields(entry.get("error"))
-                        row = {
-                            "time": timestamp,
-                            "device": entry_text(record.get("device"), 64),
-                            "model": entry_text(record.get("model"), 256),
-                            "account": entry_text(entry.get("account"), 64),
-                            "verdict": entry_text(entry.get("verdict"), 40),
-                            "retry_after": entry_text(entry.get("retry_after"), 200),
-                            "headers": header_view(entry.get("headers")),
-                            "error": {k: entry_text(error[k], cap) for k, cap in (("type", 100), ("message", 300))
-                                      if isinstance(error.get(k), str)},
-                        }
-                        item = (at, sequence, row)
-                        if len(attempts) < count:
-                            heapq.heappush(attempts, item)
-                        else:
-                            heapq.heapreplace(attempts, item)
+                        scan["skipped_lines"] += 1
+                    elif line:
+                        yield line
                 remaining -= size
                 if not remaining:
+                    scan["limited"] = True
                     break
     finally:
         os.close(directory)
-    return [row for _, _, row in sorted(attempts, reverse=True)], remaining == 0, skipped
+
+
+def recent_rate_limits(count):
+    attempts = []
+    sequence = 0
+    if not count:
+        return attempts, False, 0
+    scan = {}
+    for line in audit_log_lines(scan):
+        if b'"rate_limits"' not in line:
+            continue
+        try:
+            record = object_fields(json.loads(line))
+        except (ValueError, RecursionError):
+            continue
+        entries = record.get("rate_limits")
+        if not isinstance(entries, list):
+            continue
+        for entry in reversed(entries[-10:]):
+            if not isinstance(entry, dict):
+                continue
+            at, timestamp = attempt_time(entry, record)
+            sequence -= 1
+            if len(attempts) == count and at <= attempts[0][0]:
+                continue
+            error = object_fields(entry.get("error"))
+            row = {
+                "time": timestamp,
+                "device": entry_text(record.get("device"), 64),
+                "model": entry_text(record.get("model"), 256),
+                "account": entry_text(entry.get("account"), 64),
+                "verdict": entry_text(entry.get("verdict"), 40),
+                "retry_after": entry_text(entry.get("retry_after"), 200),
+                "headers": header_view(entry.get("headers")),
+                "error": {k: entry_text(error[k], cap) for k, cap in (("type", 100), ("message", 300))
+                          if isinstance(error.get(k), str)},
+            }
+            item = (at, sequence, row)
+            if len(attempts) < count:
+                heapq.heappush(attempts, item)
+            else:
+                heapq.heapreplace(attempts, item)
+    return [row for _, _, row in sorted(attempts, reverse=True)], scan["limited"], scan["skipped_lines"]
 
 
 def latest_ratelimits(cfg):
@@ -1789,6 +1796,124 @@ def cmd_ratelimits(args) -> int:
     return EXIT_OK
 
 
+def quota_history_file(path, default, warnings):
+    bound = 16 * 1024 * 1024
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > bound:
+                raise ValueError("invalid history file size or type")
+            data = stream.read(bound + 1)
+        if len(data) > bound:
+            raise ValueError("history file too large")
+        result = json.loads(data)
+        if not isinstance(result, type(default)):
+            raise ValueError("unexpected history file format")
+        return result
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError):
+        warnings.append(f"{path.name} could not be read")
+    return default
+
+
+def quota_audit_records(scan):
+    for line in audit_log_lines(scan):
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            scan["skipped_lines"] += 1
+            continue
+        if isinstance(record, dict):
+            yield record
+
+
+def quota_token_text(tokens):
+    return ", ".join(f"{label} {tokens[key]:,.0f}" for key, label in (
+        ("input_tokens", "input"), ("output_tokens", "output"),
+        ("cache_read_input_tokens", "cache read"), ("cache_creation_input_tokens", "cache write")))
+
+
+def print_quota_rates(report):
+    out(f"Quota rates over {report['days']} days (minimum rise {report['min_step']:g} points)")
+    out(f"Audit coverage begins {fmt_time(report['audit']['from'])}"
+        + (" (scan limit reached)" if report["audit"]["limited"] else ""))
+    if report["audit"]["skipped_lines"]:
+        out(f"Skipped {report['audit']['skipped_lines']} unreadable or oversized audit lines")
+    for warning in report["warnings"]:
+        out(warning)
+    for row in report["series"]:
+        window = f", {row['minutes']} min" if row["minutes"] else ""
+        out("")
+        out(diagnostic_text(f"{row['kind']} {row['name']} / {row['limit']}{window}"))
+        if row["latest"]:
+            latest = row["latest"]
+            out(f"  Latest: {latest['used_percent']:g}% used at {fmt_time(latest['at'])}")
+        if not row["traffic_attributed"]:
+            out("  Audit traffic cannot be attributed to this limit")
+        share = row["outside_share"]
+        out(f"  {row['intervals']} intervals, {row['cost_intervals']} priced, {row['token_intervals']} with token counts")
+        if share is not None:
+            out(f"  Rise without gateway traffic: {row['outside_intervals']}/{row['intervals']} ({share:.0%})")
+        dollars, tokens = row["usd_per_percent"], row["tokens_per_percent"]
+        if dollars:
+            iqr = ("IQR needs more data" if dollars["q1"] is None
+                   else f"IQR ${dollars['q1']:.4g}–${dollars['q3']:.4g}")
+            out(f"  Cost per 1%: ${dollars['median']:.4g} median ({iqr})")
+        else:
+            out("  Cost per 1%: not enough data")
+        out("  Tokens per 1%: " + (quota_token_text(tokens) if tokens else "not enough data"))
+        if remaining := row["remaining"]:
+            cost = f"${remaining['usd']:.4g}" if remaining["usd"] is not None else "cost unknown"
+            out(f"  Remaining: {remaining['percent']:g}%, {cost}")
+            if remaining["tokens"]:
+                out(f"  Tokens left: {quota_token_text(remaining['tokens'])}")
+            hours = remaining["hours"]
+            out(f"  Time left at the last 24 h gateway pace: {hours:.2f} h" if hours is not None
+                else "  Time left at the last 24 h gateway pace: not enough data")
+        elif row["latest"]:
+            out("  Remaining: awaiting a reading after reset")
+        if fit := row.get("fable_fit"):
+            coefficients = "not enough data" if fit["a"] is None else f"a={fit['a']:.4g}, b={fit['b']:.4g}"
+            out(f"  7d rise = a × Fable $ + b × other $: {coefficients} (n={fit['n']})")
+
+
+def cmd_quota_rate(args) -> int:
+    if not 1 <= args.days <= 365 or not 0 < args.min_step <= 100:
+        raise Refused("--days must be 1–365 and --min-step must be above 0 and at most 100")
+    # The installed admin runs with -I. Load only from its trusted release directory.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        from pricing import load_prices
+        from quota_rate import DAY, analyse
+    finally:
+        sys.dont_write_bytecode = bytecode
+        sys.path.pop(0)
+    cfg = load_config()
+    now = time.time()
+    accounts = {account["name"] for account in cfg["accounts"]}
+    providers = {name for name, spec in object_fields(cfg.get("providers")).items()
+                 if object_fields(spec).get("kind") == "openai-siwc"}
+    scan, warnings = {}, []
+    history = quota_history_file(STATE_DIR / "usage_history.json", [], warnings)
+    provider_history = quota_history_file(STATE_DIR / "provider_quota_history.json", {}, warnings)
+    if provider_history and provider_history.get("version") != 1:
+        warnings.append("provider_quota_history.json has an unsupported version")
+        provider_history = {}
+    series, earliest = analyse(quota_audit_records(scan), history, provider_history, accounts, providers,
+                               now - args.days * DAY, now, args.min_step, load_prices(cfg.get("prices_per_mtok", {})))
+    report = {"days": args.days, "min_step": args.min_step, "audit": {"from": earliest, **scan},
+              "warnings": warnings, "series": series}
+    if args.json:
+        out(json.dumps(report, indent=2))
+    else:
+        print_quota_rates(report)
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- entry point
 
 
@@ -1816,6 +1941,10 @@ def build_parser():
     p = add("ratelimits", cmd_ratelimits, "show Claude rate-limit headers and recent upstream 429s")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument("--last", type=int, default=5, metavar="N", help="maximum 429 entries (default 5, range 0–100)")
+    p = add("quota-rate", cmd_quota_rate, "estimate tokens and API-equivalent cost per quota percentage point")
+    p.add_argument("--days", type=int, default=14, metavar="N", help="days of readings to analyze (default 14)")
+    p.add_argument("--min-step", type=float, default=5, metavar="POINTS", help="minimum quota rise (default 5 points)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
     p = add("add-token", cmd_add_token, "store an account token (hidden prompt, stdin or --token-file); "
             "an existing account gets its token replaced", aliases=("add-account",))
     p.add_argument("name", metavar="NAME")

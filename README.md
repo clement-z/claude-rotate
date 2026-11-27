@@ -434,6 +434,37 @@ account and saves the table separately in `ratelimit_headers.json` next to
 identifies its source. The offline snapshot is normally up to a minute old.
 See [deployment notes](deploy/README.md#runtime-and-operations).
 
+### Estimating usage per quota point
+
+`sudo claude-rotate-admin quota-rate [--days N] [--min-step POINTS] [--json]`
+estimates the API-equivalent dollars and input, output, cache-read, and
+cache-write tokens represented by one quota percentage point. It scans the
+newest 32 MiB of retained audit logs, uses the current API list prices and
+configured overrides, and reports whether it hit the scan limit. It reads up
+to 14 days of weekly and OpenAI history where available. The default lookback
+is 14 days and the minimum rise is 5 points.
+
+Readings form non-overlapping intervals that end once usage has risen by the
+minimum step. The command starts a new segment after an observed drop or a
+reported reset. It uses sampled general weekly values for the period before
+an account's first audit utilization reading. Claude's `7d` includes all
+models, `7d_oi` includes Fable, and other Claude claims use the model families
+observed reporting them. OpenAI series are separate by provider, limit and
+window length. Retained audit traffic can identify the Codex and image routes.
+Other OpenAI limits show readings without traffic estimates when attribution
+is unavailable.
+
+Results include median cost and its interquartile range, median tokens by
+type, and the fraction of qualifying intervals with no gateway traffic.
+Remaining dollars and tokens use the latest reading and the median rates.
+Time left uses the last 24 h gateway cost pace when the audit covers that
+period. The general weekly fit estimates how many points each Fable dollar
+and each other dollar consumes when the samples distinguish the two rates.
+Outside usage can increase quota readings, including in intervals with
+gateway traffic. Unobserved resets can also skew estimates. Whole-point
+readings, especially on OpenAI, can leave too few intervals for a rate.
+API list prices here are a comparison unit for subscription usage.
+
 ## OpenAI-compatible endpoint
 
 `POST /v1/chat/completions` (same device-key auth) accepts OpenAI-format chat
@@ -542,9 +573,10 @@ Completions and Anthropic-format answers, streamed or not, is recorded in the au
 log with a `provider` field and counted per device; OpenAI's cache reads and cache
 writes are taken out of its `input_tokens` and recorded as cache read and cache
 write, as for Claude. The audit retains bounded input and output token
-details for OpenAI. The built-in GPT prices use the Standard short-context
-rows read on 2026-11-27, with `prices_per_mtok` in `config.json` changing or
-adding entries. These prices
+details for OpenAI. The built-in GPT prices use Standard short-context rates.
+The 2026-11-27 list confirms the gpt-6.2-astra, gpt-6.2-sol, gpt-6-astra and
+gpt-6.1-sol rates. Other Standard rates come from the 2026-11-19 list.
+`prices_per_mtok` in `config.json` changes or adds entries. These prices
 understate a request above 272K input tokens, which OpenAI bills at a higher
 long-context rate. A provider model no entry names counts as $0 rather than at a
 made-up Claude price. A request's cost is added to the daily and all-time totals
@@ -697,7 +729,7 @@ can lose readings since the last successful save.
 | `hold_max_s` | wait up to this many seconds for a usable account when a model family is blocked on every account (default 0 = off) |
 | `refresh_idle_s` | send an account with no traffic for this long a 1-token `claude-haiku-4-5` request (~9 tokens of its quota) to read its current usage, so quota spent outside the proxy is seen before a switch (default 1800; 0 = off). Usage is otherwise only learned from traffic. |
 | `panel_tailnet` | `true` lets tailnet users open the panel without a device key, trusting the `Tailscale-User-Login` header from Tailscale Serve; requires a loopback `bind` (default false). See [SECURITY.md](SECURITY.md). |
-| `prices_per_mtok` | `[input, output]` or `[input, output, cached input]` dollars per MTok for the cost columns. The longest pattern in the model ID wins. Entries change or add to `BUILTIN_PRICES` in `rotator.py`. Without a cached-input price, cache reads cost 0.1× input. Default `{}`. |
+| `prices_per_mtok` | `[input, output]` or `[input, output, cached input]` dollars per MTok for the cost columns. The longest pattern in the model ID wins. Entries change or add to `BUILTIN_PRICES` in `pricing.py`. Without a cached-input price, cache reads cost 0.1× input. Default `{}`. |
 | `alerts` | `device_tokens_per_hour`, `util_warn` |
 
 Claude prices use the 2026-11-27 list. The audit retains `usage.speed` and

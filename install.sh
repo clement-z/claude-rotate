@@ -38,7 +38,7 @@ say() { echo "install.sh: $*"; }
 
 SRC=$(cd "$(dirname "$0")" && pwd -P)
 cd "$SRC"
-for f in rotator.py providers.py oai_compat.py requirements.txt requirements.lock config.example.json \
+for f in rotator.py providers.py oai_compat.py pricing.py quota_rate.py requirements.txt requirements.lock config.example.json \
          deploy/systemd_runner.py deploy/claude_rotate_admin.py deploy/claude-rotate.service; do
     [ -f "$SRC/$f" ] || die "missing $SRC/$f; run from a complete checkout"
 done
@@ -150,7 +150,7 @@ install -d -o root -g root -m 0755 -- "$OPT" "$RELEASES"
 install -d -o root -g "$SERVICE_USER" -m 0750 -- "$ETC" "$ETC/tokens"
 
 # --- release build (content-addressed) ---------------------------------------------------
-SHIPPED=(rotator.py providers.py oai_compat.py requirements.txt requirements.lock config.example.json
+SHIPPED=(rotator.py providers.py oai_compat.py pricing.py quota_rate.py requirements.txt requirements.lock config.example.json
          deploy/systemd_runner.py deploy/claude_rotate_admin.py)
 fingerprint=$(sha256sum "${SHIPPED[@]}" | sha256sum | cut -c1-12)
 release="$(realpath -m -- "$RELEASES")/$fingerprint"
@@ -173,7 +173,7 @@ else
     say "building release $release"
     install -d -o root -g root -m 0755 -- "$release" "$release/deploy"
     printf '%s\n' "pid=$$ started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$release/$BUILDING_MARKER"
-    for f in rotator.py providers.py oai_compat.py requirements.txt requirements.lock config.example.json; do
+    for f in rotator.py providers.py oai_compat.py pricing.py quota_rate.py requirements.txt requirements.lock config.example.json; do
         install -o root -g root -m 0644 -- "$SRC/$f" "$release/$f"
     done
     install -o root -g root -m 0644 -- "$SRC/deploy/systemd_runner.py" "$SRC/deploy/claude_rotate_admin.py" "$release/deploy/"

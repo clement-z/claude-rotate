@@ -86,7 +86,7 @@ produces, and what any hand-built release must match:
 
 | Path | Owner / mode | Notes |
 | --- | --- | --- |
-| `/opt/claude-rotate/releases/<id>/` | root, dirs `0755`, files `0644` | `rotator.py`, `providers.py`, `oai_compat.py`, `requirements*.txt/.lock`, `config.example.json`, `deploy/systemd_runner.py`, `deploy/claude_rotate_admin.py`, `.venv/`, `installed-requirements.txt`, `.claude-rotate-release` |
+| `/opt/claude-rotate/releases/<id>/` | root, dirs `0755`, files `0644` | `rotator.py`, `providers.py`, `oai_compat.py`, `pricing.py`, `quota_rate.py`, `requirements*.txt/.lock`, `config.example.json`, `deploy/systemd_runner.py`, `deploy/claude_rotate_admin.py`, `.venv/`, `installed-requirements.txt`, `.claude-rotate-release` |
 | `/opt/claude-rotate/current` | root symlink | switched atomically to a complete release only |
 | `/usr/local/sbin/claude-rotate-admin` | root `0755` | wrapper; runs the admin module from `current` with the release interpreter |
 | `/etc/systemd/system/claude-rotate.service` | root `0644` | copy of `deploy/claude-rotate.service` |
@@ -141,6 +141,12 @@ output and `--last N` for up to 100 attempts (default 5, or 0 for the table
 alone). The command scans up to 32 MiB across the current `audit.jsonl` and
 numbered rotations through `.32`, then orders attempts by header receipt.
 It reports any audit lines it skipped for exceeding 1 MiB.
+
+`sudo claude-rotate-admin quota-rate` estimates API-equivalent cost and
+tokens per quota percentage point using local history and retained audit
+logs. It also reports remaining quota and a time estimate at the last 24 h
+gateway pace. It can run with the service stopped. See
+[quota-rate estimation](../README.md#estimating-usage-per-quota-point).
 
 Claude audit lines store `util` as numeric utilization by claim ID.
 `ratelimit` captures Fable answers and claim-set changes per account and
