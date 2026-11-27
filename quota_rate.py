@@ -2,7 +2,7 @@
 
 from bisect import bisect_right
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from math import fsum
 from statistics import median, quantiles
@@ -12,13 +12,18 @@ from pricing import api_cost, price_for, token_count
 DAY = 86400
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 CLAUDE_PATHS = ("/v1/messages", "/v1/chat/completions")
+OPENAI_PATHS = ("/v1/responses", "/v1/chat/completions")
+RESET_TOLERANCE = 60
+DROP_NOISE = 1
 
 
 @dataclass(frozen=True)
 class Reading:
     at: float
-    percent: float | None
+    percent: float
     reset: float | None
+    sampled: bool = False
+    completion_time: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,10 +78,11 @@ def request_usage(record, at, prices, provider=None):
 
 
 def collect_audit(records, accounts, providers, start, now, prices):
-    readings = defaultdict(dict)
+    readings = defaultdict(list)
     traffic = defaultdict(list)
     reporters = defaultdict(set)
     earliest = None
+    model_paths = {name: tuple(prefix + path for path in OPENAI_PATHS) for name, prefix in providers.items()}
     for record in records:
         at = audit_time(record.get("ts"))
         if at is None or at > now:
@@ -86,14 +92,22 @@ def collect_audit(records, accounts, providers, start, now, prices):
             continue
         provider = record.get("provider")
         account = record.get("account")
+        if record.get("method", "POST") != "POST":
+            continue
         if isinstance(provider, str) and provider in providers:
-            # The audit names the image route. Other OpenAI inference shares the Codex pool.
-            limit = "imagegen_premium" if record.get("route") == "codex-images" else "codex"
-            traffic[("openai", provider, limit)].append(request_usage(record, at, prices, provider))
+            if record.get("path") in model_paths[provider]:
+                traffic[("openai", provider, "codex")].append(request_usage(record, at, prices, provider))
         elif not provider and isinstance(account, str) and account in accounts:
             if record.get("path") not in CLAUDE_PATHS:
                 continue
-            request = request_usage(record, at, prices)
+            seen = number(record.get("util_at"))
+            # Completion timestamps have whole-second resolution.
+            legacy = seen is None or seen > now or seen >= at + 1
+            observed = at if legacy else seen
+            earliest = min(earliest, observed)
+            if observed < start:
+                continue
+            request = request_usage(record, observed, prices)
             traffic[("claude", account)].append(request)
             resets = mapping(record.get("ratelimit"))
             for claim, value in mapping(record.get("util")).items():
@@ -101,21 +115,20 @@ def collect_audit(records, accounts, providers, start, now, prices):
                 if used is None or (claim == "7d_oi" and not request.fable):
                     continue
                 key = ("claude", account, claim, None)
-                series = readings[key]
                 reporters[key].add(request.fable)
                 reset = reset_time(resets.get(f"unified-{claim}-reset"))
-                # Audit read order is newest first. Keep the last reading in a second.
-                if at not in series:
-                    series[at] = Reading(at, round(100 * used, 10), reset)
-                elif series[at].reset is None and reset is not None:
-                    series[at] = Reading(at, series[at].percent, reset)
+                readings[key].append(Reading(observed, round(100 * used, 10), reset, completion_time=legacy))
+    # Ties use the audit file's write order. Do not discard any readings.
+    for series in readings.values():
+        series.reverse()
     for requests in traffic.values():
         requests.sort(key=lambda r: r.at)
     return readings, traffic, reporters, earliest
 
 
 def add_claude_history(readings, history, accounts, start, now):
-    first_audit = {name: min(readings[("claude", name, "7d", None)], default=float("inf")) for name in accounts}
+    for name in accounts:
+        readings.setdefault(("claude", name, "7d", None), [])
     for sample in history:
         sample = mapping(sample)
         at = number(sample.get("ts"))
@@ -125,14 +138,9 @@ def add_claude_history(readings, history, accounts, start, now):
             if name not in accounts or not isinstance(point, list) or len(point) != 2:
                 continue
             used, reset = number(point[0]), reset_time(point[1])
-            if used is None:
+            if used is None or (reset is not None and reset <= at):
                 continue
-            point = Reading(at, round(100 * used, 10) if at < first_audit[name] else None, reset)
-            series = readings[("claude", name, "7d", None)]
-            if at not in series:
-                series[at] = point
-            elif series[at].reset is None:
-                series[at] = Reading(at, series[at].percent, reset)
+            readings[("claude", name, "7d", None)].append(Reading(at, round(100 * used, 10), reset, sampled=True))
 
 
 def add_provider_history(readings, history, providers, start, now):
@@ -152,37 +160,63 @@ def add_provider_history(readings, history, providers, start, now):
                     continue
                 at, used = number(point[0]), number(point[1])
                 if in_range(at, start, now) and used is not None and used <= 100:
-                    readings[("openai", name, limit, minutes)][at] = Reading(at, used, reset_time(point[2]))
+                    readings[("openai", name, limit, minutes)].append(
+                        Reading(at, used, reset_time(point[2]), sampled=point[3] == "usage"))
+
+
+def changed_reset(estimate, *known):
+    return estimate is not None and any(
+        reset is not None and abs(estimate - reset) > RESET_TOLERANCE for reset in known)
+
+
+def accepted_readings(readings):
+    points = sorted(readings, key=lambda r: r.at)
+    latest = deadline = cycle = None
+    for i, point in enumerate(points):
+        if point.reset is not None and point.reset <= point.at < (deadline or 0):
+            continue  # a stale sample from an expired window
+        restart = ((deadline is not None and deadline <= point.at)
+                   or changed_reset(point.reset, cycle, deadline))
+        if restart:
+            deadline = cycle = None
+        elif latest is not None and point.percent < latest.percent:
+            following = points[i + 1] if i + 1 < len(points) else None
+            reset = point.reset or deadline
+            confirmed = (following is not None and following.at > point.at and following.percent <= point.percent
+                         and (reset is None or following.at < reset)
+                         and not changed_reset(following.reset, cycle, reset))
+            if round(latest.percent - point.percent, 10) <= DROP_NOISE and not confirmed:
+                continue
+            restart = True
+        deadline = point.reset or deadline
+        cycle = cycle or deadline
+        latest = replace(point, reset=deadline)
+        yield latest, restart
 
 
 def measurement_intervals(readings, min_step, covered_from):
-    """Greedy non-overlapping intervals, each inside one observed window."""
-    intervals = []
-    anchor = latest = None
-    deadline = None
-    for point in sorted(readings.values(), key=lambda r: r.at):
-        if deadline is not None and deadline <= point.at:
-            anchor = None
-            deadline = None
-        if point.reset is not None:
-            deadline = point.reset
-        if point.percent is None:
-            continue
-        if latest is not None and point.percent < latest.percent:
-            anchor = None
-        latest = Reading(point.at, point.percent, deadline)
-        if deadline is not None and deadline <= point.at:
-            anchor = None
-            continue
-        if covered_from is None or latest.at < covered_from:
+    """Build non-overlapping intervals from all readings and from samples alone."""
+    intervals, sampled_intervals = [], []
+    anchor = sampled_anchor = latest = None
+    for latest, restart in accepted_readings(readings):
+        if restart:
+            anchor = sampled_anchor = None
+        if covered_from is None or latest.at < covered_from or (
+                latest.reset is not None and latest.reset <= latest.at):
             continue
         if anchor is None:
             anchor = latest
         rise = round(latest.percent - anchor.percent, 10)
-        if rise >= min_step:
+        if rise >= min_step and latest.at > anchor.at:
             intervals.append((anchor.at, latest.at, rise))
             anchor = latest
-    return intervals, latest
+        if latest.sampled:
+            if sampled_anchor is None:
+                sampled_anchor = latest
+            if round(latest.percent - sampled_anchor.percent, 10) >= min_step and latest.at > sampled_anchor.at:
+                sampled_intervals.append((sampled_anchor.at, latest.at))
+                sampled_anchor = latest
+    return intervals, sampled_intervals, latest
 
 
 def fit_fable(rows):
@@ -200,14 +234,16 @@ def fit_fable(rows):
 
 
 def series_report(points, requests, min_step, covered_from, now, *, general_week=False):
-    intervals, latest = measurement_intervals(points, min_step, covered_from)
+    intervals, sampled_intervals, latest = measurement_intervals(points, min_step, covered_from)
     dollar_rates, token_rates, fit_rows = [], [], []
-    outside = 0
     times = [request.at for request in requests] if requests is not None else []
+    sample_count = len(sampled_intervals)
+    outside = None
+    if requests is not None and sample_count:
+        outside = sum(bisect_right(times, start) == bisect_right(times, end) for start, end in sampled_intervals)
     for start, end, rise in intervals if requests is not None else ():
         period = requests[bisect_right(times, start):bisect_right(times, end)]
         if not period:
-            outside += 1
             continue
         if all(request.tokens is not None for request in period):
             token_rates.append(tuple(sum(t) / rise for t in zip(*(request.tokens for request in period))))
@@ -237,9 +273,10 @@ def series_report(points, requests, min_step, covered_from, now, *, general_week
     result = {
         "latest": {"at": latest.at, "used_percent": latest.percent, "reset": latest.reset} if latest else None,
         "intervals": len(intervals), "cost_intervals": len(dollar_rates), "token_intervals": len(token_rates),
+        "completion_time_readings": sum(point.completion_time for point in points),
         "traffic_attributed": requests is not None,
-        "outside_intervals": outside if requests is not None else None,
-        "outside_share": outside / len(intervals) if intervals and requests is not None else None,
+        "sampled_intervals": sample_count, "outside_intervals": outside,
+        "outside_share": outside / sample_count if outside is not None else None,
         "usd_per_percent": dollars, "tokens_per_percent": tokens, "remaining": remaining,
     }
     if general_week:
@@ -253,20 +290,25 @@ def analyse(records, history, provider_history, accounts, providers, start, now,
     add_provider_history(readings, provider_history, providers, start, now)
     for name in providers:
         if not any(kind == "openai" and owner == name for kind, owner, _, _ in readings):
-            readings[("openai", name, "codex", None)] = {}
+            readings[("openai", name, "codex", None)] = []
     reports = []
     for key, points in sorted(readings.items()):
         kind, name, limit, minutes = key
+        note = None
         if kind == "claude":
             requests = traffic[("claude", name)]
             if limit == "7d_oi":
                 requests = [request for request in requests if request.fable]
             elif limit not in ("5h", "7d"):
                 requests = [request for request in requests if request.fable in reporters[key]]
+        elif limit == "codex":
+            requests = traffic[(kind, name, limit)]
+            note = "Attributing Sign in with ChatGPT inference to the Codex limit is unconfirmed"
         else:
-            key = (kind, name, limit)
-            requests = traffic[key] if limit in ("codex", "imagegen_premium") else None
-        reports.append({"kind": kind, "name": name, "limit": limit, "minutes": minutes,
-                        **series_report(points, requests, min_step, earliest, now,
-                                        general_week=kind == "claude" and limit == "7d")})
+            requests = None
+            if limit == "imagegen_premium":
+                note = "Image cost and tokens are unavailable because the audit records bytes only"
+        report = series_report(points, requests, min_step, earliest, now,
+                               general_week=kind == "claude" and limit == "7d")
+        reports.append({"kind": kind, "name": name, "limit": limit, "minutes": minutes, "traffic_note": note, **report})
     return reports, earliest

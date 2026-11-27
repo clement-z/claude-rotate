@@ -149,12 +149,11 @@ with_config({"gpt-6.2-sol": [3.0, 12.0, 0.3], "gpt-7-sol": [1.0, 2.0, 0.05], "gp
 check("an operator entry adds a model, overrides a built-in one, and the longest match still wins",
       R.price_for("gpt-7-sol", None) == [1.0, 2.0, 0.05] and R.price_for("gpt-6.2-sol", None) == [3.0, 12.0, 0.3]
       and R.price_for("gpt-5.4-mini-fast") == [1.5, 9.0] and R.price_for("gpt-5.4-mini") == [0.75, 4.5, 0.075])
-with_config({"claude-opus-4-5-2025": [9.0, 50.0], "opus-5-5": [8.0, 30.0]})
-check("only unmodified built-in patterns require a numeric boundary",
+with_config({"claude-opus-4-5-2025": [9.0, 50.0], "fable-5-2": [8.0, 30.0]})
+check("a built-in revision override keeps its numeric boundary while custom prefixes match",
       R.price_for("claude-opus-4-5-20251101") == [9.0, 50.0]
-      and R.price_for("claude-opus-5-5-preview") == [8.0, 30.0]
-      and R.price_for("claude-opus-5-50") == [8.0, 30.0]
-      and R.price_for("claude-fable-5-20251101") == [10.0, 50.0, 1.0])
+      and R.price_for("claude-fable-5-2-20261127") == [8.0, 30.0]
+      and R.price_for("claude-fable-5-20261127") == [10.0, 50.0, 1.0])
 warnings = with_config({"x": [1.0], "y": "cheap", "z": [1, 2, 3, 4], "w": [-1, 2], "": [1, 2], "opus": [True, 1],
                         "ok": [1, 2]})
 check("malformed entries are skipped with a warning each; the built-in entry stays",

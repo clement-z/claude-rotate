@@ -885,6 +885,7 @@ def audit_claude_answer(rec: dict, account: str, family: str | None, reported: d
 def record_ratelimit_diagnostics(account, model, path, status, headers, at, *, rec=None, family=None, reported=None):
     if rec is not None:
         rec["util"] = {}
+        rec["util_at"] = at
         rec.pop("ratelimit", None)
     try:
         raw = rate_limit_headers(headers)

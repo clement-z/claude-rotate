@@ -31,7 +31,8 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({
         "accounts": [{"name": n, "token_file": n + ".token"} for n in ("a", "b")],
-        "devices": {}, "providers": {"work": {"kind": "openai-siwc"}, "lan": {"kind": "static-bearer"}},
+        "devices": {}, "providers": {"work": {"kind": "openai-siwc", "prefix": "/openai"},
+                                     "lan": {"kind": "static-bearer"}},
     }))
     state = root / "var/lib/claude-rotate"
     state.mkdir(parents=True)
@@ -44,7 +45,8 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
 
     def audit_row(hours, *, account="a", model="claude-opus-5", output=200_000, util=None, **extra):
         row = {"ts": datetime.fromtimestamp(at(hours), timezone.utc).isoformat(), "account": account,
-               "model": model, "path": "/v1/messages", "status": 200, "usage": {"output_tokens": output}}
+               "model": model, "path": "/v1/messages", "method": "POST",
+               "status": 200, "usage": {"output_tokens": output}}
         if util is not None:
             row["util"] = util
         return row | extra
@@ -64,12 +66,17 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
                   ratelimit={"unified-7d-reset": str(at(-10)), "unified-7d_oi-reset": str(at(10))}),
     ])
     save_rows(audit, [
+        audit_row(-22, account=None, provider="work", path="/openai/v1/models", method="GET", usage=None),
         audit_row(-21, account=None, provider="work", model="gpt-6.2-sol", path="/openai/v1/responses",
                   usage={"input_tokens": 125_000, "output_tokens": 100_000, "cache_read_input_tokens": 20_000,
                          "cache_creation_input_tokens": 10_000}),
         audit_row(-20, util={"7d": .35}),
         audit_row(-17, **fable, util={"7d": .45, "7d_oi": .20, "learned": .40}),
+        audit_row(-16, account=None, provider="work", path="/openai/v1/models", method="GET", usage=None),
+        audit_row(-15, account=None, provider="work", path="/openai/v1/alpha/search", route="codex-search", usage=None),
         audit_row(-14, model=fable["model"], output=1_000_000, util={"7d": .10, "7d_oi": .05, "learned": .10}),
+        audit_row(-13, account=None, provider="work", path="/openai/v1/images/generations", route="codex-images",
+                  usage=None, bytes=1000),
         audit_row(-11, **fable, util={"7d": .20, "7d_oi": .15, "learned": .20}),
         audit_row(-8, util={"7d": .90}, ratelimit={"unified-7d-reset": str(at(158))}),
         audit_row(-5, util={"7d": .95}),
@@ -77,11 +84,13 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     ])
     (state / "usage_history.json").write_text(json.dumps([
         {"ts": at(h), "accounts": {"a": [u, at(-10)]}}
-        for h, u in ((-30, .10), (-28, .15), (-26, .20), (-22, .85))
+        for h, u in ((-30, .10), (-28, .15), (-26, .20), (-22, .30))
     ]))
     (state / "provider_quota_history.json").write_text(json.dumps({"version": 1, "providers": {"work": [
         {"limit": "codex", "minutes": 10080,
          "points": [[at(h), u, at(110), "usage"] for h, u in ((-25, 10), (-20, 15), (-12, 20))]},
+        {"limit": "imagegen_premium", "minutes": 1440,
+         "points": [[at(h), u, at(1), "images"] for h, u in ((-15, 10), (-12, 20))]},
         {"limit": "another", "minutes": 300, "points": [[at(-1), 20, at(1), "inference"]]},
     ]}}))
     before = {path: path.read_bytes() for path in [config, audit, audit.with_suffix(".jsonl.1"), *state.iterdir()]}
@@ -97,8 +106,9 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     check("mid-window drop and scheduled reset split intervals, even when usage rises across the reset",
           general["usd_per_percent"] == {"median": .75, "q1": .5, "q3": 1}
           and general["latest"] == {"at": at(-5), "used_percent": 95, "reset": at(158)})
-    check("outside rise is counted separately from the rate estimates",
-          general["outside_intervals"] == 1 and math.isclose(general["outside_share"], 1 / 7))
+    check("outside rise uses independently sampled intervals",
+          general["sampled_intervals"] == 3 and general["outside_intervals"] == 1
+          and math.isclose(general["outside_share"], 1 / 3))
     check("general weekly fit distinguishes Fable and other costs",
           general["fable_fit"] == {"n": 6, "a": 2.0, "b": 1.0})
     check("latest reading gives cost remaining and time at the last full 24 h gateway pace",
@@ -111,6 +121,8 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and fable_week["tokens_per_percent"]["output_tokens"] == 12_500
           and fable_week["remaining"]["usd"] == 42.5
           and rows["a", "learned"]["usd_per_percent"]["median"] == .5)
+    check("Fable-only history has no independent estimate of outside use",
+          fable_week["outside_share"] is None and fable_week["sampled_intervals"] == 0)
     codex = rows["work", "codex"]
     check("OpenAI weekly uses provider readings and normalized audit token types",
           codex["kind"] == "openai" and codex["minutes"] == 10080 and codex["outside_share"] == .5
@@ -118,6 +130,12 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and codex["tokens_per_percent"] == {"input_tokens": 25_000, "output_tokens": 20_000,
                                             "cache_read_input_tokens": 4_000, "cache_creation_input_tokens": 2_000}
           and not rows["work", "another"]["traffic_attributed"])
+    check("OpenAI metadata and search do not count as Codex model traffic",
+          codex["sampled_intervals"] == 2 and codex["outside_intervals"] == 1 and codex["cost_intervals"] == 1)
+    images = rows["work", "imagegen_premium"]
+    check("image byte counts cannot estimate dollars or tokens",
+          images["intervals"] == 1 and not images["traffic_attributed"] and images["usd_per_percent"] is None
+          and images["tokens_per_percent"] is None and images["remaining"]["usd"] is None)
     check("sparse account shows its latest utilization and plain insufficient estimates",
           rows["b", "7d"]["usd_per_percent"] is None and rows["b", "7d"]["remaining"]["hours"] is None
           and rows["b", "7d"]["fable_fit"] == {"n": 0, "a": None, "b": None})
@@ -126,7 +144,72 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     check("human output uses flags and marks insufficient data",
           r.returncode == 0 and "over 1 days (minimum rise 25 points)" in r.stdout
           and "Cost per 1%: not enough data" in r.stdout and "work / codex, 10080 min" in r.stdout)
+    check("human output identifies legacy timestamps and OpenAI attribution limits",
+          "older audit readings use request completion time" in r.stdout
+          and "Attributing Sign in with ChatGPT inference to the Codex limit is unconfirmed" in r.stdout
+          and "Image cost and tokens are unavailable because the audit records bytes only" in r.stdout)
     r = run("--min-step", "nan")
     check("invalid thresholds are rejected", r.returncode == 1 and "--min-step" in r.stderr)
     check("the installed command leaves logs, state, configuration and release files alone",
           all(path.read_bytes() == data for path, data in before.items()) and not list(release.rglob("__pycache__")))
+
+    def rows_for(*args):
+        result = run("--json", *args)
+        assert result.returncode == 0, result.stderr
+        return {(row["name"], row["limit"]): row for row in json.loads(result.stdout)["series"]}
+
+    audit.with_suffix(".jsonl.1").unlink()
+    (state / "usage_history.json").unlink()
+    save_rows(audit, [
+        audit_row(-12, account="b", util={"7d": .10}),
+        audit_row(-10, account="b", util={"7d": .20}),
+        audit_row(-10, account="b", util={"7d": .05}),
+        audit_row(-8, account="b", util={"7d": .15}),
+        audit_row(-7, util_at=at(-9) + .25, util={"7d": .20}),
+        audit_row(-6, util_at=at(-9) + .1, util={"7d": .10}),
+        audit_row(-5, util_at=at(-5) + .98, util={"7d": .20}),
+    ])
+    rows = rows_for()
+    check("overlapping streams contribute once in header order even within one second",
+          rows["a", "7d"]["intervals"] == 1 and rows["a", "7d"]["cost_intervals"] == 1
+          and rows["a", "7d"]["completion_time_readings"] == 0
+          and rows["a", "7d"]["usd_per_percent"]["median"] == .5)
+    check("same-second legacy readings preserve a real drop and flag completion-time ordering",
+          rows["b", "7d"]["intervals"] == 2 and rows["b", "7d"]["cost_intervals"] == 2
+          and rows["b", "7d"]["completion_time_readings"] == 4)
+
+    save_rows(audit, [audit_row(-12 + i, util={"7d": used})
+                      for i, used in enumerate((.20, .19, .20, .25, .24, .24, .29))])
+    noise = rows_for()["a", "7d"]
+    check("an isolated one-point drop is ignored and a sustained one-point drop starts a segment",
+          noise["cost_intervals"] == 2 and noise["usd_per_percent"] == {"median": 2.5, "q1": 2.25, "q3": 2.75})
+
+    old_reset, new_reset = at(-6), at(162)
+    save_rows(audit, [
+        audit_row(-12, util={"7d": .10}, ratelimit={"unified-7d-reset": str(old_reset)}),
+        audit_row(-11, util={"7d": .20}),
+        audit_row(-8, provider="work", account=None, path="/openai/v1/models", method="GET"),
+        audit_row(-3, provider="work", account=None, path="/openai/v1/chat/completions",
+                  model="gpt-5.2", output=1_000_000),
+    ])
+    (state / "usage_history.json").write_text(json.dumps([
+        {"ts": at(h), "accounts": {"a": [u, reset]}}
+        for h, u, reset in ((-12, .10, old_reset), (-11, .20, old_reset), (-9, .35, old_reset),
+                            (-5.5, 0, old_reset), (-5, .40, new_reset), (-4, .50, new_reset))
+    ]))
+    (state / "provider_quota_history.json").write_text(json.dumps({"version": 1, "providers": {"work": [
+        {"limit": "codex", "minutes": 10080,
+         "points": [[stamp, used, reset, "usage"] for stamp, used, reset in (
+             (at(-9), 10, at(-4) + 20), (at(-4) + 5, 50, new_reset), (at(-2), 55, new_reset + 30))]},
+    ]}}))
+    rows = rows_for()
+    general = rows["a", "7d"]
+    check("samples after the first audit reading count outside use and set headroom after an idle reset",
+          general["sampled_intervals"] == 3 and general["outside_intervals"] == 2
+          and general["outside_share"] == 2 / 3 and general["cost_intervals"] == 1
+          and general["latest"] == {"at": at(-4), "used_percent": 50, "reset": new_reset}
+          and general["remaining"]["percent"] == 50)
+    codex = rows["work", "codex"]
+    check("a deadline shift breaks the cycle before the old reset and nearby estimates stay joined",
+          codex["intervals"] == 1 and codex["cost_intervals"] == 1
+          and codex["usd_per_percent"]["median"] == 2.8 and codex["outside_intervals"] == 0)

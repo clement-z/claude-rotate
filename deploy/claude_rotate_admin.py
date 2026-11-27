@@ -1850,12 +1850,18 @@ def print_quota_rates(report):
         if row["latest"]:
             latest = row["latest"]
             out(f"  Latest: {latest['used_percent']:g}% used at {fmt_time(latest['at'])}")
-        if not row["traffic_attributed"]:
+        if count := row["completion_time_readings"]:
+            out(f"  {count} older audit readings use request completion time")
+        if row["traffic_note"]:
+            out(f"  {row['traffic_note']}")
+        elif not row["traffic_attributed"]:
             out("  Audit traffic cannot be attributed to this limit")
         share = row["outside_share"]
         out(f"  {row['intervals']} intervals, {row['cost_intervals']} priced, {row['token_intervals']} with token counts")
         if share is not None:
-            out(f"  Rise without gateway traffic: {row['outside_intervals']}/{row['intervals']} ({share:.0%})")
+            out(f"  Rise without gateway traffic: {row['outside_intervals']}/{row['sampled_intervals']} ({share:.0%})")
+        else:
+            out("  Rise without gateway traffic: unavailable (needs sampled intervals and attributable traffic)")
         dollars, tokens = row["usd_per_percent"], row["tokens_per_percent"]
         if dollars:
             iqr = ("IQR needs more data" if dollars["q1"] is None
@@ -1895,8 +1901,11 @@ def cmd_quota_rate(args) -> int:
     cfg = load_config()
     now = time.time()
     accounts = {account["name"] for account in cfg["accounts"]}
-    providers = {name for name, spec in object_fields(cfg.get("providers")).items()
-                 if object_fields(spec).get("kind") == "openai-siwc"}
+    providers = {}
+    for name, spec in object_fields(cfg.get("providers")).items():
+        if object_fields(spec).get("kind") == "openai-siwc":
+            prefix = spec.get("prefix")
+            providers[name] = prefix if isinstance(prefix, str) else "/" + name
     scan, warnings = {}, []
     history = quota_history_file(STATE_DIR / "usage_history.json", [], warnings)
     provider_history = quota_history_file(STATE_DIR / "provider_quota_history.json", {}, warnings)

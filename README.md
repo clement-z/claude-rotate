@@ -418,7 +418,8 @@ available. The audit keeps the first nine and the latest attempt if there are
 more than ten, and counts omitted attempts in `rate_limits_omitted`.
 
 `util` records the last upstream answer's valid utilization readings as
-numbers by claim ID. An answer without utilization has an empty object.
+numbers by claim ID. `util_at` is when the headers arrived, in Unix seconds.
+An answer without utilization has an empty object.
 `ratelimit` records raw headers for the final answer when it is a Fable
 answer or when its reported claim IDs differ from the previous answer for
 that account and model family. A retried 429 keeps its headers in
@@ -449,17 +450,25 @@ to 14 days of weekly and OpenAI history where available. The default lookback
 is 14 days and the minimum rise is 5 points.
 
 Readings form non-overlapping intervals that end once usage has risen by the
-minimum step. The command starts a new segment after an observed drop or a
-reported reset. It uses sampled general weekly values for the period before
-an account's first audit utilization reading. Claude's `7d` includes all
-models, `7d_oi` includes Fable, and other Claude claims use the model families
-observed reporting them. OpenAI series are separate by provider, limit and
-window length. Retained audit traffic can identify the Codex and image routes.
-Other OpenAI limits show readings without traffic estimates when attribution
-is unavailable.
+minimum step. Audit readings are ordered by header arrival. The report flags
+older records that use request completion time. A drop of more than one point,
+a smaller drop confirmed by the next reading, or a reported reset starts a new
+segment. Reset estimates within 60 seconds count as the same deadline.
+The independent 30-minute samples are used throughout the general weekly
+series, including to detect resets and update the latest reading while idle.
+Claude's `7d` includes all models, `7d_oi` includes Fable, and other Claude
+claims use the model families observed reporting them.
+
+OpenAI series are separate by provider, limit and window length. The Codex
+estimate uses POST requests to the Responses and Chat Completions endpoints.
+Attributing Sign in with ChatGPT inference to the Codex limit is unconfirmed.
+Image requests record bytes, so image costs and tokens are unavailable.
+Other OpenAI limits show readings when traffic attribution is unavailable.
 
 Results include median cost and its interquartile range, median tokens by
-type, and the fraction of qualifying intervals with no gateway traffic.
+type, and the fraction of qualifying independently sampled intervals with no
+gateway traffic. That fraction is unavailable for series without independent
+samples, such as Fable 7d.
 Remaining dollars and tokens use the latest reading and the median rates.
 Time left uses the last 24 h gateway cost pace when the audit covers that
 period. The general weekly fit estimates how many points each Fable dollar

@@ -83,23 +83,16 @@ BUILTIN_PRICES = {
 }
 
 
-class PriceTable(dict):
-    def __init__(self):
-        super().__init__(BUILTIN_PRICES)
-        self.operator_patterns = set()
-
-
 def load_prices(extra) -> dict:
     """The built-in table with config.json's prices_per_mtok laid over it entry by
     entry, so an install whose config holds an older copy still gets new entries. A
     malformed entry is reported and skipped: costs are analytics, never a reason to
     stop the proxy."""
-    table = PriceTable()
+    table = dict(BUILTIN_PRICES)
     for pattern, price in (extra.items() if isinstance(extra, dict) else []):
         if (isinstance(pattern, str) and pattern and isinstance(price, list) and len(price) in (2, 3)
                 and all(type(v) in (int, float) and 0 <= v < 1e6 for v in price)):
             table[pattern] = price
-            table.operator_patterns.add(pattern)
         else:
             print(f"warning: prices_per_mtok entry {pattern!r} ignored: it needs [input, output] or "
                   "[input, output, cached input], in $ per MTok", file=sys.stderr)
@@ -123,9 +116,8 @@ def price_for(model: str | None, prices: dict, default=DEFAULT_PRICE) -> list[fl
     priced as gpt-5.4 whatever the order of the table."""
     if not isinstance(model, str):
         return default
-    overrides = getattr(prices, "operator_patterns", ())
     pattern = max((pat for pat in prices if (
-        pat in model if pat in overrides or pat not in BUILTIN_PRICES else price_pattern_matches(pat, model)
+        price_pattern_matches(pat, model) if pat in BUILTIN_PRICES else pat in model
     )), key=len, default=None)
     return prices[pattern] if pattern else default
 

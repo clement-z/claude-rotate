@@ -148,16 +148,32 @@ SSE = ('event: message_start\n'
        'data: {"message": {"usage": {"input_tokens": 11, "output_tokens": 1}}}\n\n'
        'event: message_delta\n'
        'data: {"usage": {"output_tokens": 33}}\n\n')
+header_time, body_time = time.time(), time.time() + 5
+clock = [header_time]
+
+
+class DelayedBody(Chunks):
+    async def __aiter__(self):
+        clock[0] = body_time
+        async for chunk in super().__aiter__():
+            yield chunk
+
+
 use_upstream(lambda req: httpx.Response(
-    200, content=SSE.encode(),
+    200, stream=DelayedBody(SSE.encode()),
     headers={**unified(), "content-type": "text/event-stream"}))
-r = call()
+with patch.object(R, "time", SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic,
+                                            strftime=lambda fmt: time.strftime(fmt, time.localtime(clock[0])))):
+    r = call()
 check("SSE body relayed untouched", r.text == SSE)
 recs = audit_recs()
 check("SSE usage captured to audit",
       recs and recs[-1]["usage"] == {"input_tokens": 11, "output_tokens": 33,
                                      "cache_read_input_tokens": 0,
                                      "cache_creation_input_tokens": 0})
+check("the utilization timestamp is captured before the stream completes",
+      recs[-1]["util_at"] == header_time
+      and recs[-1]["ts"] == time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(body_time)))
 
 # --- 4. quota 429 → rotate → transparent retry -------------------------------
 fresh_state("a", {"b": {"util_5h": 0.1, "util_7d": 0.1}})
