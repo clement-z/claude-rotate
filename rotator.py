@@ -308,6 +308,13 @@ def _write_audit(rec: dict) -> None:
         rec = dict(rec, model=str(rec.get("model", ""))[:256],
                    path=str(rec.get("path", ""))[:1024], metadata_truncated=True)
         line = (json.dumps(rec) + "\n").encode("utf-8")
+    if len(line) > AUDIT_MAX_BYTES and ("ratelimit" in rec or "rate_limits" in rec):
+        rec = {key: value for key, value in rec.items() if key != "ratelimit"}
+        if "rate_limits" in rec:
+            rec["rate_limits"] = [{key: value for key, value in entry.items() if key != "headers"}
+                                  for entry in rec["rate_limits"]]
+        rec["ratelimit_truncated"] = True
+        line = (json.dumps(rec) + "\n").encode("utf-8")
     if len(line) > AUDIT_MAX_BYTES:
         raise ValueError("audit_max_bytes is too small for one audit record")
     if AUDIT_PATH.exists() and AUDIT_PATH.stat().st_size + len(line) > AUDIT_MAX_BYTES:
@@ -1951,20 +1958,24 @@ async def retry_wait(seconds: float, request: Request | None) -> None:
 
 RATE_LIMIT_PREFIX = "anthropic-ratelimit-"
 MAX_RATE_LIMIT_ATTEMPTS = 10
-MAX_STREAMED_RATE_LIMIT_BODY = 64 * 1024
+MAX_RATE_LIMIT_ERROR_BYTES = 64 * 1024
 
 
 def rate_limit_headers(headers: httpx.Headers) -> dict:
     out = {}
     for name, value in headers.items():
         if name.startswith(RATE_LIMIT_PREFIX):
-            out[name[len(RATE_LIMIT_PREFIX):]] = value[:200]
+            out.setdefault(name.removeprefix(RATE_LIMIT_PREFIX)[:100], value[:200])
             if len(out) == 40:
                 break
     return out
 
 
-def rate_limit_error(entry: dict, content: bytes | bytearray) -> None:
+def rate_limit_error(entry: dict, content: bytes | bytearray, headers: httpx.Headers) -> None:
+    if len(content) > MAX_RATE_LIMIT_ERROR_BYTES:
+        return
+    if "text/event-stream" in headers.get("content-type", ""):
+        content = next((line[5:].lstrip() for line in content.splitlines() if line.startswith(b"data:")), content)
     try:
         data = json.loads(content)
     except (ValueError, RecursionError):
@@ -1999,57 +2010,75 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
     retries = 0
     noted = False
     verdict = None
-    while True:
-        await retry_wait(0, request)
-        account = STATE.get("active_account")
-        if account not in ACCOUNTS or disabled(account):
-            account = pick_account()
-            if account is None:
-                raise HTTPException(status_code=503, detail="no enabled accounts")
-            STATE["active_account"] = account
-            save_state()
-        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
-        pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
-        if pace > 0:
-            await retry_wait(min(pace, 60), request)
-        upstream = await client.send(
-            client.build_request(method, url, headers=fwd_headers, content=body),
-            stream=True)
-        if upstream.status_code != 429:
-            return upstream, account, retries, noted, verdict
-        verdict = await note_response(account, upstream.headers, 429)
-        retry_after = upstream.headers.get("retry-after")
-        entry = {"account": account, "verdict": verdict,
-                 "retry_after": retry_after[:200] if retry_after is not None else None,
-                 "headers": rate_limit_headers(upstream.headers)}
-        entries = rec.setdefault("rate_limits", [])
-        if len(entries) < MAX_RATE_LIMIT_ATTEMPTS:
-            entries.append(entry)
-        else:
-            # Keep the initial attempts and the most recent one.
-            entries[-1] = entry
-            rec["rate_limits_omitted"] = rec.get("rate_limits_omitted", 0) + 1
-        wait = 0.0
-        retry = verdict in ("switched", "burst") and retries < 5
-        if not retry and verdict == "exhausted" and hold_deadline:
-            # Every account is spent: hold the request open until the soonest
-            # window reset instead of failing, so unattended runs finish.
-            wait = min(earliest_relief() + 5, hold_deadline) - time.time()
-            retry = wait > 0
-        if not retry:
-            noted = True
-            return upstream, account, retries, noted, verdict
-        rate_limit_error(entry, await bounded_response(upstream))
-        retries += 1
-        if wait > 0:
-            async with state_lock:
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
-                    "from": account, "to": account,
-                    "reason": f"all accounts spent; holding {round(wait)}s"})
-                STATE["events"] = STATE["events"][-200:]
+    try:
+        while True:
+            await retry_wait(0, request)
+            account = STATE.get("active_account")
+            if account not in ACCOUNTS or disabled(account):
+                account = pick_account()
+                if account is None:
+                    raise HTTPException(status_code=503, detail="no enabled accounts")
+                STATE["active_account"] = account
                 save_state()
-            await retry_wait(wait, request)
+            fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
+            pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
+            if pace > 0:
+                await retry_wait(min(pace, 60), request)
+            upstream = await client.send(
+                client.build_request(method, url, headers=fwd_headers, content=body),
+                stream=True)
+            if upstream.status_code != 429:
+                return upstream, account, retries, noted, verdict
+            verdict = await note_response(account, upstream.headers, 429)
+            retry_after = upstream.headers.get("retry-after")
+            entry = {"account": account, "verdict": verdict,
+                     "retry_after": retry_after[:200] if retry_after is not None else None,
+                     "headers": rate_limit_headers(upstream.headers)}
+            entries = rec.setdefault("rate_limits", [])
+            if len(entries) < MAX_RATE_LIMIT_ATTEMPTS:
+                entries.append(entry)
+            else:
+                # Keep the initial attempts and the most recent one.
+                entries[-1] = entry
+                rec["rate_limits_omitted"] = rec.get("rate_limits_omitted", 0) + 1
+            wait = 0.0
+            retry = verdict in ("switched", "burst") and retries < 5
+            if not retry and verdict == "exhausted" and hold_deadline:
+                # Every account is spent: hold the request open until the soonest
+                # window reset instead of failing, so unattended runs finish.
+                wait = min(earliest_relief() + 5, hold_deadline) - time.time()
+                retry = wait > 0
+            if not retry:
+                noted = True
+                return upstream, account, retries, noted, verdict
+            rate_limit_error(entry, await bounded_response(upstream), upstream.headers)
+            retries += 1
+            if wait > 0:
+                async with state_lock:
+                    STATE["events"].append({
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
+                        "from": account, "to": account,
+                        "reason": f"all accounts spent; holding {round(wait)}s"})
+                    STATE["events"] = STATE["events"][-200:]
+                    save_state()
+                await retry_wait(wait, request)
+    except (Exception, asyncio.CancelledError) as exc:
+        if rec.get("rate_limits"):
+            status = 500
+            if isinstance(exc, HTTPException):
+                status = exc.status_code
+            elif isinstance(exc, httpx.HTTPError):
+                status = 502
+            elif isinstance(exc, asyncio.CancelledError):
+                status = 499
+            rec.update(account=account or rec["rate_limits"][-1]["account"], status=status)
+            if retries:
+                rec["retries"] = retries
+            try:
+                audit(rec)
+            except Exception as audit_error:
+                storage_error("audit_write", audit_error)
+        raise
 
 
 @app.post("/v1/chat/completions")
@@ -2094,7 +2123,7 @@ async def openai_chat(request: Request):
             resp_headers[h] = upstream.headers[h]
 
     if upstream.status_code == 429 and verdict == "exhausted":
-        rate_limit_error(rec["rate_limits"][-1], await bounded_response(upstream))
+        rate_limit_error(rec["rate_limits"][-1], await bounded_response(upstream), upstream.headers)
         retry_after = max(1, round(earliest_relief() - time.time()))
         rec["status"] = 503
         audit(rec)
@@ -2128,7 +2157,7 @@ async def openai_chat(request: Request):
 
     content = await bounded_response(upstream)
     if upstream.status_code == 429:
-        rate_limit_error(rec["rate_limits"][-1], content)
+        rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
     if not noted:
         await note_response(account, upstream.headers, upstream.status_code)
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
@@ -2580,14 +2609,14 @@ async def proxy(request: Request, path: str):
             try:
                 async for chunk in upstream.aiter_bytes():
                     if error_body is not None:
-                        if len(error_body) + len(chunk) <= MAX_STREAMED_RATE_LIMIT_BODY:
+                        if len(error_body) + len(chunk) <= MAX_RATE_LIMIT_ERROR_BYTES:
                             error_body.extend(chunk)
                         else:
                             error_body = None
                     usage_from_sse(chunk.decode("utf-8", errors="replace"), usage_acc)
                     yield chunk
                 if error_body is not None:
-                    rate_limit_error(rec["rate_limits"][-1], error_body)
+                    rate_limit_error(rec["rate_limits"][-1], error_body, upstream.headers)
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(usage_acc)
@@ -2599,7 +2628,7 @@ async def proxy(request: Request, path: str):
 
     content = await bounded_response(upstream)
     if upstream.status_code == 429:
-        rate_limit_error(rec["rate_limits"][-1], content)
+        rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
     try:
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):

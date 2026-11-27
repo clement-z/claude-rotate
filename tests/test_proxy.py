@@ -78,6 +78,15 @@ def audit_recs():
     return [json.loads(l) for l in R.AUDIT_PATH.read_text().splitlines() if l.strip()]
 
 
+class Chunks(httpx.AsyncByteStream):
+    def __init__(self, *chunks):
+        self.chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
 # --- 1. auth -----------------------------------------------------------------
 fresh_state()
 use_upstream(lambda req: httpx.Response(200))
@@ -247,6 +256,14 @@ check("a streamed 429 is relayed and its audit bounds Retry-After and the error 
       r.status_code == 429 and r.json() == {"error": long_error} and entry["retry_after"] == "1" * 200
       and entry["error"] == {"type": "rate_limit_error", "message": "m" * 300})
 
+frame = b"event: error\ndata: " + json.dumps({"type": "error", "error": returned_error}).encode() + b"\n\n"
+use_upstream(lambda req: httpx.Response(429, stream=Chunks(frame[:16], frame[16:33], frame[33:]), headers={
+    **unified(u5="1.0", status="rejected", **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}),
+    "content-type": "text/event-stream"}))
+r = call()
+check("a split SSE 429 frame keeps its body and records the first data payload's error",
+      r.status_code == 429 and r.content == frame and audit_recs()[-1]["rate_limits"][0]["error"] == returned_error)
+
 chat = "/v1/chat/completions"
 chat_body = {"model": "claude-fable-5", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
 fresh_state()
@@ -288,6 +305,68 @@ check("OpenAI chat still translates a returned burst 429 after retries and recor
       r.status_code == 429 and r.json() == {"error": {"type": "api_error", "message": "upstream: burst on this account"}}
       and rec["retries"] == 5 and len(rec["rate_limits"]) == 6
       and all(e["verdict"] == "burst" and e["error"] == burst_error for e in rec["rate_limits"]))
+
+for path in ("/v1/messages", chat):
+    fresh_state()
+    failed_retry = httpx.ConnectError("mock retry failed")
+    calls = []
+
+    def fail_retry(req):
+        calls.append(req)
+        if len(calls) == 1:
+            return httpx.Response(429, json={"error": burst_error}, headers=unified(**{"retry-after": "0"}))
+        raise failed_retry
+
+    use_upstream(fail_retry)
+    caught = None
+    try:
+        call(path, body=chat_body)
+    except httpx.ConnectError as exc:
+        caught = exc
+    recs = audit_recs()
+    check(f"{path} preserves a failed retry exception and writes the 429 audit once",
+          caught is failed_retry and len(recs) == 1 and recs[0]["status"] == 502 and recs[0]["retries"] == 1
+          and recs[0]["rate_limits"][0]["error"] == burst_error)
+
+large_error_body = json.dumps({"error": burst_error, "padding": "x" * (64 * 1024)}).encode()
+fresh_state()
+use_upstream(lambda req: httpx.Response(429, content=large_error_body, headers=unified(**{"retry-after": "0"}))
+             if not R.STATE["accounts"] else httpx.Response(200, json={"usage": {}}, headers=unified()))
+with patch.object(R.json, "loads", wraps=json.loads) as loads:
+    r = call()
+check("audit skips JSON parsing of discarded 429 errors over 64 KiB",
+      r.status_code == 200 and "error" not in audit_recs()[-1]["rate_limits"][0]
+      and all(args.args[0] != large_error_body for args in loads.call_args_list))
+
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+use_upstream(lambda req: httpx.Response(429, content=large_error_body, headers=unified(
+    u5="1.0", status="rejected", **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)})))
+with patch.object(R.json, "loads", wraps=json.loads) as loads:
+    r = call(chat, body=chat_body)
+check("audit skips JSON parsing of discarded OpenAI exhaustion errors over 64 KiB",
+      r.status_code == 503 and "error" not in audit_recs()[-1]["rate_limits"][0]
+      and all(args.args[0] != large_error_body for args in loads.call_args_list))
+
+fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+headers = unified(u5="1.0", status="rejected", **{
+    "anthropic-ratelimit-unified-5h-reset": str(now + 100),
+    "anthropic-ratelimit-" + "n" * 120: "long-name",
+    **{f"anthropic-ratelimit-test-{i}": "x" * 200 for i in range(40)}})
+use_upstream(lambda req: httpx.Response(429, json={"error": returned_error}, headers=headers))
+r = call(body=chat_body)
+rec = audit_recs()[-1]
+check("rate-limit header names are capped at 100 characters in both snapshots",
+      r.status_code == 429 and rec["ratelimit"]["n" * 100] == "long-name"
+      and rec["rate_limits"][0]["headers"]["n" * 100] == "long-name"
+      and all(len(name) <= 100 for name in rec["ratelimit"]))
+with patch.object(R, "AUDIT_MAX_BYTES", 4096):
+    r = call(body=chat_body)
+rec = audit_recs()[-1]
+check("a 4 KiB audit file keeps the attempt and error after dropping both header snapshots",
+      r.status_code == 429 and r.json() == {"error": returned_error}
+      and R.AUDIT_PATH.stat().st_size <= 4096 and rec["ratelimit_truncated"] is True
+      and "ratelimit" not in rec and "headers" not in rec["rate_limits"][0]
+      and rec["rate_limits"][0]["error"] == returned_error)
 
 # --- 7. every account spent, hold on → wait for reset, then succeed ----------
 now = time.time()

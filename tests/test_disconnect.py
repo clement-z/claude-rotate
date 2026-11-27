@@ -28,8 +28,9 @@ async def main():
         def upstream(request):
             calls.append(time.monotonic())
             if mode == "pace":
-                return httpx.Response(429, json={"error": "burst"}, headers={"retry-after": "3"})
-            return httpx.Response(429, json={"error": "spent"}, headers={
+                return httpx.Response(429, json={"error": {"type": "rate_limit_error", "message": "burst"}},
+                                      headers={"retry-after": "3"})
+            return httpx.Response(429, json={"error": {"type": "rate_limit_error", "message": "spent"}}, headers={
                 "anthropic-ratelimit-unified-status": "rejected",
                 "anthropic-ratelimit-unified-5h-utilization": "1",
                 "anthropic-ratelimit-unified-5h-reset": str(time.time() + 30),
@@ -53,6 +54,7 @@ async def main():
             for mode in ("hold", "pace"):
                 for path in ("/v1/messages", "/v1/chat/completions"):
                     calls.clear()
+                    r.AUDIT_PATH.write_text("")
                     r.STATE = {"active_account": "a", "accounts": {}, "events": []}
                     body = json.dumps({"model": "test", "messages": [{"role": "user", "content": "hi"}]}).encode()
                     _reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -72,6 +74,13 @@ async def main():
                         await asyncio.sleep(0.01)
                     assert len(calls) == 1, "disconnected request retried upstream"
                     assert not server.server_state.tasks, "disconnected wait retained its task"
+                    records = [json.loads(line) for line in r.AUDIT_PATH.read_text().splitlines()]
+                    assert len(records) == 1 and records[0]["status"] == 499
+                    assert records[0]["path"] == path and records[0]["retries"] == 1
+                    limits = records[0]["rate_limits"]
+                    assert len(limits) == 1 and limits[0]["account"] == "a"
+                    assert limits[0]["verdict"] == ("exhausted" if mode == "hold" else "burst")
+                    assert limits[0]["error"]["message"] == ("spent" if mode == "hold" else "burst")
                     print(f"real TCP disconnected {mode} cancelled: {path}")
         finally:
             server.should_exit = True

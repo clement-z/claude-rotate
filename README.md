@@ -400,8 +400,10 @@ more than ten, and counts omitted attempts in `rate_limits_omitted`.
 `ratelimit` captures the final answer's rate-limit headers for Fable requests
 and for answers without the unified 5-hour utilization header. These snapshots
 help identify model-specific limits and explain missing utilization readings.
-Both fields keep up to 40 `anthropic-ratelimit-*` headers, with the prefix removed
-and values truncated to 200 characters.
+Both fields keep up to 40 `anthropic-ratelimit-*` headers, with the prefix removed,
+names capped at 100 characters, and values capped at 200. If the audit record
+would exceed the file limit, the proxy strips these snapshots and marks it
+`ratelimit_truncated`.
 
 ## OpenAI-compatible endpoint
 
