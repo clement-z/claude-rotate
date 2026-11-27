@@ -234,9 +234,12 @@ async def main():
           str(sent.url) == "https://api.openai.com/v1/responses"
           and sent.headers["authorization"] == "Bearer fake-oa-access"
           and not any(DESK.encode() in v for _, v in sent.headers.raw))
+    cached_usage = usage(200, 50, 1000, 0) | {
+        "input_tokens_details": {"cached_tokens": 1000}, "output_tokens_details": {"reasoning_tokens": 10}}
     check("a response.completed line split over chunks, with a split UTF-8 character, audits input minus cached, "
           "output and cached as cache read",
-          one(new).get("usage") == usage(200, 50, 1000, 0) and one(new).get("provider") == "openai"
+          one(new).get("usage") == cached_usage
+          and one(new).get("provider") == "openai"
           and one(new).get("status") == 200 and one(new).get("model") == "gpt-5.1-codex"
           and "interrupted" not in one(new) and "account" not in one(new))
     check("the finished upstream stream is closed", stream.closed)
@@ -272,7 +275,8 @@ async def main():
     openai.answer = lambda request: httpx.Response(200, headers={"content-type": "application/json"}, content=answer)
     r, new = await call("POST", "/openai/v1/chat/completions", content=js({"model": "gpt-5.1"}))
     check("a buffered JSON answer reaches the client unchanged and its usage is audited",
-          r.status_code == 200 and r.content == answer and one(new).get("usage") == usage(60, 20, 40, 0)
+          r.status_code == 200 and r.content == answer
+          and one(new).get("usage") == (usage(60, 20, 40, 0) | {"input_tokens_details": {"cached_tokens": 40}})
           and one(new).get("model") == "gpt-5.1" and one(new).get("path") == "/openai/v1/chat/completions")
     check("admission slot released after a buffered success", gate().active == 0)
 
@@ -404,8 +408,10 @@ async def main():
           body == b"".join(wire) and not any(k in ("content-type", "content-length") for k, _ in hdrs))
     check("the upstream's Date and Server are not relayed next to Uvicorn's",
           not any(k in ("date", "server") for k, _ in hdrs))
+    charged_usage = usage(50, 7, 1000, 150) | {
+        key: real_usage[key] for key in ("input_tokens_details", "output_tokens_details")}
     check("its usage is audited: cached reads and cache writes taken out of input_tokens",
-          one(rows()[before:]).get("usage") == usage(50, 7, 1000, 150) and stream.closed)
+          one(rows()[before:]).get("usage") == charged_usage and stream.closed)
 
     stream = Body(wire[0], httpx.RemoteProtocolError("peer closed connection"))
     openai.answer = lambda request: httpx.Response(200, stream=stream)
@@ -422,11 +428,11 @@ async def main():
     r, new = await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
     check("a sized JSON answer without Content-Type is buffered, relayed and its usage audited",
           r.status_code == 200 and r.content == answer and r.headers.get("content-length") == str(len(answer))
-          and "content-type" not in r.headers and one(new).get("usage") == usage(50, 7, 1000, 150))
+          and "content-type" not in r.headers and one(new).get("usage") == charged_usage)
     openai.answer = lambda request: httpx.Response(200, stream=Body(answer[:30], answer[30:]))
     r, new = await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
     check("an unsized JSON answer without Content-Type is relayed as it comes and its usage still audited",
-          r.status_code == 200 and r.content == answer and one(new).get("usage") == usage(50, 7, 1000, 150))
+          r.status_code == 200 and r.content == answer and one(new).get("usage") == charged_usage)
     openai.answer = lambda request: httpx.Response(200, json={"ok": True})
 
     # 4. HEAD and OPTIONS
@@ -508,7 +514,7 @@ async def main():
               head.get("status") == 200 and body == b"".join(events) and rec.get("status") == 200
               and "interrupted" not in rec and stream.closed)
         if label == "response.completed":
-            check("and its usage is recorded", rec.get("usage") == usage(200, 50, 1000, 0))
+            check("and its usage is recorded", rec.get("usage") == cached_usage)
 
     stream = Body(created, done, httpx.ReadError("connection reset"))
     openai.answer = lambda request: sse(stream)

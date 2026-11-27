@@ -20,8 +20,7 @@ def check(name, cond):
     PASS += 1
 
 
-# --- usage_from_sse: max-accumulate across events, ignore junk ---
-sink = {}
+# --- stream usage: max-accumulate across events, ignore junk ---
 sse = (
     'event: message_start\n'
     'data: {"message": {"usage": {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 200}}}\n\n'
@@ -30,7 +29,10 @@ sse = (
     'data: {broken json with "usage" inside}\n'
     'data: [DONE]\n'
 )
-R.usage_from_sse(sse, sink)
+meter = R.providers.SseUsage(claude=True)
+for offset in range(0, len(sse), 13):
+    meter.feed(sse[offset:offset + 13].encode())
+sink = meter.usage
 check("sse captures input_tokens", sink.get("input_tokens") == 10)
 check("sse max-accumulates output_tokens", sink.get("output_tokens") == 42)
 check("sse captures cache reads", sink.get("cache_read_input_tokens") == 200)
@@ -42,8 +44,8 @@ check("summarize fills zeros", R.summarize_usage({"input_tokens": 5}) == {
     "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
 
 # --- price_for: substring match + default ---
-check("opus priced", R.price_for("claude-opus-5") == [5.0, 25.0])
-check("fable priced", R.price_for("claude-fable-5") == [10.0, 50.0])
+check("opus priced", R.price_for("claude-opus-5") == [5.0, 25.0, 0.5])
+check("fable priced", R.price_for("claude-fable-5") == [10.0, 50.0, 1.0])
 check("unknown model → default", R.price_for("weird-model-9") == R.DEFAULT_PRICE)
 check("None model → default", R.price_for(None) == R.DEFAULT_PRICE)
 

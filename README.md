@@ -379,8 +379,8 @@ Live per-account quota gauges, straight from Anthropic's rate-limit headers:
   session override.
 - **By model** (24 h / 7 d / 30 d / all time) and **by account** (24 h) —
   requests, tokens, the share of prompt tokens served from cache, and a
-  *cost-equivalent* column: what the usage would cost at API list prices (incl.
-  cache read 0.1× / write 1.25×) — i.e. what the subscriptions are saving you.
+  *cost-equivalent* column estimates what the usage would cost at API list
+  prices, including cached input and cache writes.
 
 The 24 h figures come from the audit log. Longer periods come from
 `device_usage.json` next to `state.json`: daily totals per device and model for
@@ -389,6 +389,10 @@ weekly-quota use and time at the limit) for the billing periods. It is updated
 with every request and saved every minute. On first start it is rebuilt once
 from `audit.jsonl` and its rotated copies, and the weekly-quota part from
 `usage_history.json`, so all time reaches back as far as those files do.
+The 24 h view prices retained audit records at read time. Daily and all-time
+totals, the device trend, and billing periods use stored costs, so they mix
+old and new prices after an upgrade. Older audit records without speed or
+cache-write duration use standard speed and the short cache-write rate.
 
 The panel's JSON endpoints use the same Claude device key or enabled tailnet
 access as the panel. `GET /rotate/status` returns per-account `claims`,
@@ -537,14 +541,15 @@ held to `max_response_bytes`. Usage from Responses (`response.completed`), Chat
 Completions and Anthropic-format answers, streamed or not, is recorded in the audit
 log with a `provider` field and counted per device; OpenAI's cache reads and cache
 writes are taken out of its `input_tokens` and recorded as cache read and cache
-write, as for Claude. Costs are API list prices: built in for the Claude families and
-OpenAI's current GPT models (Standard tier, short context, read
-2026-11-19), with `prices_per_mtok` in `config.json` changing or adding entries. They
+write, as for Claude. The audit retains bounded input and output token
+details for OpenAI. The built-in GPT prices use the Standard short-context
+rows read on 2026-11-27, with `prices_per_mtok` in `config.json` changing or
+adding entries. These prices
 understate a request above 272K input tokens, which OpenAI bills at a higher
 long-context rate. A provider model no entry names counts as $0 rather than at a
 made-up Claude price. A request's cost is added to the daily and all-time totals
-when it is recorded, so a price change applies from then on there; the 24-hour
-figures are worked out again from the audit log and follow it at once.
+when it is recorded, so a price change applies from then on there. The 24-hour
+view calculates the figures again from the audit log.
 
 **Signing in.** On a machine with a browser:
 
@@ -692,8 +697,16 @@ can lose readings since the last successful save.
 | `hold_max_s` | wait up to this many seconds for a usable account when a model family is blocked on every account (default 0 = off) |
 | `refresh_idle_s` | send an account with no traffic for this long a 1-token `claude-haiku-4-5` request (~9 tokens of its quota) to read its current usage, so quota spent outside the proxy is seen before a switch (default 1800; 0 = off). Usage is otherwise only learned from traffic. |
 | `panel_tailnet` | `true` lets tailnet users open the panel without a device key, trusting the `Tailscale-User-Login` header from Tailscale Serve; requires a loopback `bind` (default false). See [SECURITY.md](SECURITY.md). |
-| `prices_per_mtok` | `[input, output]` or `[input, output, cached input]` $ per MTok for the cost columns, by a pattern found in the model id; the longest matching pattern wins. Entries change or add to the built-in table (Claude families and OpenAI models, see `BUILTIN_PRICES` in `rotator.py`); without a cached-input price a cache read costs 0.1x input, a cache write 1.25x. Default `{}`. |
+| `prices_per_mtok` | `[input, output]` or `[input, output, cached input]` dollars per MTok for the cost columns. The longest pattern in the model ID wins. Entries change or add to `BUILTIN_PRICES` in `rotator.py`. Without a cached-input price, cache reads cost 0.1× input. Default `{}`. |
 | `alerts` | `device_tokens_per_hour`, `util_warn` |
+
+Claude prices use the 2026-11-27 list. The audit retains `usage.speed` and
+the cache-write split when Anthropic reports them. Fast mode doubles the
+covered models' rates. Haiku 5.5 uses its higher tier above 100,000 prompt
+tokens, including cache reads and writes, on each request. Claude cache
+writes cost 1.25× input for five minutes and 2× for an hour. OpenAI uses
+the same multipliers for 30 minutes and 12 hours. An unsplit write count
+uses the short rate.
 
 ### Rotation policy
 

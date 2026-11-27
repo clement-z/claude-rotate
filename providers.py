@@ -26,9 +26,12 @@ import socket
 import sys
 import time
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
 
 import httpx
+
+from oai_compat import claude_usage, merge_usage, token_count
 
 ANTHROPIC = "anthropic"  # the rotated Claude accounts on the bare root
 # First path segments the Claude passthrough, the admin endpoints and FastAPI's own
@@ -881,7 +884,46 @@ def write_private(path: Path, text: str) -> None:
         os.close(dfd)
 
 
-def usage_of(event) -> dict | None:
+OPENAI_CACHE_FIELDS = ("cached_tokens", "cache_write_tokens", "cache_write_tokens_details",
+                       "cache_write_30m_tokens", "cache_write_tokens_30m",
+                       "cache_write_12h_tokens", "cache_write_tokens_12h")
+OPENAI_CACHE_TTLS = ("ttl_30m_tokens", "ttl_12h_tokens")
+
+
+def openai_cache_writes(details: dict) -> tuple[int, int]:
+    """Total write tokens and the subset explicitly reported as 12-hour writes."""
+    total = token_count(details.get("cache_write_tokens"))
+    split = details.get("cache_write_tokens_details")
+    split = split if isinstance(split, dict) else {}
+    short = max(token_count(split.get("ttl_30m_tokens")), token_count(details.get("cache_write_30m_tokens")),
+                token_count(details.get("cache_write_tokens_30m")))
+    long = max(token_count(split.get("ttl_12h_tokens")), token_count(details.get("cache_write_12h_tokens")),
+               token_count(details.get("cache_write_tokens_12h")))
+    return max(total, short + long), long
+
+
+def bounded_usage_details(details, preferred=(), limit=32) -> dict | None:
+    if not isinstance(details, dict):
+        return None
+    out = {}
+    # Keep known counters even if a response reports many extra diagnostic keys.
+    for key in chain(preferred, details):
+        if key not in details:
+            continue
+        value = details[key]
+        if key == "cache_write_tokens_details" and preferred == OPENAI_CACHE_FIELDS and isinstance(value, dict):
+            value = bounded_usage_details(value, OPENAI_CACHE_TTLS, limit=8)
+        elif isinstance(value, str):
+            value = value[:200]
+        elif value is not None and not isinstance(value, bool) and not number(value):
+            continue
+        out[key[:100]] = value
+        if len(out) == limit:
+            break
+    return out
+
+
+def usage_of(event, *, claude=False) -> dict | None:
     """Token counts of a Responses, Chat Completions or Anthropic answer or stream
     event, in the audit log's fields (prompt tokens without the cached part)."""
     if not isinstance(event, dict):
@@ -893,25 +935,27 @@ def usage_of(event) -> dict | None:
     if not isinstance(usage, dict):
         return None
 
-    def n(value):
-        return value if type(value) is int and value >= 0 else 0
-
-    if "prompt_tokens" not in usage and "input_tokens_details" not in usage and (
-            "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
-            or str(event.get("type", "")).startswith("message_")):
-        return {k: n(usage.get(k)) for k in ("input_tokens", "output_tokens",
-                                             "cache_read_input_tokens", "cache_creation_input_tokens")}
+    if claude or ("prompt_tokens" not in usage and "input_tokens_details" not in usage and (
+            "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage or "cache_creation" in usage
+            or str(event.get("type", "")).startswith("message_"))):
+        return claude_usage(usage)
     prompt = usage.get("input_tokens", usage.get("prompt_tokens"))
     output = usage.get("output_tokens", usage.get("completion_tokens"))
     if type(prompt) is not int and type(output) is not int:
         return None
-    details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
-    details = details if isinstance(details, dict) else {}
+    details = bounded_usage_details(usage.get("input_tokens_details", usage.get("prompt_tokens_details")),
+                                    OPENAI_CACHE_FIELDS)
+    output_details = bounded_usage_details(usage.get("output_tokens_details", usage.get("completion_tokens_details")))
     # Both are parts of input_tokens: what the prompt cache served and what it stored.
     # Taken out of input_tokens, the four fields stay disjoint, as in Anthropic's usage.
-    cached, written = n(details.get("cached_tokens")), n(details.get("cache_write_tokens"))
-    return {"input_tokens": max(0, n(prompt) - cached - written), "output_tokens": n(output),
-            "cache_read_input_tokens": cached, "cache_creation_input_tokens": written}
+    cached, written = token_count((details or {}).get("cached_tokens")), openai_cache_writes(details or {})[0]
+    out = {"input_tokens": max(0, token_count(prompt) - cached - written), "output_tokens": token_count(output),
+           "cache_read_input_tokens": cached, "cache_creation_input_tokens": written}
+    if details is not None:
+        out["input_tokens_details"] = details
+    if output_details is not None:
+        out["output_tokens_details"] = output_details
+    return out
 
 
 class StreamUsage:
@@ -954,8 +998,9 @@ class SseUsage:
     message_delta), so each keeps the largest value seen. `ended` turns true once a
     terminal event is complete, at the blank line that closes it."""
 
-    def __init__(self):
+    def __init__(self, *, claude=False):
         self.decode = codecs.getincrementaldecoder("utf-8")(errors="replace").decode
+        self.claude = claude
         self.buf, self.skip, self.usage = "", False, None
         self.terminal, self.ended = False, False
 
@@ -984,8 +1029,10 @@ class SseUsage:
                     continue
                 if isinstance(event, dict) and event.get("type") in TERMINAL:
                     self.terminal = True
-                usage = usage_of(event)
+                usage = usage_of(event, claude=self.claude)
                 if usage:
-                    self.usage = {k: max(v, (self.usage or {}).get(k, 0)) for k, v in usage.items()}
+                    if self.usage is None:
+                        self.usage = {}
+                    merge_usage(self.usage, usage)
         if len(self.buf) > SSE_LINE_MAX:
             self.buf, self.skip = "", True

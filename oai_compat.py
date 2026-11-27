@@ -14,6 +14,39 @@ import json
 import time
 
 _FINISH = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length"}
+USAGE_COUNTS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+CACHE_CREATION_COUNTS = ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+
+
+def token_count(value) -> int:
+    return value if type(value) is int and 0 <= value < 10**15 else 0
+
+
+def claude_usage(usage) -> dict | None:
+    if not isinstance(usage, dict) or not usage:
+        return None
+    out = {key: token_count(usage.get(key)) for key in USAGE_COUNTS}
+    if isinstance(split := usage.get("cache_creation"), dict):
+        counts = {key: token_count(split[key]) for key in CACHE_CREATION_COUNTS if key in split}
+        if counts:
+            out["cache_creation"] = counts
+            out["cache_creation_input_tokens"] = max(out["cache_creation_input_tokens"], sum(counts.values()))
+    if isinstance(speed := usage.get("speed"), str) and speed:
+        out["speed"] = speed[:32]
+    return out
+
+
+def merge_usage(sink: dict, usage: dict) -> None:
+    for key, value in usage.items():
+        if key in USAGE_COUNTS:
+            sink[key] = max(value, sink.get(key, 0))
+        elif key == "cache_creation":
+            split = sink.setdefault(key, {})
+            for duration, count in value.items():
+                split[duration] = max(count, split.get(duration, 0))
+            sink["cache_creation_input_tokens"] = max(sink.get("cache_creation_input_tokens", 0), sum(split.values()))
+        else:
+            sink[key] = value
 
 
 def _oai_usage(u: dict) -> dict:
@@ -131,9 +164,8 @@ class SseToOai:
         }) + "\n\n"
 
     def _absorb_usage(self, u: dict | None) -> None:
-        for k, v in (u or {}).items():
-            if isinstance(v, (int, float)):
-                self.usage[k] = v
+        if usage := claude_usage(u):
+            merge_usage(self.usage, usage)
 
     def feed(self, text: str) -> str:
         self._buf += text

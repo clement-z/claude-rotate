@@ -54,7 +54,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.datastructures import MutableHeaders
 
 import providers
-from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
+from oai_compat import SseToOai, anthropic_to_oai, claude_usage as summarize_usage, oai_to_anthropic, token_count
 from providers import ANTHROPIC, HISTORY_DAYS
 
 ROOT = Path(__file__).parent
@@ -1292,28 +1292,6 @@ def weekly_outlook(now: float) -> dict:
     return out
 
 
-def usage_from_sse(text: str, sink: dict) -> None:
-    for line in text.splitlines():
-        if line.startswith("data:") and '"usage"' in line:
-            try:
-                obj = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-                continue
-            usage = obj.get("usage") or obj.get("message", {}).get("usage")
-            if usage:
-                for k in ("input_tokens", "output_tokens",
-                          "cache_read_input_tokens", "cache_creation_input_tokens"):
-                    if usage.get(k):
-                        sink[k] = max(sink.get(k, 0), usage[k])
-
-
-def summarize_usage(usage: dict | None) -> dict | None:
-    if not usage:
-        return None
-    return {k: usage.get(k, 0) for k in (
-        "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
-
-
 def status_claims(info: dict, now: float) -> dict:
     applicable = {family: applicable_claims(info, family) for family in MODEL_FAMILIES}
     thresholds = claim_thresholds()
@@ -1555,14 +1533,22 @@ async def buffered_search(request: Request, upstream: httpx.Response) -> bytes:
 
 # API list prices per MTok, [input, output] or [input, output, cached input], matched
 # by the longest pattern found in the model id. Without a cached-input price a cache
-# read costs 0.1x input; a cache write costs 1.25x input. Cost columns are
+# read costs 0.1x input. Claude prices read 2026-11-27 from
+# https://platform.claude.com/docs/en/about-claude/pricing.md. Cost columns are
 # *API-equivalent* dollars: what this usage would cost pay-per-token.
 BUILTIN_PRICES = {
     "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
     "opus": [5.0, 25.0],
     "sonnet": [3.0, 15.0],
     "haiku": [1.0, 5.0],
-    # OpenAI Standard tier, short context (up to 272K input tokens), read 2026-11-19 from
+    "fable-5-2": [8.0, 40.0, 0.20], "mythos-5-2": [8.0, 40.0, 0.20],
+    "fable-5-1": [10.0, 50.0, 0.25], "mythos-5-1": [10.0, 50.0, 0.25],
+    "fable-5": [10.0, 50.0, 1.0], "mythos-5": [10.0, 50.0, 1.0],
+    "opus-5-5": [4.0, 20.0, 0.20], "opus-5": [5.0, 25.0, 0.50],
+    "opus-4-8": [5.0, 25.0, 0.50], "opus-4-7": [5.0, 25.0, 0.50],
+    "sonnet-5-5": [2.0, 10.0, 0.10], "sonnet-5": [2.0, 10.0, 0.20], "sonnet-4-6": [3.0, 15.0, 0.30],
+    "haiku-5-5": [0.10, 0.50, 0.01], "haiku-4-5": [1.0, 5.0, 0.10],
+    # OpenAI Standard tier, short context (up to 272K input tokens), read 2026-11-27 from
     # https://developers.openai.com/api/docs/pricing. gpt-5.6-sol is a promotional
     # price until 2026-11-30. The -pro and -nano rows keep those models from taking
     # the price of the shorter name they contain.
@@ -1598,33 +1584,57 @@ def load_prices() -> dict:
 
 PRICES = load_prices()
 DEFAULT_PRICE = [5.0, 25.0]
+FAST_PRICE_MODELS = ("fable-5-2", "mythos-5-2", "opus-5", "opus-4-8")
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
     "util_warn": 0.8,
 })
 
 
+def price_pattern_matches(pattern: str, model: str) -> bool:
+    # A date starting with 2 is not the -2 revision of a model.
+    return pattern in model and (not pattern[-1].isdigit()
+                                 or re.search(re.escape(pattern) + r"(?![0-9])", model) is not None)
+
+
 def price_for(model: str | None, default=DEFAULT_PRICE) -> list[float] | None:
     """The entry of the longest pattern found in the model id, so gpt-5.4-mini is not
     priced as gpt-5.4 whatever the order of the table."""
-    matches = [pat for pat in PRICES if isinstance(model, str) and pat in model]
-    return PRICES[max(matches, key=len)] if matches else default
+    if not isinstance(model, str):
+        return default
+    pattern = max((pat for pat in PRICES if price_pattern_matches(pat, model)), key=len, default=None)
+    return PRICES[pattern] if pattern else default
 
 
 def api_cost(model: str | None, usage: dict, provider=None) -> float:
-    """API-equivalent $ for one request: in + out + cache read (the cached-input price,
-    or 0.1x input) + cache write (1.25x input).
+    """API-equivalent $ for one request, including prompt length, speed and cache TTL.
     Another provider's model costs 0 unless prices_per_mtok names it: the Claude
     default price would be invented."""
     price = price_for(model, None if provider else DEFAULT_PRICE)
     if price is None:
         return 0.0
     p_in, p_out, *cached = price
-    return (
-        usage.get("input_tokens", 0) * p_in
+    input_tokens = usage.get("input_tokens", 0)
+    read_tokens = usage.get("cache_read_input_tokens", 0)
+    write_tokens = usage.get("cache_creation_input_tokens", 0)
+    long_writes = 0
+    if isinstance(split := usage.get("cache_creation"), dict):
+        long_writes = token_count(split.get("ephemeral_1h_input_tokens"))
+        write_tokens = max(write_tokens, long_writes + token_count(split.get("ephemeral_5m_input_tokens")))
+    elif isinstance(details := usage.get("input_tokens_details"), dict):
+        total, long_writes = providers.openai_cache_writes(details)
+        write_tokens = max(write_tokens, total)
+    scale = 1
+    if isinstance(model, str):
+        if price_pattern_matches("haiku-5-5", model) and input_tokens + read_tokens + write_tokens > 100_000:
+            scale = 5
+        elif usage.get("speed") == "fast" and any(price_pattern_matches(pat, model) for pat in FAST_PRICE_MODELS):
+            scale = 2
+    return scale * (
+        input_tokens * p_in
         + usage.get("output_tokens", 0) * p_out
-        + usage.get("cache_read_input_tokens", 0) * (cached[0] if cached else p_in * 0.1)
-        + usage.get("cache_creation_input_tokens", 0) * p_in * 1.25
+        + read_tokens * (cached[0] if cached else p_in * 0.1)
+        + ((write_tokens - long_writes) * 1.25 + long_writes * 2) * p_in
     ) / 1_000_000
 
 
@@ -2174,7 +2184,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <div class="card"><h2>By model <span class="seg" id="period"></span></h2><table id="models"></table></div>
  <div class="card"><h2>By account, 24 h</h2><table id="by-account"></table><h2 style="margin-top:20px">Recent switches</h2><div class="timeline" id="events"></div></div>
 </section>
-<p class="muted small">Cost-equivalent = API list prices (cache read 0.1&times;, write 1.25&times;); actual spend is covered by the subscriptions.</p>
+<p class="muted small">Cost-equivalent uses API list prices. The 24 h view uses current prices. Stored totals and billing periods keep the prices used when each request was recorded.</p>
 </main>
 <dialog id="confirm"><div id="cf-text"></div><div class="small" id="cf-err" style="color:var(--crit)"></div>
  <div class="acts"><button class="linkbtn" id="cf-no">Cancel</button><button class="linkbtn primary" id="cf-yes">Switch</button></div></dialog>
@@ -3283,7 +3293,7 @@ async def proxy(request: Request, path: str):
         resp_headers["x-rotate-account"] = account
 
     if "text/event-stream" in upstream.headers.get("content-type", ""):
-        usage_acc: dict = {}
+        meter = providers.SseUsage(claude=True)
 
         async def relay():
             error_body = bytearray() if upstream.status_code == 429 else None
@@ -3294,13 +3304,13 @@ async def proxy(request: Request, path: str):
                             error_body.extend(chunk)
                         else:
                             error_body = None
-                    usage_from_sse(chunk.decode("utf-8", errors="replace"), usage_acc)
+                    meter.feed(chunk)
                     yield chunk
                 if error_body is not None:
                     rate_limit_error(rec["rate_limits"][-1], error_body, upstream.headers)
             finally:
                 await upstream.aclose()
-                rec["usage"] = summarize_usage(usage_acc)
+                rec["usage"] = meter.usage
                 audit(rec)
 
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
