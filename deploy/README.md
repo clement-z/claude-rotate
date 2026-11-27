@@ -62,6 +62,10 @@ wrapper, the `current`/`current.next` links and release directories carrying an
 installer marker. Kept and reported: unknown directories under `releases/`,
 drop-ins, and by default `/etc/claude-rotate`, `/var/lib/claude-rotate`,
 `/var/log/claude-rotate` and the identity, so a later `install.sh` adopts them.
+The state directory includes `provider_quotas.json` and
+`provider_quota_history.json` for OpenAI meters and charts. Both files are
+mode `0600` under the service. Uninstall keeps them by default and
+`--purge` removes them with the rest of the state directory.
 
 `--legacy` additionally removes release directories named exactly `89ec74a`,
 `89ec74a7c7e22501df50f417a3d23da8d27ae428` or either with a

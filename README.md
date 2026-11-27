@@ -600,15 +600,31 @@ from the backend becomes a short JSON error, since Codex shows the model the bod
 The audit record carries `route: "codex-images"`, the duration and the bytes.
 
 **Quota.** The proxy keeps the plan's latest figures per limit and shows them in
-`/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`;
-the panel warns at 90 %. They come from two places. Image answers carry Codex's quota
-headers (`x-codex-active-limit: imagegen_premium`, a 24-hour window). Model use
+`/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`.
+It caches the figures in `provider_quotas.json` next to `state.json`. The panel
+warns at 90 %. Image answers carry Codex's quota headers
+(`x-codex-active-limit: imagegen_premium`, a 24-hour window), and the proxy
+also accepts quota headers on inference answers when present. Model use
 (`codex`, a 5-hour and a weekly window) is not in the Sign in with ChatGPT route's
 answers, so with an images login installed the proxy reads it every 5 minutes from
 `GET https://chatgpt.com/backend-api/wham/usage`, where Codex reads it: a read with
 the Codex login, no model call. These are the account's figures; whether requests on
 the Sign in with ChatGPT route count against the same `codex` limit is not
 documented, so watch the weekly figure move with Codex traffic before relying on it.
+
+Below the meters, the OpenAI card plots the last 14 days for each observed
+limit and window duration. Hover or tap a reading to see its receipt time,
+usage, headroom and reported reset. Dashed vertical ticks mark reported resets.
+Nearby polls from the same reset cycle form lines. Header readings appear as
+dots, and gaps mean no observations. The panel fetches
+`GET /rotate/quota-history` on open and once a minute with the same access
+rules as `/rotate/status`. It returns an `as_of` timestamp and the observed
+series by provider.
+
+The proxy keeps up to 16 series per provider in `provider_quota_history.json`
+next to `state.json`. The latest reading in each UTC five-minute bucket
+wins. The proxy saves changes once a minute and on orderly shutdown. An abrupt
+stop can lose readings since the last successful save.
 
 ## Configuration (`config.json`)
 
@@ -807,7 +823,9 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
   disposable analytics. `device_usage.json` is rebuilt from `logs/` if lost,
   but all-time totals and billing-period use older than the oldest kept log
   (and the 14 days of `usage_history.json`) go with it. The plan history
-  lives in `config.json`.
+  lives in `config.json`. Keep `provider_quotas.json` and
+  `provider_quota_history.json` if you want the OpenAI meters and 14-day
+  charts to survive a restore. Both files can be rebuilt from new observations.
 - **Upgrades.** For the Debian service, run `sudo ./install.sh` from the newer
   reviewed checkout; it builds a new immutable release and switches to it. Roll
   back with the [manual procedure](deploy/README.md#immutable-upgrades-and-rollback).
