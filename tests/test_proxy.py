@@ -444,6 +444,29 @@ for path in ("/v1/messages", chat):
           caught is failed_retry and len(recs) == 1 and recs[0]["status"] == 502 and recs[0]["retries"] == 1
           and recs[0]["rate_limits"][0]["error"] == burst_error)
 
+fresh_state()
+calls = []
+
+
+def fail_after_switch(req):
+    calls.append(req.headers["authorization"])
+    if len(calls) == 1:
+        return httpx.Response(429, json={"error": returned_error}, headers=unified(u5="1", status="rejected"))
+    raise httpx.ConnectError("mock connection failed after switch")
+
+
+use_upstream(fail_after_switch)
+try:
+    call()
+except httpx.ConnectError:
+    pass
+rec, = audit_recs()
+check("a failed retry on a different account keeps the first account's reading out of the final audit fields",
+      calls == ["Bearer tok-a", "Bearer tok-b"] and rec["account"] == "b" and rec["status"] == 502
+      and rec["util"] == {} and "util_at" not in rec and "ratelimit" not in rec
+      and rec["rate_limits"][0]["account"] == "a"
+      and rec["rate_limits"][0]["headers"]["unified-5h-utilization"] == "1")
+
 large_error_body = json.dumps({"error": burst_error, "padding": "x" * (64 * 1024)}).encode()
 fresh_state()
 use_upstream(lambda req: httpx.Response(429, content=large_error_body, headers=unified(**{"retry-after": "0"}))

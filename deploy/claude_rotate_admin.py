@@ -1901,11 +1901,8 @@ def cmd_quota_rate(args) -> int:
     cfg = load_config()
     now = time.time()
     accounts = {account["name"] for account in cfg["accounts"]}
-    providers = {}
-    for name, spec in object_fields(cfg.get("providers")).items():
-        if object_fields(spec).get("kind") == "openai-siwc":
-            prefix = spec.get("prefix")
-            providers[name] = prefix if isinstance(prefix, str) else "/" + name
+    providers = {name for name, spec in object_fields(cfg.get("providers")).items()
+                 if object_fields(spec).get("kind") == "openai-siwc"}
     scan, warnings = {}, []
     history = quota_history_file(STATE_DIR / "usage_history.json", [], warnings)
     provider_history = quota_history_file(STATE_DIR / "provider_quota_history.json", {}, warnings)

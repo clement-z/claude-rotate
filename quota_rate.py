@@ -12,7 +12,7 @@ from pricing import api_cost, price_for, token_count
 DAY = 86400
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 CLAUDE_PATHS = ("/v1/messages", "/v1/chat/completions")
-OPENAI_PATHS = ("/v1/responses", "/v1/chat/completions")
+OPENAI_ENDPOINTS = ("v1/responses", "v1/chat/completions")
 RESET_TOLERANCE = 60
 DROP_NOISE = 1
 
@@ -82,7 +82,6 @@ def collect_audit(records, accounts, providers, start, now, prices):
     traffic = defaultdict(list)
     reporters = defaultdict(set)
     earliest = None
-    model_paths = {name: tuple(prefix + path for path in OPENAI_PATHS) for name, prefix in providers.items()}
     for record in records:
         at = audit_time(record.get("ts"))
         if at is None or at > now:
@@ -95,7 +94,9 @@ def collect_audit(records, accounts, providers, start, now, prices):
         if record.get("method", "POST") != "POST":
             continue
         if isinstance(provider, str) and provider in providers:
-            if record.get("path") in model_paths[provider]:
+            path = record.get("path")
+            # The audit provider identifies the account even after a URL prefix rename.
+            if isinstance(path, str) and path.removeprefix("/").partition("/")[2] in OPENAI_ENDPOINTS:
                 traffic[("openai", provider, "codex")].append(request_usage(record, at, prices, provider))
         elif not provider and isinstance(account, str) and account in accounts:
             if record.get("path") not in CLAUDE_PATHS:
@@ -104,7 +105,6 @@ def collect_audit(records, accounts, providers, start, now, prices):
             # Completion timestamps have whole-second resolution.
             legacy = seen is None or seen > now or seen >= at + 1
             observed = at if legacy else seen
-            earliest = min(earliest, observed)
             if observed < start:
                 continue
             request = request_usage(record, observed, prices)
@@ -127,8 +127,13 @@ def collect_audit(records, accounts, providers, start, now, prices):
 
 
 def add_claude_history(readings, history, accounts, start, now):
+    rounded_headers = defaultdict(list)
     for name in accounts:
-        readings.setdefault(("claude", name, "7d", None), [])
+        series = readings.setdefault(("claude", name, "7d", None), [])
+        for i, point in enumerate(series):
+            rounded = round(point.at)
+            if not point.completion_time and rounded < point.at:
+                rounded_headers[name, rounded, point.percent].append(i)
     for sample in history:
         sample = mapping(sample)
         at = number(sample.get("ts"))
@@ -140,7 +145,17 @@ def add_claude_history(readings, history, accounts, start, now):
             used, reset = number(point[0]), reset_time(point[1])
             if used is None or (reset is not None and reset <= at):
                 continue
-            readings[("claude", name, "7d", None)].append(Reading(at, round(100 * used, 10), reset, sampled=True))
+            percent = round(100 * used, 10)
+            # Rounding can move a sample ahead of the header it copied.
+            series = readings[("claude", name, "7d", None)]
+            candidates = rounded_headers.get((name, at, percent), ())
+            match = max((i for i in candidates if not changed_reset(series[i].reset, reset)),
+                        key=lambda i: series[i].at, default=None)
+            if match is None:
+                series.append(Reading(at, percent, reset, sampled=True))
+            else:
+                point = series[match]
+                series[match] = replace(point, reset=point.reset or reset, sampled=True)
 
 
 def add_provider_history(readings, history, providers, start, now):

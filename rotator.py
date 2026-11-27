@@ -2588,7 +2588,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
     hold_deadline = time.monotonic() + HOLD_MAX_S
     retries = 0
     verdict = None
-    account = None
+    account = observed_account = None
     burst_accounts = set()
     retrying = False
     try:
@@ -2650,6 +2650,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
             except BaseException:
                 await upstream.aclose()
                 raise
+            observed_account = account
             if upstream.status_code != 429:
                 return upstream, account, retries, verdict
             if policy == "strict":
@@ -2690,6 +2691,10 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
             elif isinstance(exc, asyncio.CancelledError):
                 status = 499
             rec.update(account=account or rec["rate_limits"][-1]["account"], status=status)
+            if rec["account"] != observed_account:
+                rec["util"] = {}
+                rec.pop("util_at", None)
+                rec.pop("ratelimit", None)
             if retries:
                 rec["retries"] = retries
             try:

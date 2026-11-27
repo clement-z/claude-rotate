@@ -445,7 +445,8 @@ See [deployment notes](deploy/README.md#runtime-and-operations).
 estimates the API-equivalent dollars and input, output, cache-read, and
 cache-write tokens represented by one quota percentage point. It scans the
 newest 32 MiB of retained audit logs, uses the current API list prices and
-configured overrides, and reports whether it hit the scan limit. It reads up
+configured overrides, and reports whether it hit the scan limit. Coverage starts
+at the earliest retained request completion. It reads up
 to 14 days of weekly and OpenAI history where available. The default lookback
 is 14 days and the minimum rise is 5 points.
 
@@ -474,8 +475,12 @@ Time left uses the last 24 h gateway cost pace when the audit covers that
 period. The general weekly fit estimates how many points each Fable dollar
 and each other dollar consumes when the samples distinguish the two rates.
 Outside usage can increase quota readings, including in intervals with
-gateway traffic. Unobserved resets can also skew estimates. Whole-point
-readings, especially on OpenAI, can leave too few intervals for a rate.
+gateway traffic. Unobserved resets can also skew estimates. An unconfirmed
+drop of one point or less is treated as noise, so a one-point credit can be
+missed and a noisy dip can shift a measured rise by a point. Legacy audit
+records without `util_at` that finish in the same second share one interval
+for cost attribution. Whole-point readings, especially on OpenAI, can leave
+too few intervals for a rate.
 API list prices here are a comparison unit for subscription usage.
 
 ## OpenAI-compatible endpoint

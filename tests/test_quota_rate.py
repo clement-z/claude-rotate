@@ -189,7 +189,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
         audit_row(-12, util={"7d": .10}, ratelimit={"unified-7d-reset": str(old_reset)}),
         audit_row(-11, util={"7d": .20}),
         audit_row(-8, provider="work", account=None, path="/openai/v1/models", method="GET"),
-        audit_row(-3, provider="work", account=None, path="/openai/v1/chat/completions",
+        audit_row(-3, provider="work", account=None, path="/old-prefix/v1/chat/completions",
                   model="gpt-5.2", output=1_000_000),
     ])
     (state / "usage_history.json").write_text(json.dumps([
@@ -211,5 +211,38 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and general["remaining"]["percent"] == 50)
     codex = rows["work", "codex"]
     check("a deadline shift breaks the cycle before the old reset and nearby estimates stay joined",
+          codex["intervals"] == 1)
+    check("OpenAI model traffic under an old URL prefix still counts for the audit provider",
           codex["intervals"] == 1 and codex["cost_intervals"] == 1
           and codex["usd_per_percent"]["median"] == 2.8 and codex["outside_intervals"] == 0)
+
+    save_rows(audit, [
+        audit_row(-11, output=0),
+        audit_row(-10, util_at=at(-10) + .1, util={"7d": .10}),
+        audit_row(-10, util_at=at(-10) + .2, util={"7d": .20}),
+    ])
+    (state / "usage_history.json").write_text(json.dumps([
+        {"ts": at(-10) - 1, "accounts": {"a": [.10, new_reset]}},
+        {"ts": at(-10), "accounts": {"a": [.20, new_reset]}},
+    ]))
+    general = rows_for()["a", "7d"]
+    check("a rounded weekly sample and its matching header count the rise once",
+          general["intervals"] == 1 and general["cost_intervals"] == 1
+          and general["sampled_intervals"] == 1 and general["outside_intervals"] == 0
+          and general["latest"]["at"] == at(-10) + .2)
+
+    save_rows(audit, [
+        audit_row(-18, util_at=at(-31), util={"7d": .10}),
+        audit_row(-15),
+    ])
+    (state / "usage_history.json").write_text(json.dumps([
+        {"ts": at(h), "accounts": {"a": [u, new_reset]}}
+        for h, u in ((-30, .10), (-26, .20), (-16, .25), (-14, .30))
+    ]))
+    r = run("--json")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout)
+    general = next(row for row in report["series"] if row["name"] == "a" and row["limit"] == "7d")
+    check("a long stream does not extend coverage past the earliest retained completion",
+          report["audit"]["from"] == at(-18) and general["sampled_intervals"] == 1
+          and general["cost_intervals"] == 1 and general["remaining"]["hours"] is None)
