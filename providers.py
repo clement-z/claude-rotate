@@ -8,7 +8,7 @@ openai-siwc     one "Sign in with ChatGPT" credential (plan usage) forwarded to
                 they are; a refused refresh takes the provider down until a new
                 sign-in is installed. With "images": true, Codex's two image
                 requests go to the ChatGPT backend instead, with a Codex login
-                (CodexLogin), since the Sign in with ChatGPT route refuses images.
+                (CodexLogin). Codex's web search uses that login too.
 
 Protocol: https://developers.openai.com/siwc/token-sharing-open-source (read 2026-11-17).
 Tokens never leave this module except in the upstream Authorization header: not in
@@ -43,14 +43,16 @@ TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 SIWC_API = "https://api.openai.com"
 SIWC_AUTH = "https://auth.openai.com"
 SIWC_RESOURCE = "https://api.openai.com/v1"  # the token's audience, fixed by the flow
-# The ChatGPT backend Codex itself uses with a ChatGPT login, for its two image routes
-# only. Pinned like the rest: the Codex login's token goes to these URLs and nowhere else.
+# The ChatGPT backend Codex itself uses with a ChatGPT login. The routes are pinned.
 CODEX_BACKEND = "https://chatgpt.com/backend-api/codex"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI's public OAuth client
 IMAGE_PATHS = {"/v1/images/generations": "/images/generations", "/v1/images/edits": "/images/edits"}
-# What the backend gets from the client besides the body; the gateway adds the
-# login's bearer and account id. Codex's turn metadata can name the team's repository.
-IMAGE_HEADERS = ("content-type", "originator", "user-agent", "x-codex-image-turn-id")
+SEARCH_ENDPOINT = "/alpha/search"
+SEARCH_PATH = "/v1" + SEARCH_ENDPOINT
+# The gateway adds the login's bearer and account id.
+CODEX_HEADERS = ("content-type", "originator", "user-agent")
+IMAGE_HEADERS = CODEX_HEADERS + ("x-codex-image-turn-id",)
+SEARCH_HEADERS = CODEX_HEADERS + ("x-codex-turn-metadata", "accept")
 # Refresh refusals Codex treats as permanent for its login (and any 401).
 CODEX_PERMANENT = {"invalid_grant", "refresh_token_expired", "refresh_token_reused",
                    "refresh_token_invalidated"}
@@ -78,8 +80,7 @@ RETRY_S, RETRY_MAX_S = 30, 300  # backoff after a failed refresh, shared by ever
 # more often (each rotation risks a lost answer, and spends a refresh early).
 FORCED_REFRESH_MIN_S = 600
 PEEK_MAX = 64 * 1024  # how much of a 401 body is read to classify it
-# OpenAI's 401 for a valid credential asking for an operation the plan route does not
-# allow (images/generations, for one): a refresh cannot change that answer.
+# OpenAI's 401 for a valid credential asking for an operation the route does not allow.
 REFUSED_OPERATION = {"rejected_by_hardened_oauth_boundary"}
 SSE_LINE_MAX = 8 * 1024 * 1024  # a longer SSE line is skipped for usage, still relayed
 # Events after which a stream has nothing more to say: a client may hang up once it
@@ -93,6 +94,10 @@ NO_COOKIES = http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(
 
 class ProviderDown(Exception):
     """The provider cannot serve now. The message is safe to show the caller."""
+
+    def __init__(self, message, notes=None):
+        super().__init__(message)
+        self.notes = notes or {}
 
 
 class ClientGone(Exception):
@@ -364,7 +369,7 @@ class OpenAISiwc:
             else "not attempted: the refresh is backing off or the credential is not on disk")
         if self.down:
             await upstream.aclose()
-            raise ProviderDown(self.down)
+            raise ProviderDown(self.down, notes | {"upstream_status": 401})
         if self.rec.get("access_token") == token:
             return upstream, 0, notes  # no replacement: the caller gets OpenAI's 401
         await upstream.aclose()
@@ -545,11 +550,10 @@ class OpenAISiwc:
 
 
 class CodexLogin(OpenAISiwc):
-    """The Codex ChatGPT login behind an openai-siwc provider's image requests: what
+    """The Codex ChatGPT login behind an openai-siwc provider's images and search: what
     `codex login` writes, converted by `claude-rotate-admin install-credential --images`
     to the record shape above plus account_id. It refreshes like the provider's own
-    credential, with Codex's parameters, and is sent only to the two image routes of the
-    ChatGPT backend."""
+    credential, with Codex's parameters."""
     kind = "codex-login"
     upstream = CODEX_BACKEND
     suffix = ".codex.json"
@@ -627,14 +631,14 @@ class CodexLogin(OpenAISiwc):
                 "refreshes": self.refreshes, "last_answer": self.last_answer, "usage_error": self.usage_error}
 
 
-def image_url(endpoint: str) -> httpx.URL:
-    """The backend URL for one of IMAGE_PATHS' values; nothing of the client's path or query."""
+def codex_url(endpoint: str) -> httpx.URL:
+    """The backend URL for a fixed endpoint, without the client's query."""
     return httpx.URL(CODEX_BACKEND + endpoint)
 
 
-def image_headers(client: dict) -> dict:
-    """The client headers the image routes get (lower-case names)."""
-    return {k: v for k, v in client.items() if k in IMAGE_HEADERS} | {"accept-encoding": "identity"}
+def codex_headers(client: dict, search: bool) -> dict:
+    allowed = SEARCH_HEADERS if search else IMAGE_HEADERS
+    return {k: v for k, v in client.items() if k in allowed} | {"accept-encoding": "identity"}
 
 
 def jwt_exp(token: str) -> int | None:
@@ -756,6 +760,9 @@ async def peek(upstream: httpx.Response) -> tuple[httpx.Response, bytes | None]:
         whole = False
     except StopAsyncIteration:
         pass
+    except BaseException:
+        await upstream.aclose()
+        raise
     # The bytes are decoded already: the copy must not decode them again.
     headers = [(k, v) for k, v in upstream.headers.multi_items() if k.lower() != "content-encoding"]
     return (httpx.Response(upstream.status_code, headers=headers, request=upstream.request,
@@ -763,12 +770,17 @@ async def peek(upstream: httpx.Response) -> tuple[httpx.Response, bytes | None]:
 
 
 def error_type(body: bytes | None) -> str | None:
-    """error.type of an OpenAI error answer, only if it looks like one."""
+    """Recognize an operation refusal in either field, otherwise report error.type."""
     try:
         err = json.loads(body).get("error") if body else None
     except (ValueError, RecursionError, AttributeError):
         return None
-    kind = err.get("type") if isinstance(err, dict) else None
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    if isinstance(code, str) and code in REFUSED_OPERATION:
+        return code
+    kind = err.get("type")
     return kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", kind) else None
 
 

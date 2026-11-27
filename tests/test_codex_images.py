@@ -1,5 +1,5 @@
-"""Codex's image requests under an openai-siwc provider with "images": true
-(rotator.image_proxy, providers.CodexLogin): which requests go to the ChatGPT backend
+"""Codex's image and search requests under an openai-siwc provider with "images": true
+(rotator.codex_proxy, providers.CodexLogin): which requests go to the ChatGPT backend
 and which stay on the Sign in with ChatGPT route, the backend's header allowlist and
 the actor header dropped on every route, image answers relayed or replaced, the Codex
 login's refresh, refusals and status, request sizes, the large-body budget and the
@@ -492,6 +492,125 @@ async def history_checks():
               and any(a["text"].startswith("provider openai: quota codex at 95%") for a in alerts)
               and points(OAI, "codex", 10080) == [[weekly_seen, 95, weekly_reset, "usage"]]
               and points(OAI, "codex", 300) == [[now, 4, None, "inference"]])
+
+
+async def search_checks():
+    path = "/openai/v1/alpha/search"
+    image_path = "/openai/v1/images/generations"
+    url = P.CODEX_BACKEND + "/alpha/search"
+    query, result = "fake-private-search-query", "fake-private-search-result"
+    body = js({"id": "fake-search", "model": "gpt-5.1-codex", "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": query}]}],
+        "commands": {"search_query": [{"q": query}]}})
+    answer = js({"output": result, "results": []})
+    login = new_login(codex_record(14))
+    OAI.quota_history.prune(time.time())
+    quota_reset = int(time.time()) + 600
+    backend.answer = lambda request: httpx.Response(200, headers={
+        "content-type": "application/json", "set-cookie": "session=fake",
+        "x-codex-active-limit": "search_tool", "x-codex-primary-used-percent": "19",
+        "x-codex-primary-window-minutes": "300", "x-codex-primary-reset-at": str(quota_reset)},
+        stream=Body(answer))
+    with patch.object(R.IMAGE_LINE, "enter", side_effect=AssertionError("search entered the image queue")), \
+         patch.object(R.LARGE_BODIES, "take", side_effect=AssertionError("search took an image body slot")):
+        r, new = await call("POST", path + "?ignore=fake", content=body, headers=HDRS)
+    sent = backend.calls[-1]
+    allowed = {"content-type", "originator", "user-agent", "x-codex-turn-metadata", "accept"}
+    check("search sends the original JSON to the pinned backend with the Codex login and only its allowed headers",
+          r.status_code == 200 and r.content == answer and str(sent.url) == url and sent.method == "POST"
+          and sent.content == body and all(sent.headers.get(k) == HDRS[k] for k in allowed)
+          and set(sent.headers) <= allowed | (MAY_REACH - set(FROM_CLIENT))
+          and sent.headers["authorization"] == f"Bearer {login.rec['access_token']}"
+          and sent.headers["chatgpt-account-id"] == CX_ACCOUNT and not leaks(sent, [DESK])
+          and r.headers["x-rotate-provider"] == "openai" and "set-cookie" not in r.headers)
+    rec = one(new)
+    check("search audit records status, response bytes and duration without the query, metadata or result",
+          rec.get("route") == "codex-search" and rec.get("status") == 200 and rec.get("bytes") == len(answer)
+          and rec.get("path") == path and type(rec.get("duration_s")) in (int, float)
+          and not any(s in json.dumps(new) for s in (query, result, "fake-secret-repo")))
+    history = OAI.quota_history.snapshot(time.time())
+    check("search quota headers update the meters and enter history as inference",
+          OAI.quotas.get("search_tool", {}).get("primary", {}).get("used_percent") == 19
+          and any(s["limit"] == "search_tool" and s["minutes"] == 300
+                  and s["points"][-1][1:] == [19, quota_reset, "inference"] for s in history))
+    nb = len(backend.calls)
+    for provider in ("plain", "draw"):
+        r, new = await call("POST", f"/{provider}/v1/alpha/search", content=body, headers=HDRS)
+        sent = siwc[provider].calls[-1]
+        check(f"search without a Codex login on {provider} still uses Sign in with ChatGPT",
+              r.status_code == 200 and len(backend.calls) == nb and "route" not in one(new)
+              and str(sent.url) == P.SIWC_API + "/v1/alpha/search"
+              and sent.headers["authorization"] == f"Bearer {SIWC[provider][0]}"
+              and "x-openai-actor-authorization" not in sent.headers)
+    with patch.object(R, "MAX_REQUEST_BYTES", len(body) - 1), patch.object(R, "MAX_IMAGE_REQUEST_BYTES", len(body)):
+        r, _ = await call("POST", path, content=body, headers=HDRS)
+    check("search over max_request_bytes gets 413 before the backend call",
+          r.status_code == 413 and len(backend.calls) == nb)
+    stream = Body(answer[:-1], answer[-1:])
+    backend.answer = lambda request: httpx.Response(
+        200, headers={"content-type": "application/json"}, stream=stream)
+    with patch.object(R, "MAX_SEARCH_RESPONSE_BYTES", len(answer) - 1):
+        r, new = await call("POST", path, content=body, headers=HDRS)
+    check("an oversized search answer without Content-Length is closed and replaced with JSON 502",
+          stream.closed and r.status_code == 502 and r.json()["error"]["type"] == "api_error"
+          and "upstream response too large" in r.text and result not in r.text
+          and one(new).get("status") == 502 and one(new).get("upstream_status") == 200 and one(new).get("bytes") == 0)
+
+    page = Body(b"<html>fake backend challenge</html>")
+    backend.answer = lambda request: httpx.Response(403, headers={"content-type": "text/html"}, stream=page)
+    r, new = await call("POST", path, content=body)
+    check("an HTML search error becomes short JSON with the original status",
+          page.closed and r.status_code == 403 and r.json()["error"]["type"] == "api_error"
+          and "fake backend challenge" not in r.text and one(new).get("upstream_content_type") == "text/html")
+
+    backend.answer = image_ok
+    await call("POST", image_path, content=PROMPT)
+    image_status = login.last_answer
+    na = len(cx_auth.calls)
+    for field, route in (("type", path), ("code", image_path)):
+        refusal = js({"error": {field: "rejected_by_hardened_oauth_boundary", "message": "fake: refused"}})
+        backend.answer = lambda request: httpx.Response(401, content=refusal)
+        r, new = await call("POST", route, content=body if route == path else PROMPT)
+        check(f"a refused operation in error.{field} is relayed and audited without touching the login",
+              r.status_code == 401 and r.content == refusal and len(cx_auth.calls) == na
+              and not login.down and not login.lost and not login.unsaved
+              and one(new).get("upstream_error") == "rejected_by_hardened_oauth_boundary"
+              and one(new).get("refresh_after_401") == "skipped: operation refused"
+              and (route != path or login.last_answer == image_status))
+    backend.answer = image_ok
+    r, _ = await call("POST", image_path, content=PROMPT)
+    check("images still work after a search operation refusal", r.status_code == 200 and r.content == IMAGE)
+
+    def expired(request):
+        return httpx.Response(401, json={"error": {"type": "invalid_request_error", "code": "token_expired"}})
+
+    access = secret("fake-cx-search-refreshed", True)
+    backend.answer = lambda request: (httpx.Response(200, json={"output": result})
+                                      if request.headers["authorization"] == f"Bearer {access}" else expired(request))
+    cx_auth.answer = lambda request: httpx.Response(200, json={
+        "access_token": access, "refresh_token": secret("fake-cx-search-rotation", True)})
+    nb = len(backend.calls)
+    r, new = await call("POST", path, content=body)
+    check("a genuine search 401 refreshes and replays the same request once on success",
+          r.status_code == 200 and r.json()["output"] == result and len(cx_auth.calls) == na + 1
+          and len(backend.calls) == nb + 2 and all(req.content == body for req in backend.calls[nb:])
+          and one(new).get("retries") == 1 and one(new).get("upstream_error") == "invalid_request_error")
+
+    na = len(cx_auth.calls)
+    login.refreshed_at = 0
+    backend.answer = expired
+    cx_auth.answer = lambda request: httpx.Response(401, json={"error": "invalid_grant"})
+    r, new = await call("POST", path, content=body)
+    check("a genuine search 401 follows image auth rules and audits why refresh failed",
+          r.status_code == 503 and len(cx_auth.calls) == na + 1 and login.down is not None
+          and one(new).get("refresh_after_401") == "attempted"
+          and one(new).get("upstream_status") == 401 and one(new).get("upstream_error") == "invalid_request_error")
+    nb = len(backend.calls)
+    r, _ = await call("POST", image_path, content=PROMPT)
+    check("a permanent token-endpoint refusal takes the shared login down for images too",
+          r.status_code == 503 and len(backend.calls) == nb and idle())
+    check("no search query, result or forwarded metadata appears in the audit",
+          not any(s in R.AUDIT_PATH.read_text() for s in (query, result, "fake-secret-repo")))
 
 
 async def main():
@@ -1083,6 +1202,7 @@ async def main():
     check("no provider's own credential was refreshed", siwc_auth.calls == [])
     check("all idle at the end", idle())
     await history_checks()
+    await search_checks()
     await C.aclose()
 
 

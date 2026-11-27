@@ -133,10 +133,10 @@ credential. What that changes:
   transferred session is not available yet on OpenAI's side; disconnect the agent
   in ChatGPT's settings to cut it off.
 - With `"images": true`, the proxy also holds a Codex ChatGPT login,
-  `credentials/<provider>.codex.json`, and sends Codex's two image requests to
-  `https://chatgpt.com/backend-api/codex/images/...` with it. This is a private
-  endpoint, used here the way the Codex CLI uses it, without any OpenAI programme
-  behind it: OpenAI left image generation out of token sharing. OpenAI's Terms of
+  `credentials/<provider>.codex.json`, and sends Codex's image and web search
+  requests to `https://chatgpt.com/backend-api/codex` with it. Search forwards
+  the conversation items and turn metadata that Codex sends. These are private
+  endpoints used by the Codex CLI. OpenAI's Terms of
   Use (effective 2026-01-01) forbid to "circumvent any rate limits or restrictions"
   and to "automatically or programmatically extract data or Output", and this use
   can be read as either. An action against the account would also end the Sign in
@@ -147,9 +147,9 @@ credential. What that changes:
   without the token-sharing limits, reaches Codex cloud tasks and the account's
   connectors. The proxy keeps only its access and refresh tokens and the account id
   (not the id token, not an API key `codex login` may have stored), mode 0600 under
-  the service user, and sends it only to the two image URLs and, every 5 minutes, a
-  read of the plan's usage (`/wham/usage`), all fixed in the code. Devices reach the
-  two image routes and nothing else with it. Deleting the file
+  the service user, and sends it only to the two image URLs, `/alpha/search`
+  and a read of the plan's usage (`/wham/usage`) every five minutes, all fixed
+  in the code. Devices can use the image and search routes. Deleting the file
   does not end the login: revoke it in ChatGPT's settings or with `codex logout` on
   a copy.
 - Codex turns its image tool on for a provider of its own when the provider sends

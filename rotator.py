@@ -180,6 +180,7 @@ def resource_limit(name: str, default: int, *, allow_zero=False, minimum=1) -> i
 
 MAX_REQUEST_BYTES = resource_limit("max_request_bytes", 32 * 1024 * 1024)
 MAX_RESPONSE_BYTES = resource_limit("max_response_bytes", 32 * 1024 * 1024)
+MAX_SEARCH_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CONCURRENT_REQUESTS = resource_limit("max_concurrent_requests", 0, allow_zero=True)
 # Under a provider with "images": true, request bodies may reach max_image_request_bytes:
 # an edit carries reference images, and every request after a generation carries the
@@ -953,12 +954,12 @@ async def bounded_body(request: Request, limit: int | None = None) -> bytes:
     return bytes(body)
 
 
-async def bounded_response(upstream: httpx.Response) -> bytes:
+async def bounded_response(upstream: httpx.Response, limit: int | None = None) -> bytes:
     """Limit buffered upstream responses; streaming responses stay streaming."""
-    body = bytearray()
+    body, limit = bytearray(), limit or MAX_RESPONSE_BYTES
     try:
         async for chunk in upstream.aiter_bytes(chunk_size=65536):
-            if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+            if len(body) + len(chunk) > limit:
                 raise HTTPException(status_code=502, detail="upstream response too large")
             body.extend(chunk)
     finally:
@@ -2268,13 +2269,16 @@ async def provider_proxy(request: Request, prov):
     images = getattr(prov, "images", None)
     path = upstream_path(request, drop=1, confined=prov.kind == "static-bearer"
                          and httpx.URL(prov.upstream).raw_path.strip(b"/") != b"")
-    body = await bounded_body(request, MAX_IMAGE_REQUEST_BYTES if images else None)
+    search = request.method == "POST" and path == providers.SEARCH_PATH
+    body = await bounded_body(request, MAX_IMAGE_REQUEST_BYTES if images and not search else None)
+    if search and images and images.rec:
+        return await codex_proxy(request, prov, device, providers.SEARCH_ENDPOINT, path, body, refuse)
     hold = LARGE_BODIES.take(len(body))
     streaming = False
     try:
         endpoint = providers.IMAGE_PATHS.get(path) if images and request.method == "POST" else None
         if endpoint:
-            response = await image_proxy(request, prov, device, endpoint, path, body, hold, refuse)
+            response = await codex_proxy(request, prov, device, endpoint, path, body, refuse, hold)
         else:
             response = await forward(request, prov, device, path, body, hold, refuse)
         streaming = isinstance(response, StreamingResponse)
@@ -2301,7 +2305,7 @@ async def forward(request: Request, prov, device: str, path: str, body: bytes, h
         audit(rec | {"status": 499})
         raise HTTPException(status_code=499, detail="client disconnected")
     except providers.ProviderDown as exc:
-        audit(rec | {"status": 503})
+        audit(rec | exc.notes | {"status": 503})
         return refuse(503, f"provider '{prov.name}' is unavailable: {exc}", "provider_unavailable")
     except httpx.HTTPError as exc:
         audit(rec | {"status": 502})
@@ -2369,62 +2373,80 @@ async def forward(request: Request, prov, device: str, path: str, body: bytes, h
                        request, upstream)
 
 
-async def image_proxy(request: Request, prov, device: str, endpoint: str, path: str, body: bytes,
-                      hold: Hold, refuse):
-    """Codex's image requests under a provider with "images": true: to the ChatGPT
-    backend with the provider's Codex login, body unchanged. The answer is relayed as it
-    arrives, never cut to a size: Codex retries a 5xx, and each retry is a new image."""
+async def codex_proxy(request: Request, prov, device: str, endpoint: str, path: str, body: bytes,
+                      refuse, hold: Hold | None = None):
+    """Forward to the ChatGPT backend with the Codex login, body unchanged."""
     login = prov.images
+    search = endpoint == providers.SEARCH_ENDPOINT
+    operation = "web search" if search else "image generation"
     rec = {"device": device, "provider": prov.name, "path": prov.prefix + path, "method": "POST",
-           "route": "codex-images", "model": request_model(request, body) if len(body) <= 65536 else None}
+           "route": "codex-search" if search else "codex-images",
+           "model": request_model(request, body) if len(body) <= 65536 else None}
     started = time.monotonic()
 
     async def alive():
         return not await request.is_disconnected()
 
-    def unavailable(status, message, kind):
-        audit(rec | {"status": status, "duration_s": round(time.monotonic() - started, 1)})
-        return refuse(status, f"image generation is unavailable: {message}", kind)
+    def finish(**extra):
+        audit(rec | {"bytes": 0, "duration_s": round(time.monotonic() - started, 1)} | extra)
 
-    try:
-        slot = await IMAGE_LINE.enter(alive)
-    except providers.ClientGone:
-        audit(rec | {"status": 499})
-        raise HTTPException(status_code=499, detail="client disconnected")
-    if slot is None:
-        return unavailable(429, f"{IMAGE_LINE_MAX} image requests are already waiting; retry later",
-                           "rate_limit_error")
+    def unavailable(status, message, kind):
+        finish(status=status)
+        return refuse(status, f"{operation} is unavailable: {message}", kind)
+
+    slot = None
     streaming = False
     try:
         try:
+            if not search:
+                slot = await IMAGE_LINE.enter(alive)
+                if slot is None:
+                    return unavailable(429, f"{IMAGE_LINE_MAX} image requests are already waiting; retry later",
+                                       "rate_limit_error")
             upstream, retries, notes = await login.send(
-                "POST", providers.image_url(endpoint), providers.image_headers(dict(request.headers)),
+                "POST", providers.codex_url(endpoint), providers.codex_headers(dict(request.headers), search),
                 body, alive)
         except providers.ClientGone:
-            audit(rec | {"status": 499})
+            finish(status=499)
             raise HTTPException(status_code=499, detail="client disconnected")
         except providers.ProviderDown as exc:
+            rec.update(exc.notes)
             return unavailable(503, str(exc), "provider_unavailable")
         except httpx.HTTPError as exc:
             return unavailable(502, f"the ChatGPT backend is unreachable: {providers.connect_failure(exc)}",
                                "api_error")
-        login.note_answer(upstream.status_code)
-        prov.record_quotas(providers.quota_snapshots(upstream.headers), "images", time.time())
+        if not search:
+            login.note_answer(upstream.status_code)
+        prov.record_quotas(providers.quota_snapshots(upstream.headers), "inference" if search else "images", time.time())
         rec["status"] = upstream.status_code
         if retries:
             rec["retries"] = retries
         rec.update(notes)
         ctype = upstream.headers.get("content-type", "")
-        if upstream.status_code >= 400 and "json" not in ctype.lower():
+        if (upstream.status_code >= 400 and "json" not in ctype.lower()
+                and rec.get("upstream_error") not in providers.REFUSED_OPERATION):
             # A Cloudflare challenge page or the like: Codex hands the body to the model.
             await upstream.aclose()
-            audit(rec | {"upstream_content_type": ctype[:64], "duration_s": round(time.monotonic() - started, 1)})
-            return refuse(upstream.status_code, f"image generation failed: the ChatGPT backend answered "
+            finish(upstream_content_type=ctype[:64])
+            return refuse(upstream.status_code, f"{operation} failed: the ChatGPT backend answered "
                           f"{upstream.status_code} with {ctype or 'no content type'}", "api_error")
         resp_headers = response_headers(upstream, "set-cookie", "content-security-policy", "date", "server")
         resp_headers["content-security-policy"] = "default-src 'none'; sandbox; frame-ancestors 'none'"
         resp_headers["x-rotate-provider"] = prov.name
 
+        if search:
+            try:
+                content = await bounded_response(upstream, min(MAX_RESPONSE_BYTES, MAX_SEARCH_RESPONSE_BYTES))
+            except HTTPException as exc:
+                finish(status=exc.status_code, upstream_status=upstream.status_code)
+                return refuse(exc.status_code, str(exc.detail), "api_error")
+            except httpx.HTTPError as exc:
+                finish(status=502, upstream_status=upstream.status_code)
+                return refuse(502, f"the ChatGPT backend broke off its answer ({type(exc).__name__})", "api_error")
+            finish(bytes=len(content))
+            return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
+
+        # Codex retries a 5xx, and each retry is a new image. Relay as it arrives.
         async def relay():
             sent, done = 0, False
             try:
@@ -2441,12 +2463,12 @@ async def image_proxy(request: Request, prov, device: str, endpoint: str, path: 
                 await upstream.aclose()
                 slot.release()
                 hold.release()
-                audit(rec | {"bytes": sent, "duration_s": round(time.monotonic() - started, 1)})
+                finish(bytes=sent)
 
         streaming = True
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
     finally:
-        if not streaming:
+        if slot is not None and not streaming:
             slot.release()
 
 

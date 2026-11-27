@@ -560,14 +560,14 @@ that answer to the client byte for byte, without a refresh or a replay, since a 
 token would get the same answer. The audit record carries `upstream_error` (OpenAI's
 error type) and `refresh_after_401` (skipped, held back, or attempted) for any 401.
 
-**Image generation.** The Sign in with ChatGPT route refuses images, but Codex's
+**Image generation and web search.** The Sign in with ChatGPT route refuses images, but Codex's
 `image_gen` tool is one JSON request to `<base_url>/images/generations` (or
 `/images/edits`), which Codex makes itself. With `"images": true` in an `openai-siwc`
 entry, the proxy sends those two requests to the ChatGPT backend Codex uses with its
 own login (`https://chatgpt.com/backend-api/codex`), with a Codex ChatGPT login it
-holds, billed to the same plan. Everything else stays on the Sign in with ChatGPT
-route. This is a private endpoint, not an OpenAI programme: see SECURITY.md before
-turning it on. To set it up:
+holds, billed to the same plan. The proxy also sends Codex's web search request
+there when the Codex login is installed. These are private endpoints. See
+SECURITY.md before turning them on.
 
 1. On the laptop, a login used for nothing else, then on the server:
    ```sh
@@ -586,9 +586,10 @@ turning it on. To set it up:
    http_headers = { "x-openai-actor-authorization" = "claude-rotate" }
    ```
    Codex offers `image_gen` to a provider of its own only when that header is set
-   (any value; the proxy drops it before any upstream). The header also turns on
-   Codex's web search tool, which posts to `/alpha/search`; that route is not known
-   to work on the Sign in with ChatGPT route, so web search stays off.
+   (any value, stripped before forwarding). The header also enables the web
+   search tool. The gateway sends `POST /alpha/search` through the Codex login
+   when installed. After a live search succeeds through the gateway, you can
+   drop `web_search = "disabled"`.
 
 Codex resends each generated image (about 1.3 MB of base64 for a 1536x1024 PNG) with
 every later request of its thread, so under a provider with images the request
@@ -598,6 +599,9 @@ above `max_request_bytes` share `max_image_bytes_in_flight` (256 MiB, then 503),
 generation takes about 8 s. Answers are relayed as they come; an HTML error page
 from the backend becomes a short JSON error, since Codex shows the model the body.
 The audit record carries `route: "codex-images"`, the duration and the bytes.
+Search uses `max_request_bytes`. Search replies are buffered up to 4 MiB or
+`max_response_bytes`, whichever is lower. The audit records `route: "codex-search"`
+without search input or results.
 
 **Quota.** The proxy keeps the plan's latest figures per limit and shows them in
 `/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`.
