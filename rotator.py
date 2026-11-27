@@ -1517,8 +1517,13 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .key{display:inline-block;width:16px;border-top:2px solid;vertical-align:4px;margin-right:6px}
  .key.dash{border-top-style:dashed} .key.band{height:10px;border:0;vertical-align:-1px;background:rgba(208,59,59,.3)}
  .wk{display:flex} .wk svg{display:block} .wk-scroll{flex:1;min-width:0;overflow-x:auto;scrollbar-width:thin;scrollbar-color:var(--axis) transparent} svg text{fill:var(--muted);font-size:11px;font-family:inherit}
- .tip{position:absolute;pointer-events:none;background:#262624;border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;min-width:170px;display:none}
+ .tip{position:absolute;z-index:1;pointer-events:none;background:var(--surface);color:var(--ink);box-shadow:0 4px 16px #0008;border:1px solid var(--axis);border-radius:8px;padding:8px 10px;font-size:12px;min-width:170px;max-width:calc(100% - 16px);display:none}
  .tip .row{display:flex;justify-content:space-between;gap:12px} .tip .v{color:var(--ink);font-weight:600}
+ .quota-history{margin-top:12px}
+ .quota-plot{position:relative;border-top:1px solid var(--grid);padding-top:8px;margin-top:8px}
+ .quota-plot header{justify-content:space-between;gap:2px 12px}
+ .quota-plot header b{overflow-wrap:anywhere}
+ .quota-chart svg{display:block;width:100%;height:148px}
  .sentence{margin-top:8px;color:var(--ink2)}
  table{border-collapse:collapse;width:100%} th,td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
  th{color:var(--muted);font-weight:500;font-size:12px} td:first-child,th:first-child,.l{text-align:left} tr:last-child td{border-bottom:0}
@@ -1574,7 +1579,9 @@ const cleanURL = new URL(location.href);
 cleanURL.searchParams.delete('key');
 history.replaceState(null, '', cleanURL.pathname + cleanURL.search + cleanURL.hash);
 const $=id=>document.getElementById(id), H=3600, D=86400, PERIODS={'24 h':'24h','7 d':'7d','30 d':'30d','All time':'all'};
-let period='7 d', showTable=false, WK=null, ST={}, PENDING=null;
+let period='7 d', showTable=false, WK=null, ST={}, PENDING=null, weeklySelection=null;
+let quotaHistory=null, quotaHistoryFailed=false;
+const quotaCards=new Map();
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(n){n=n||0;return n>=1e6?(n/1e6).toFixed(n>=1e7?0:1)+'M':n>=1e3?(n/1e3).toFixed(n>=1e4?0:1)+'k':''+Math.round(n)}
 function money(v){v=v||0;return '$'+(v>=100?Math.round(v).toLocaleString():v.toFixed(2))}
@@ -1582,6 +1589,7 @@ function tok(b){return (b.input_tokens||0)+(b.output_tokens||0)+(b.cache_write||
 function sum(o,f){return Object.values(o||{}).reduce((a,b)=>a+(f(b)||0),0)}
 function when(ts){return new Date(ts*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'})}
 function day(ts){return new Date(ts*1000).toLocaleDateString([],{month:'short',day:'numeric'})}
+function observed(ts){return new Date(ts*1000).toLocaleString([],{dateStyle:'medium',timeStyle:'long'})}
 function dur(s){return s<5400?Math.round(s/60)+' min':s<2*D?(s/H).toFixed(s<10*H?1:0)+' h':(s/D).toFixed(1)+' d'}
 function ago(min){return min==null?'never':min<1?'just now':min<60?min+' min ago':(min/60).toFixed(1)+' h ago'}
 function cell(b,l){return b?`<td data-l="${l}">${money(b.cost_usd)}<span class="sub">${fmt(tok(b))} tok &middot; ${fmt(b.requests)} req</span></td>`:`<td data-l="${l}" class="muted">&ndash;</td>`}
@@ -1603,9 +1611,105 @@ function quotas(name,p){const now=Date.now()/1000, q=p.quotas||{}, im=p.images;
   if(im)rows+=images.length?images.map(id=>wins(q[id]).map(w=>row('images',q[id],w)).join('')).join(''):empty('24h','images · no figure yet: comes with the next image');
   rows+=ids.filter(id=>id!=='codex'&&!images.includes(id)).map(id=>wins(q[id]).map(w=>row(id,q[id],w)).join('')).join('');
   const dot=im?(['down','unavailable'].includes(im.state)?'crit':im.unsaved||im.usage_error||im.last_error?'warn':'good'):'';
-  return `<div class="card"><div class="acct-head"><b>${esc(name)}</b><span class="badge">ChatGPT plan${plan?' '+esc(plan):''}</span>`
+  return `<div class="acct-head"><b>${esc(name)}</b><span class="badge">ChatGPT plan${plan?' '+esc(plan):''}</span>`
     +(im?`<span class="badge" title="${esc(im.reason||im.unsaved||im.last_error||im.usage_error||'')}"><span class="dot" style="background:var(--${dot})"></span>images ${esc(im.state)}</span>`:'')
-    +`<span class="acct-side"><span class="muted small">upstream: ${esc(p.state)}</span></span></div>`+rows+'</div>'}
+    +`<span class="acct-side"><span class="muted small">upstream: ${esc(p.state)}</span></span></div>`+rows}
+function quotaPlot(host, points, minutes, now, selected){
+  const chart=host.querySelector('.quota-chart'), tip=host.querySelector('.tip');
+  const width=chart.clientWidth||360, height=148, left=40, right=width-12, top=12, bottom=height-22;
+  const span=14*D, start=now-span, X=t=>left+(right-left)*(t-start)/span, Y=u=>top+(100-u)*(bottom-top)/100;
+  let grid='', ticks='', lines='', dots='', cycle=null, marked=false;
+  const resetFor=p=>p[2]!=null&&Math.abs(p[2]-p[0])<=minutes*60+60?p[2]:null;
+  for(const [v,color] of [[0,'--axis'],[25,'--grid'],[50,'--grid'],[75,'--grid'],[100,'--s2']]){
+    grid+=`<text x="${left-5}" y="${Y(v)+4}" text-anchor="end">${v}%</text><line x1="${left}" x2="${right}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(${color})"/>`}
+  for(const f of (width<280?[0,.5,1]:[0,.25,.5,.75,1])){
+    const t=start+f*span;
+    grid+=`<text x="${X(t)}" y="${height-5}" text-anchor="${f===0?'start':f===1?'end':'middle'}">${esc(day(t))}</text>`}
+  const xy=p=>X(p[0]).toFixed(2)+','+Y(p[1]).toFixed(2);
+  let previousJoined=false;
+  for(let i=0;i<points.length;i++){
+    const p=points[i], prev=points[i-1], reset=resetFor(p), prevReset=prev?resetFor(prev):null;
+    const sameCycle=reset!=null&&cycle!=null&&Math.abs(reset-cycle)<=60;
+    const joined=prev&&sameCycle&&prevReset!=null&&Math.abs(prevReset-reset)<=60
+      &&p[3]==='usage'&&prev[3]==='usage'&&p[0]-prev[0]<=420&&p[1]>=prev[1]
+      &&![cycle,prevReset,reset].some(r=>prev[0]<r&&p[0]>=r);
+    if(joined) lines+=(previousJoined?'':'M'+xy(prev))+'L'+xy(p);
+    else if(prev&&!previousJoined) dots+=quotaDot(prev);
+    if(reset!=null){
+      if(!sameCycle){cycle=reset; marked=false}
+      if(!marked&&start<=reset&&reset<=now){
+        marked=true;
+        ticks+=`<line class="quota-reset" x1="${X(reset)}" x2="${X(reset)}" y1="${top}" y2="${bottom}" stroke="var(--ink)" opacity=".45" stroke-dasharray="3 4"/>`}}
+    previousJoined=joined;
+  }
+  if(!previousJoined) dots+=quotaDot(points[points.length-1]);
+  function quotaDot(p){return `<circle cx="${X(p[0])}" cy="${Y(p[1])}" r="2.5" fill="var(--s1)"/>`}
+  chart.innerHTML=`<svg width="${width}" height="${height}">${grid}${ticks}<path class="quota-line" d="${lines}" fill="none" stroke="var(--s1)" stroke-width="2"/>${dots}
+    <line class="crosshair" x1="0" x2="0" y1="${top}" y2="${bottom}" stroke="var(--ink)" opacity="0"/></svg>`;
+  const pct=n=>n.toLocaleString([],{maximumFractionDigits:2})+'%';
+  return bindTooltip(chart,chart.querySelector('.crosshair'),tip,(x,y,t)=>{
+    if(t!=null){const p=points.find(p=>p[0]===t); return p&&[p,X(t)]}
+    let nearest=null, distance=13;
+    for(const p of points){const d=Math.hypot(X(p[0])-x,Y(p[1])-y); if(d<distance){nearest=p; distance=d}}
+    return nearest&&[nearest,X(nearest[0])];
+  },p=>[observed(p[0]),[['Usage',pct(p[1]),'var(--s1)'],['Headroom',pct(100-p[1])],
+                        ['Reported reset',p[2]==null?'Unknown':observed(p[2])]]],selected);
+}
+function renderQuotaHistory(name,card){
+  const {plots}=card, series=quotaHistory&&Object.hasOwn(quotaHistory.providers,name)?quotaHistory.providers[name]:[];
+  card.width=plots.clientWidth;
+  const selected=new Map([...card.selections].map(([key,selection])=>[key,selection()]));
+  card.selections.clear();
+  plots.replaceChildren();
+  const summary=document.createElement('div'); summary.className='muted small';
+  summary.textContent=quotaHistory?(series.length?'History as of '+observed(quotaHistory.as_of):'No observations yet')
+    :quotaHistoryFailed?'Quota history unavailable':'Loading quota history…';
+  plots.append(summary);
+  for(const {limit,minutes,points} of series){
+    if(!points.length) continue;
+    const plot=document.createElement('div'); plot.className='quota-plot';
+    plot.innerHTML=`<header><b>${esc(limit)} · ${esc(wlabel(minutes))}</b><span class="muted small">Last observed ${esc(observed(points[points.length-1][0]))}</span></header>
+      <div class="quota-chart"></div><div class="tip"></div>`;
+    plots.append(plot);
+    const key=limit+' '+minutes;
+    card.selections.set(key,quotaPlot(plot,points,minutes,quotaHistory.as_of,selected.get(key)));
+  }
+}
+function resizeQuotaPlots(){
+  for(const [name,card] of quotaCards) if(card.width!==card.plots.clientWidth) renderQuotaHistory(name,card);
+}
+function refreshQuotaCards(status){
+  const current=new Set();
+  for(const [name,p] of Object.entries(status.providers||{})){
+    if(p.kind!=='openai-siwc') continue;
+    current.add(name);
+    if(!quotaCards.has(name)){
+      const root=document.createElement('div'), bars=document.createElement('div'), plots=document.createElement('div');
+      root.className='card'; plots.className='quota-history'; root.append(bars,plots); $('oai').append(root);
+      quotaCards.set(name,{root,bars,plots,selections:new Map()});
+    }
+    quotaCards.get(name).bars.innerHTML=quotas(name,p);
+  }
+  for(const [name,card] of quotaCards) if(!current.has(name)){
+    card.root.remove(); quotaCards.delete(name);
+  }
+  resizeQuotaPlots();
+}
+const panelFetch=path=>fetch(path,{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'});
+async function refreshQuotaHistory(){
+  try{
+    const response=await panelFetch('/rotate/quota-history');
+    if(!response.ok) throw new Error('history request failed');
+    const data=await response.json();
+    if(!Number.isFinite(data.as_of)||!data.providers||typeof data.providers!=='object') return;
+    if(quotaHistory&&data.as_of<quotaHistory.as_of) return;
+    quotaHistory=data;
+  }catch(err){
+    if(quotaHistory) return;
+    quotaHistoryFailed=true;
+  }
+  quotaCards.forEach((card,name)=>renderQuotaHistory(name,card));
+}
 function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
   return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
 function billing(b){
@@ -1625,7 +1729,7 @@ function billing(b){
     return h+'</table>'}).join('')
     +'<p class="muted small">Weekly use: the share of its weekly quota the account used over the period, and in its busiest 7 days. All accounts: the same for the combined weekly quota, then with this account on the next plan down or up. An average over 100% cannot last (&#9888;); a busiest week over 100% can fit across weekly resets but means time at the limit.</p>'}
 function weekly(p){
-  if(!p||!p.series.length) return 'collecting data';
+  if(!p||!p.series?.length) return 'collecting data';
   const cw=Math.max(300,$('weekly').clientWidth||1100),Hh=cw<600?220:270,L=48,R=12,T=14,B=26, now=p.series[p.series.length-1][0];
   const all=p.series.concat(p.projection.slice(1)), last=p.series[p.series.length-1];
   // The plot scrolls from the first sample to the projection's end and opens centred on now.
@@ -1652,31 +1756,86 @@ function weekly(p){
   for(let i=1;i<all.length;i++){const dn=all[i-1][1]-all[i][1]; if(dn>=1) s+=`<text x="${X(all[i-1][0])}" y="${Y(all[i-1][1])-8}" text-anchor="middle">reset &minus;${Math.round(dn)}</text>`}  // a weekly reset gave quota back
   for(const [i,c,dy] of [[1,'var(--s1)',18],[2,'var(--s2)',-9]])  // usage label below its dot, limit above
     s+=`<circle cx="${X(now)}" cy="${Y(last[i])}" r="4.5" fill="${c}" stroke="var(--surface)" stroke-width="2"/><text x="${X(now)-8}" y="${Y(last[i])+dy}" text-anchor="end" style="fill:var(--ink)">${Math.round(last[i])}%</text>`;
-  return `<div class="wk">${y}</svg><div class="wk-scroll" id="wk-scroll">${s}<line id="xh" x1="0" x2="0" y1="${T}" y2="${Hh-B}" stroke="var(--ink2)" opacity="0"/></svg></div></div>`+sentence(p,now)}
+  return `<div class="wk">${y}</svg><div class="wk-scroll" id="wk-scroll">${s}<line class="crosshair" x1="0" x2="0" y1="${T}" y2="${Hh-B}" stroke="var(--ink)" opacity="0"/></svg></div></div>`+sentence(p,now)}
 function sentence(p,now){
   const rate=p.rate_per_day==null?'':`At the current rate (${p.rate_per_day}% of a weekly quota per day), `;
   if(p.eta) return `<div class="sentence">${rate}every account ${p.eta<=now+60?'is at 100% now':'is spent at <b>'+esc(when(p.eta))+'</b>'}; quota returns at ${esc(when(p.back))} when ${esc(p.back_account)} resets.</div>`;
   return `<div class="sentence">${p.note?esc(p.note):rate+'no shortfall in the next 7.5 days.'}</div>`}
-$('weekly').onpointerdown=$('weekly').onpointermove=e=>{  // pointerdown: a tap on a touch screen
-  const svg=e.currentTarget.querySelector('#wk-scroll svg'); if(!svg||!WK) return;
-  const r=svg.getBoundingClientRect(), t=WK.x0+(e.clientX-r.left)/WK.pps;
-  let q=WK.all[0]; for(const p of WK.all) if(Math.abs(p[0]-t)<Math.abs(q[0]-t)) q=p;
-  const xh=svg.querySelector('#xh'), x=(q[0]-WK.x0)*WK.pps;
-  xh.setAttribute('x1',x); xh.setAttribute('x2',x); xh.setAttribute('opacity','.6');
-  const tip=$('tip'); tip.replaceChildren();
-  const head=document.createElement('div'); head.className='muted'; head.textContent=when(q[0])+(q[0]>WK.now?' · projected':''); tip.append(head);
-  for(const [k,v,c] of [['Usage',q[1],'var(--s1)'],['Limit',q[2],'var(--s2)'],[q[2]-q[1]<=0.1?'Blocked':'Headroom',q[2]-q[1],'']]){
-    const row=document.createElement('div'), a=document.createElement('span'), b=document.createElement('span');
-    row.className='row'; b.className='v'; b.textContent=Math.round(v)+'%';
-    if(c){const key=document.createElement('span'); key.className='key'; key.style.borderColor=c; a.append(key)} a.append(k); row.append(a,b); tip.append(row)}
-  const c=e.currentTarget.parentNode.getBoundingClientRect(), px=e.clientX-c.left;
-  tip.style.pointerEvents=e.pointerType==='touch'?'auto':'none';
-  tip.style.display='block'; tip.style.top=(r.top-c.top+8)+'px';
-  tip.style.left=Math.max(8,px+16+tip.offsetWidth>c.width?px-16-tip.offsetWidth:px+16)+'px'};
-function hideTip(){
-  $('tip').style.display='none'; const xh=$('xh'); if(xh) xh.setAttribute('opacity','0')}
-$('tip').onclick=hideTip;
-$('weekly').onpointerleave=e=>{if(e.pointerType!=='touch') hideTip()};  // touch fires leave right after the tap
+function bindTooltip(chart,crosshair,tip,findPoint,format,selected){
+  const svg=chart.querySelector('svg');
+  let selection=null, tap=null, scroll=chart.scrollLeft;
+  function hide(){
+    selection=null; tip.style.display='none'; crosshair.setAttribute('opacity','0');
+  }
+  function show(found,pointerType){
+    if(!found){hide(); return}
+    const [point,x]=found, r=svg.getBoundingClientRect(), bounds=chart.getBoundingClientRect();
+    if(r.left+x<bounds.left-1||r.left+x>bounds.right+1){hide(); return}
+    selection={time:point[0],pointerType};
+    crosshair.setAttribute('x1',x); crosshair.setAttribute('x2',x); crosshair.setAttribute('opacity','.6');
+    const [title,rows]=format(point);
+    tip.replaceChildren();
+    const head=document.createElement('div'); head.className='muted'; head.textContent=title; tip.append(head);
+    for(const [label,value,color] of rows){
+      const row=document.createElement('div'), a=document.createElement('span'), b=document.createElement('span');
+      row.className='row'; b.className='v'; b.textContent=value; a.textContent=label;
+      if(color){const key=document.createElement('span'); key.className='key'; key.style.borderColor=color; a.prepend(key)}
+      row.append(a,b); tip.append(row);
+    }
+    const c=(tip.offsetParent||tip.parentNode).getBoundingClientRect(), px=r.left+x-c.left;
+    tip.style.pointerEvents=pointerType==='touch'?'auto':'none';
+    tip.style.display='block'; tip.style.top=(r.top-c.top+8)+'px';
+    const left=px+16+tip.offsetWidth>c.width?px-16-tip.offsetWidth:px+16;
+    tip.style.left=Math.max(8,Math.min(c.width-8-tip.offsetWidth,left))+'px';
+  }
+  function select(e){
+    const r=svg.getBoundingClientRect();
+    show(findPoint(e.clientX-r.left,e.clientY-r.top),e.pointerType);
+  }
+  const moved=e=>Math.hypot(e.clientX-tap.x,e.clientY-tap.y)>8;
+  chart.onpointerdown=e=>{
+    if(e.pointerType!=='touch') select(e);
+    else if(e.isPrimary!==false) tap={id:e.pointerId,x:e.clientX,y:e.clientY};
+  };
+  chart.onpointermove=e=>{
+    if(e.pointerType!=='touch') select(e);
+    else if(tap&&e.pointerId===tap.id&&moved(e)){tap=null; hide()}
+  };
+  chart.onpointerup=e=>{
+    if(!tap||e.pointerId!==tap.id) return;
+    if(moved(e)) hide(); else select(e);
+    tap=null;
+  };
+  chart.onpointercancel=()=>{tap=null; hide()};
+  chart.onpointerleave=e=>{if(e.pointerType!=='touch') hide()};
+  chart.onscroll=()=>{if(chart.scrollLeft!==scroll){scroll=chart.scrollLeft; tap=null; hide()}};
+  tip.onclick=hide;
+  if(selected) show(findPoint(null,null,selected.time),selected.pointerType); else hide();
+  return ()=>selection;
+}
+function refreshWeekly(wk){
+  const selected=weeklySelection&&weeklySelection(), sc=$('wk-scroll'), tip=$('tip');
+  const keep=sc&&sc.scrollWidth?sc.scrollWidth-sc.clientWidth-sc.scrollLeft:null;
+  WK=null;
+  $('weekly').innerHTML=weekly(wk);
+  const plot=$('wk-scroll');
+  if(!plot||!WK){tip.style.display='none'; weeklySelection=null; return}
+  const {all,now,x0,pps,start}=WK;
+  plot.scrollLeft=keep==null?start:plot.scrollWidth-plot.clientWidth-keep;
+  const pct=v=>Math.round(v)+'%';
+  weeklySelection=bindTooltip(plot,plot.querySelector('.crosshair'),tip,(x,y,t)=>{
+    let point;
+    if(t!=null) point=all.find(p=>p[0]===t);
+    else{
+      const time=x0+x/pps;
+      point=all[0];
+      for(const p of all) if(Math.abs(p[0]-time)<Math.abs(point[0]-time)) point=p;
+    }
+    return point&&[point,(point[0]-x0)*pps];
+  },q=>[when(q[0])+(q[0]>now?' · projected':''),[
+    ['Usage',pct(q[1]),'var(--s1)'],['Limit',pct(q[2]),'var(--s2)'],
+    [q[2]-q[1]<=0.1?'Blocked':'Headroom',pct(q[2]-q[1])]]],selected);
+}
 $('tbl').onclick=()=>{showTable=!showTable; $('tbl').textContent=showTable?'Chart':'Table'; refresh()};
 $('period').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p; if(p){period=p; refresh()}};
 const usable=a=>!a.disabled&&(a.effective_util_5h||0)<ST.switch_threshold&&(a.effective_util_7d||0)<ST.switch_threshold_7d;
@@ -1692,8 +1851,7 @@ $('cf-yes').onclick=async()=>{$('cf-yes').disabled=true;
   catch(err){$('cf-err').textContent='request failed'} finally{$('cf-yes').disabled=false}};
 async function refresh(){
   const [st, stats] = await Promise.all([
-    fetch('/rotate/status',{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'}).then(r=>r.json()),
-    fetch('/rotate/stats',{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'}).then(r=>r.json())]);
+    panelFetch('/rotate/status').then(r=>r.json()), panelFetch('/rotate/stats').then(r=>r.json())]);
   const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{}); ST=st;
   const names=accts.map(([n])=>n), i=names.indexOf(st.active_account), nxt=names.slice(i+1).concat(names.slice(0,i+1)).find(n=>n!==st.active_account&&usable(st.accounts[n]));
   $('host').textContent=location.host||'';
@@ -1718,11 +1876,9 @@ async function refresh(){
       +(name!==st.active_account?`<button class="linkbtn" data-sw="${esc(name)}"${usable(a)?'':' disabled title="disabled or at a switch threshold"'}>Select</button>`:st.pinned===name?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
       +meter('5h',u5,st.switch_threshold,a.reset_5h_in_min>0?'resets in '+dur(a.reset_5h_in_min*60):'window idle')
       +meter('7d',u7,st.switch_threshold_7d,a.reset_7d_in_h>0?'resets in '+dur(a.reset_7d_in_h*H):'window idle')+'</div>'}).join('');
-  $('oai').innerHTML=Object.entries(st.providers||{}).filter(([,p])=>p.kind==='openai-siwc').map(([n,p])=>quotas(n,p)).join('');
-  const sc=$('wk-scroll'), keep=sc&&sc.scrollWidth?sc.scrollWidth-sc.clientWidth-sc.scrollLeft:null;  // keep the view across redraws
-  $('weekly').innerHTML=weekly(wk);
+  refreshQuotaCards(st);
+  refreshWeekly(wk);
   $('billing').innerHTML=billing(stats.billing);
-  const nsc=$('wk-scroll'); if(nsc&&WK) nsc.scrollLeft=keep==null?WK.start:nsc.scrollWidth-nsc.clientWidth-keep;
   // devices: configured ones, then removed ones that still have history
   const roster=stats.devices||{}, gone=Object.keys((per.all||{}).device||{}).filter(n=>!(n in roster)&&n!=='?');
   let dh=`<tr><th>Device</th><th class="l">Status</th><th class="l">Last model</th><th>24 h</th><th>7 d</th><th>30 d</th><th>All time${per.since?' <span class="muted">since '+esc(per.since)+'</span>':''}</th><th>30-day trend</th></tr>`;
@@ -1744,6 +1900,8 @@ async function refresh(){
   $('upd').textContent='updated '+new Date().toLocaleTimeString();
 }
 refresh(); setInterval(refresh, 10000);
+refreshQuotaHistory(); setInterval(refreshQuotaHistory, 60000);
+window.addEventListener('resize',resizeQuotaPlots);
 </script></body></html>"""
 
 
