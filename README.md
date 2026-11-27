@@ -577,18 +577,16 @@ SECURITY.md before turning them on.
    Do not run `codex logout` in that directory: it revokes the login. The installer
    keeps the two tokens, the client and account ids and the expiry, nothing else.
 2. Add `"images": true` to the provider entry and run `claude-rotate-admin activate`.
-3. In each Codex that should make images, two more lines in `config.toml`:
+3. In each Codex that should make images and search the web, one more line in `config.toml`:
    ```toml
-   web_search = "disabled"              # top level
-
    [model_providers.gateway]
    # ... as above, plus:
    http_headers = { "x-openai-actor-authorization" = "claude-rotate" }
    ```
-   Codex offers `image_gen` to a provider of its own only when that header is set
-   (any value, stripped before forwarding). The header also enables the web
-   search tool. After a live search succeeds through the gateway, you can drop
-   `web_search = "disabled"`.
+   Codex offers `image_gen` and its web search tool to a provider of its own only
+   when that header is set (any value, stripped before forwarding). Both go through
+   the Codex login (web search checked live on 2026-11-27). To keep a team off the
+   web, add `web_search = "disabled"` at the top level.
 
 Codex resends each generated image (about 1.3 MB of base64 for a 1536x1024 PNG) with
 every later request of its thread, so under a provider with images the request
