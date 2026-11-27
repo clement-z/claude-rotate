@@ -3,6 +3,8 @@ config.json
 tokens/
 *.token
 state.json
+ratelimit_headers.json
+.ratelimit_headers.*.tmp
 logs/
 __pycache__/
 *.pyc

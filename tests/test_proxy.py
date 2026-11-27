@@ -46,6 +46,8 @@ def fresh_state(active="a", accounts=None):
     R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
                "last_switch_ts": 0}
     R.LAST_BLOCKED_ACCOUNT.clear()
+    R.LATEST_RATELIMITS.clear()
+    R.RATELIMIT_HEADERS_DIRTY = False
     R.AUDIT_PATH.write_text("")
 
 
@@ -279,14 +281,15 @@ check("the first weekly-only Opus stream records headers even after Fable was ob
 call()
 check("stable weekly-only Opus answers omit the raw snapshot",
       "ratelimit" not in audit_recs()[-1] and audit_recs()[-1]["util"] == {"7d": 0.2})
-extra = {f"anthropic-ratelimit-unified-added-{i}-utilization": "0.30" for i in range(40)}
+extra = {f"anthropic-ratelimit-unified-added-{i:02}-utilization": "0.30" for i in range(30)}
 extra["anthropic-ratelimit-unified-invalid-utilization"] = "NaN"
 extra["anthropic-ratelimit-unified-negative-utilization"] = "-1"
 use_upstream(lambda req: httpx.Response(200, json={}, headers=unified(u5=None, u7="0.0", **extra)))
 call()
+extra = dict(reversed(list(extra.items())))
 call()
 changed, stable = audit_recs()[-2:]
-check("claim-set changes log once and utilization has valid bounded samples including zero",
+check("claim-set changes log once despite header reordering at the cap, and utilization is valid",
       "ratelimit" in changed and "ratelimit" not in stable and changed["util"] == stable["util"]
       and stable["util"]["7d"] == 0 and len(stable["util"]) == 1 + R.MAX_LEARNED_CLAIMS
       and not ({"invalid", "negative"} & stable["util"].keys()))
@@ -346,7 +349,39 @@ check("OpenAI chat still maps exhaustion to 503 and audits the upstream 429 and 
 answer = call("/rotate/ratelimits", method="GET").json()["latest_ratelimits"]["a"]["claude-opus-5"]
 check("the latest table records chat 429s at the actual upstream path",
       answer["status"] == 429 and answer["path"] == "/v1/messages" and answer["headers"] == rec["ratelimit"]
-      and answer["time"] <= time.time())
+      and answer["time"] == rec["rate_limits"][0]["at"] <= time.time())
+
+fresh_state()
+seen_models = []
+
+
+def numeric_model(req):
+    seen_models.append(json.loads(req.content)["model"])
+    return httpx.Response(400, json={"error": {"message": "invalid model"}})
+
+
+use_upstream(numeric_model)
+r = call(chat, body=chat_body | {"model": 123})
+check("a numeric chat model retains upstream 400 and uses the missing-model diagnostic bucket",
+      seen_models == [123] and r.status_code == 400 and r.json()["error"]["message"] == "upstream: invalid model"
+      and R.LATEST_RATELIMITS["a"][""]["status"] == 400 and audit_recs()[-1]["util"] == {})
+before_errors = R.STORAGE_ERRORS.get("ratelimit_diagnostics", {}).get("count", 0)
+with patch.object(R, "remember_ratelimits", side_effect=RuntimeError("diagnostic fault")):
+    r = call(chat, body=chat_body | {"model": 123})
+check("diagnostic failures are reported and preserve the upstream response",
+      r.status_code == 400 and R.STORAGE_ERRORS["ratelimit_diagnostics"]["count"] == before_errors + 1)
+
+now = time.time()
+fresh_state("a", {"a": {"claims": {"7d_oi": {"utilization": 0.9, "reset": now - 60}}}})
+use_upstream(lambda req: httpx.Response(429, json={"error": returned_error},
+                                        headers=unified(u5=None, oi_status="rejected")))
+with patch.dict(R.CFG, {"account_pins": {"laptop": {"account": "a", "mode": "strict"}}}):
+    r = call(body={"model": "claude-fable-5"})
+status = call("/rotate/status", method="GET").json()["accounts"]["a"]
+claim = status["claims"]["7d_oi"]
+check("a Fable rejection after reset still reports its active recheck block",
+      r.status_code == 429 and claim["freshness"] == "awaiting_reading" and claim["block_reason"] == "rejected"
+      and now < claim["blocked_until"] <= time.time() + R.RECHECK_S and not status["eligible_by_family"]["fable"])
 
 fresh_state()
 use_upstream(lambda req: httpx.Response(429, json={"error": burst_error},
@@ -742,6 +777,17 @@ check("a weekly-only Haiku idle probe retires 5h and keeps family-specific claim
       and info["learned_claims"] == {"default": ["ordinary"]}
       and info["last_success_claims"] == {"default": ["5h", "ordinary"]})
 
+reset = time.time() + 600
+fresh_state("a", {"a": {"claims": {"5h": {"utilization": 1, "reset": reset}}}})
+use_upstream(lambda req: httpx.Response(200, json={}, headers=unified(u5=None)))
+with patch.dict(R.CFG, {"account_pins": {"laptop": {"account": "a", "mode": "strict"}}}):
+    for path, method in (("/v1/messages/count_tokens", "POST"), ("/v1/models", "GET")):
+        assert call(path, method=method).status_code == 200
+        assert R.claim_reading("a", "5h") == {"utilization": 1, "reset": reset}
+    assert call().status_code == 200
+check("only inference can retire the 5h block after count_tokens and metadata report weekly usage",
+      "5h" not in R.STATE["accounts"]["a"]["claims"])
+
 fresh_state(active="a", accounts={"a": {"last_seen": time.time()}, "b": {}})
 R._REFRESH_TRIED.clear()
 probes.clear()
@@ -751,8 +797,8 @@ asyncio.run(R.refresh_idle_accounts())
 check("headerless 429 (retired model) neither paces nor gets retried before the interval",
       "pace_until" not in R.STATE["accounts"].get("b", {}) and len(probes) == 1)
 check("even a headerless idle probe replaces the model's latest answer",
-      R.STATE["latest_ratelimits"]["b"][R.REFRESH_MODEL]["status"] == 429
-      and R.STATE["latest_ratelimits"]["b"][R.REFRESH_MODEL]["headers"] == {})
+      R.LATEST_RATELIMITS["b"][R.REFRESH_MODEL]["status"] == 429
+      and R.LATEST_RATELIMITS["b"][R.REFRESH_MODEL]["headers"] == {})
 
 # The table is bounded independently for each account and kept out of status.
 fresh_state()
@@ -761,13 +807,58 @@ for i in range(16):
     call(body={"model": f"claude-test-{i}"})
 call(body={"model": "claude-test-0"})
 long_model = "claude-test-" + "x" * 300
-with patch.object(R, "STATE_PATH", tmp / "diagnostic-state.json"), patch.object(R, "save_state", lambda: R.write_state(R.STATE)):
+snapshot_path = tmp / "ratelimit_headers.json"
+with patch.object(R, "STATE_PATH", tmp / "diagnostic-state.json"), patch.object(R, "RATELIMIT_HEADERS_PATH", snapshot_path), \
+     patch.object(R, "save_state", lambda: R.write_state(R.STATE)):
     call("/v1/messages?ignore=query-marker", body={"model": long_model})
-    saved = R.load_state()
-models = saved["latest_ratelimits"]["a"]
+    saved = json.loads(R.STATE_PATH.read_text())
+    check("answer writes do not save the latest table in either state or the snapshot",
+          "latest_ratelimits" not in saved and not snapshot_path.exists() and R.RATELIMIT_HEADERS_DIRTY)
+    R.save_ratelimit_headers()
+    assert snapshot_path.stat().st_mode & 0o777 == 0o600 and not R.RATELIMIT_HEADERS_DIRTY
+    with patch.object(Path, "replace", side_effect=AssertionError("clean snapshot was rewritten")):
+        R.save_ratelimit_headers()
+models = json.loads(snapshot_path.read_text())["a"]
 check("latest answers persist, evict by last use, cap model IDs and omit the query",
       len(models) == 16 and "claude-test-1" not in models and "claude-test-0" in models
       and long_model[:256] in models and models[long_model[:256]]["path"] == "/v1/messages")
+snapshot_path.write_text(json.dumps({"a": models, "removed": models}))
+with patch.object(R, "RATELIMIT_HEADERS_PATH", snapshot_path), patch.object(R, "LATEST_RATELIMITS", {}), \
+     patch.dict(R.CFG, {"configured_accounts": {"a", "b"}}):
+    R.load_ratelimit_headers()
+    assert R.LATEST_RATELIMITS == {"a": models} and R.RATELIMIT_HEADERS_DIRTY
+    with patch.object(Path, "replace", side_effect=OSError("failed replace")):
+        R.save_ratelimit_headers()
+    assert R.RATELIMIT_HEADERS_DIRTY and "removed" in json.loads(snapshot_path.read_text())
+
+    async def idle_task(*_):
+        await asyncio.Event().wait()
+
+    async def shutdown():
+        async with R.lifespan(None):
+            pass
+
+    with patch.object(R, "save_quota_history"), patch.object(R, "refresh_loop", idle_task), \
+         patch.object(R.providers, "maintain_loop", idle_task):
+        asyncio.run(shutdown())
+    check("snapshot load prunes removed accounts and shutdown retries a failed save",
+          json.loads(snapshot_path.read_text()) == {"a": models} and not R.RATELIMIT_HEADERS_DIRTY)
+    R.remember_ratelimits("a", "claude-tick", "/v1/messages", 200, {}, time.time())
+    sleeps = []
+
+    async def tick_sleep(seconds):
+        sleeps.append(seconds)
+        raise asyncio.CancelledError
+
+    with patch.multiple(R, REFRESH_IDLE_S=0, record_history=lambda now: None, save_rollup=lambda: None,
+                        save_quotas=lambda: None, save_quota_history=lambda now: None), \
+         patch.object(R.asyncio, "sleep", tick_sleep):
+        try:
+            asyncio.run(R.refresh_loop())
+        except asyncio.CancelledError:
+            pass
+    check("minute maintenance flushes the dirty snapshot",
+          sleeps == [60] and "claude-tick" in json.loads(snapshot_path.read_text())["a"])
 panel_status = call("/rotate/status", method="GET").json()
 check("status advertises the table without embedding its records",
       panel_status["ratelimits_available"] is True and "latest_ratelimits" not in json.dumps(panel_status))

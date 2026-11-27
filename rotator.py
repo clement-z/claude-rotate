@@ -81,6 +81,7 @@ async def lifespan(app):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         save_quota_history(time.time())
+        save_ratelimit_headers()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -365,6 +366,7 @@ def load_state() -> dict:
         "accounts": {name: {} for name in ACCOUNTS},
         "events": [],
     }
+    state.pop("latest_ratelimits", None)
     if "version" not in state:
         now = time.time()
         for info in state["accounts"].values():
@@ -732,7 +734,7 @@ def claim_field(field: str, value: str) -> float | str | None:
 def parse_claims(headers: httpx.Headers, existing: dict) -> dict:
     claims = {}
     learned_count = 0
-    for name, value in headers.items():
+    for name, value in sorted(headers.items()):
         match = CLAIM_HEADER.fullmatch(name.lower())
         if not match:
             continue
@@ -752,19 +754,80 @@ def parse_claims(headers: httpx.Headers, existing: dict) -> dict:
     return claims
 
 
-def remember_ratelimits(account: str, model: str | None, path: str, status: int, headers: dict, now: float) -> None:
-    models = STATE.setdefault("latest_ratelimits", {}).setdefault(account, {})
-    key = (model or "")[:256]
+RATELIMIT_HEADERS_PATH = STATE_PATH.with_name("ratelimit_headers.json")
+LATEST_RATELIMITS: dict = {}
+RATELIMIT_HEADERS_DIRTY = False
+MAX_RATELIMIT_MODELS = 16
+
+
+def remember_ratelimits(account: str, model, path: str, status: int, headers: dict, now: float) -> None:
+    global RATELIMIT_HEADERS_DIRTY
+    models = LATEST_RATELIMITS.setdefault(account, {})
+    key = model[:256] if isinstance(model, str) else ""
     models.pop(key, None)
     models[key] = {"time": now, "status": status, "path": path[:1024], "headers": headers}
-    while len(models) > 16:
+    while len(models) > MAX_RATELIMIT_MODELS:
         del models[next(iter(models))]
+    RATELIMIT_HEADERS_DIRTY = True
+
+
+def load_ratelimit_headers() -> None:
+    global RATELIMIT_HEADERS_DIRTY
+    try:
+        saved = json.loads(RATELIMIT_HEADERS_PATH.read_text())
+        if not isinstance(saved, dict):
+            raise ValueError("expected an account mapping")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, RecursionError) as exc:
+        storage_error("ratelimit_headers_load", exc)
+        return
+    for name in CFG["configured_accounts"]:
+        if not isinstance(models := saved.get(name), dict):
+            continue
+        valid = {}
+        for model, row in models.items():
+            if (not isinstance(row, dict) or not providers.number(row.get("time")) or row["time"] < 0
+                    or type(row.get("status")) is not int or not 100 <= row["status"] <= 599
+                    or not isinstance(row.get("path"), str) or not isinstance(row.get("headers"), dict)):
+                continue
+            headers = {key[:100]: value[:200] for key, value in list(row["headers"].items())[:40]
+                       if isinstance(value, str)}
+            valid[model[:256]] = dict(time=row["time"], status=row["status"], path=row["path"][:1024], headers=headers)
+        if valid:
+            LATEST_RATELIMITS[name] = dict(sorted(valid.items(), key=lambda pair: pair[1]["time"])[-MAX_RATELIMIT_MODELS:])
+    RATELIMIT_HEADERS_DIRTY = saved != LATEST_RATELIMITS
+
+
+def save_ratelimit_headers() -> None:
+    global RATELIMIT_HEADERS_DIRTY
+    if not RATELIMIT_HEADERS_DIRTY:
+        return
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=RATELIMIT_HEADERS_PATH.parent,
+                                         prefix=".ratelimit_headers.", suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            json.dump(LATEST_RATELIMITS, f)
+        tmp.replace(RATELIMIT_HEADERS_PATH)
+    except (OSError, ValueError, TypeError, RecursionError) as exc:
+        storage_error("ratelimit_headers_write", exc)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    else:
+        RATELIMIT_HEADERS_DIRTY = False
+
+
+load_ratelimit_headers()
 
 
 def audit_claude_answer(rec: dict, account: str, family: str | None, reported: dict, headers: dict) -> None:
     claims = {}
     unfamiliar = 0
-    for claim, fields in reported.items():
+    for claim, fields in sorted(reported.items()):
         if not fields:
             continue
         if claim not in KNOWN_CLAIMS:
@@ -783,7 +846,21 @@ def audit_claude_answer(rec: dict, account: str, family: str | None, reported: d
     previous[scope] = claim_ids
 
 
-def observe_claims(info: dict, claims: dict, reported: dict, status: int, family: str | None, now: float) -> None:
+def record_ratelimit_diagnostics(account, model, path, status, headers, at, *, rec=None, family=None, reported=None):
+    if rec is not None:
+        rec["util"] = {}
+        rec.pop("ratelimit", None)
+    try:
+        raw = rate_limit_headers(headers)
+        if rec is not None:
+            audit_claude_answer(rec, account, family, reported, raw)
+        remember_ratelimits(account, model, path, status, raw, at)
+    except Exception as exc:
+        storage_error("ratelimit_diagnostics", exc)
+
+
+def observe_claims(info: dict, claims: dict, reported: dict, status: int, family: str | None, now: float,
+                   *, retire_shared: bool) -> None:
     if not reported:
         return
     info["claims"] = claims
@@ -791,7 +868,7 @@ def observe_claims(info: dict, claims: dict, reported: dict, status: int, family
     members = set(learned.get(family, ()))
     weekly = reported.get("7d", {})
     weekly_snapshot = "utilization" in weekly and weekly.get("reset", 0) > now
-    if 200 <= status < 300 and weekly_snapshot and "5h" not in reported:
+    if retire_shared and 200 <= status < 300 and weekly_snapshot and "5h" not in reported:
         claims.pop("5h", None)
     if family is not None and 200 <= status < 300:
         info.setdefault("last_success_claims", {})[family] = sorted(reported)
@@ -849,7 +926,8 @@ def aggregate_recheck(info: dict, headers: httpx.Headers, family: str, now: floa
 
 async def note_response(account: str, headers: httpx.Headers, status: int, *, family: str | None = "default",
                         repeated_burst: bool = False, policy: str = "automatic",
-                        model: str | None = None, path: str | None = None, rec: dict | None = None) -> str | None:
+                        model=None, path: str | None = None, rec: dict | None = None,
+                        received_at: float | None = None) -> str | None:
     """Observe headers once and classify an automatic 429 for its own family."""
     async with state_lock:
         info = STATE["accounts"].setdefault(account, {})
@@ -857,11 +935,11 @@ async def note_response(account: str, headers: httpx.Headers, status: int, *, fa
         claims = account_claims(info)
         reported = parse_claims(headers, claims)
         if path is not None:
-            raw = rate_limit_headers(headers)
-            remember_ratelimits(account, model, path, status, raw, now)
-            if rec is not None:
-                audit_claude_answer(rec, account, family, reported, raw)
-        observe_claims(info, claims, reported, status, family, now)
+            at = now if received_at is None else received_at
+            record_ratelimit_diagnostics(account, model, path, status, headers, at,
+                                         rec=rec, family=family, reported=reported)
+        observe_claims(info, claims, reported, status, family, now,
+                       retire_shared=family is not None or policy == "observe")
         aggregate = headers.get("anthropic-ratelimit-unified-status")
         if aggregate:
             info["status"] = aggregate
@@ -931,10 +1009,7 @@ async def refresh_idle_accounts() -> None:
             await note_response(name, r.headers, r.status_code, family=None, policy="observe",
                                 model=REFRESH_MODEL, path="/v1/messages")
         else:
-            async with state_lock:
-                remember_ratelimits(name, REFRESH_MODEL, "/v1/messages", r.status_code,
-                                    rate_limit_headers(r.headers), time.time())
-                save_state()
+            record_ratelimit_diagnostics(name, REFRESH_MODEL, "/v1/messages", r.status_code, r.headers, time.time())
             print(f"warning: usage refresh of {name}: HTTP {r.status_code} without usage headers",
                   file=sys.stderr)
 
@@ -948,6 +1023,7 @@ async def refresh_loop() -> None:
         save_rollup()
         save_quotas()
         save_quota_history(now)
+        save_ratelimit_headers()
         await asyncio.sleep(60)
 
 
@@ -1311,8 +1387,7 @@ async def rotate_quota_history(request: Request):
 async def rotate_ratelimits(request: Request):
     if not panel_allowed(request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
-    latest = STATE.get("latest_ratelimits", {})
-    return {"latest_ratelimits": {name: latest[name] for name in ACCOUNTS if name in latest}}
+    return {"latest_ratelimits": LATEST_RATELIMITS}
 
 
 @app.post("/rotate/switch")
@@ -2119,10 +2194,10 @@ function meter(label,u,thr,reset,block){
     +`<span>${u==null?'':`<b>${Math.round(u*100)}%</b> `}<span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
 const familyLabel=family=>family==='fable'?'Fable':'Default';
 function claimMeters(account,now){
-  const rows=Object.entries(account.claims||{}).filter(([,c])=>c.freshness!=='awaiting_reading').map(([id,c])=>{
+  const rows=Object.entries(account.claims||{}).filter(([,c])=>c.freshness!=='awaiting_reading'||c.block_reason).map(([id,c])=>{
     const meta=[];
     if(c.status&&c.status!=='allowed'&&!c.block_reason)meta.push(c.status);
-    if(c.reset)meta.push(c.reset>now?'resets in '+dur(c.reset-now):'reset '+when(c.reset));
+    if(c.reset>now)meta.push('resets in '+dur(c.reset-now));
     if(c.blocked_until&&c.blocked_until!==c.reset)meta.push('recheck '+when(c.blocked_until));
     if(c.seen_at&&account.last_seen-c.seen_at>600)meta.push('seen '+ago(Math.round((now-c.seen_at)/60)));
     return meter(esc(c.label||id),c.effective_utilization,c.threshold,esc(meta.filter(Boolean).join(' · ')),c.block_reason)});
@@ -2601,12 +2676,14 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
             if retrying:
                 retries += 1
             fwd_headers["authorization"] = f"Bearer {token}"
-            upstream = await client.send(
-                client.build_request(method, url, headers=fwd_headers, content=body), stream=True)
+            outbound = client.build_request(method, url, headers=fwd_headers, content=body)
+            upstream = await client.send(outbound, stream=True)
+            received_at = time.time()
             try:
                 verdict = await note_response(account, upstream.headers, upstream.status_code, family=family,
                                               repeated_burst=account in burst_accounts, policy=policy,
-                                              model=rec["model"], path=upstream.request.url.path, rec=rec)
+                                              model=rec["model"], path=outbound.url.path, rec=rec,
+                                              received_at=received_at)
             except BaseException:
                 await upstream.aclose()
                 raise
@@ -2615,9 +2692,13 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
             if policy == "strict":
                 verdict = "strict"
             retry_after = upstream.headers.get("retry-after")
-            entry = {"account": account, "verdict": verdict,
+            entry = {"account": account, "verdict": verdict, "at": received_at,
                      "retry_after": retry_after[:200] if retry_after is not None else None,
-                     "headers": rate_limit_headers(upstream.headers)}
+                     "headers": {}}
+            try:
+                entry["headers"] = rate_limit_headers(upstream.headers)
+            except Exception as exc:
+                storage_error("ratelimit_diagnostics", exc)
             entries = rec.setdefault("rate_limits", [])
             if len(entries) < MAX_RATE_LIMIT_ATTEMPTS:
                 entries.append(entry)

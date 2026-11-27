@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -376,6 +377,12 @@ def test_status_live_query_uses_header(f):
         assert "acct-2, strict (config)" in offline.stdout
         assert "auto until restart (runtime)" in human.stdout
 
+        live_claims["7d_oi"].update(reset=now-60, freshness="awaiting_reading",
+                                     effective_utilization=None, blocked_until=now+300)
+        human = f.run("status")
+        assert human.returncode == 0 and "Fable 7d: rejected, recheck in " in human.stdout, human
+        assert "Fable 7d: 100%" not in human.stdout
+
         # Partial readings and malformed optional fields are diagnostic data.
         del live_claims["7d"]["families"]
         live_claims["learned"].update(families=7, effective_utilization="???", status=False, freshness=None)
@@ -484,8 +491,11 @@ def test_ratelimits_live_offline_and_rotated(f):
         cfg = f.cfg()
         cfg["port"] = server.server_address[1]
         f.config.write_text(json.dumps(cfg))
-        write_state(f, {"latest_ratelimits": {"acct-1": {"claude-opus-5":
-                       {"time": now, "status": 200, "path": "/v1/messages", "headers": {"unified-status": "allowed"}}}}})
+        f.state_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = f.state_dir / "ratelimit_headers.json"
+        snapshot.write_text(json.dumps({"acct-1": {"claude-opus-5":
+                            {"time": now, "status": 200, "path": "/v1/messages",
+                             "headers": {"unified-status": "allowed"}}}}))
         audit.with_suffix(".jsonl.2").write_text(record("oldest", "old", "older"))
         audit.with_suffix(".jsonl.1").write_text(record("rotated", padding="x" * 80_000))
         audit.write_text(record("retry", "returned") + '{"status":429}\n{truncated\n')
@@ -520,11 +530,26 @@ def test_ratelimits_live_offline_and_rotated(f):
         offline = f.run("ratelimits", "--json", "--last", "3")
         assert offline.returncode == 0, offline
         report = json.loads(offline.stdout)
-        assert report["source"] == "state.json" and list(report["latest_ratelimits"]["acct-1"]) == ["claude-opus-5"]
+        assert report["source"] == "ratelimit_headers.json" and "up to a minute old" in report["detail"]
+        assert list(report["latest_ratelimits"]["acct-1"]) == ["claude-opus-5"]
         assert report["rate_limits"] == entries[:3]
         rotated = f.run("ratelimits", "--json", "--last", "100")
         assert rotated.returncode == 0, rotated
         assert len(json.loads(rotated.stdout)["rate_limits"]) == 6
+
+        def timed_record(label, at):
+            row = json.loads(record(label))
+            row["rate_limits"][0]["at"] = at
+            return json.dumps(row) + "\n"
+
+        newer_at = 1_800_000_000.125
+        audit.with_suffix(".jsonl.1").write_text(timed_record("newer answer", newer_at))
+        audit.write_text(timed_record("earlier answer that finished later", newer_at - 600))
+        reordered = f.run("ratelimits", "--json", "--last", "1")
+        assert reordered.returncode == 0, reordered
+        entry = json.loads(reordered.stdout)["rate_limits"][0]
+        assert entry["error"]["message"] == "newer answer"
+        assert datetime.fromisoformat(entry["time"]).timestamp() == newer_at
 
         with audit.open("wb") as stream:
             stream.truncate(33 * 1024 * 1024)
@@ -535,8 +560,16 @@ def test_ratelimits_live_offline_and_rotated(f):
 
         for path in audit.parent.glob("audit.jsonl*"):
             path.unlink()
+        audit.write_text(record("valid but oversized", padding="x" * (1024 * 1024)) * 2)
+        skipped = f.run("ratelimits", "--json")
+        assert skipped.returncode == 0, skipped
+        report = json.loads(skipped.stdout)
+        assert report["audit_skipped_lines"] == 2 and not report["rate_limits"]
+        human = f.run("ratelimits")
+        assert "Skipped 2 oversized audit line(s)" in human.stdout and "No 429s found in scanned lines" in human.stdout
+        audit.unlink()
         empty = f.run("ratelimits")
-        assert empty.returncode == 0 and "No 429s found" in empty.stdout and "(state.json)" in empty.stdout
+        assert empty.returncode == 0 and "No 429s found" in empty.stdout and "(ratelimit_headers.json)" in empty.stdout
     finally:
         server.shutdown()
         server.server_close()

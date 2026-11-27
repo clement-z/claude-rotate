@@ -230,6 +230,12 @@ elements.tip.parentNode=new Element();
   assert.equal(claims.match(/rejected/g)?.length,1);
   assert(!claims.includes('limit reached')&&!claims.includes('blocked'));
   assert(!claims.includes('>5h<')&&!claims.includes('<b>0%</b>'),'absent and expired usage do not show zero');
+  Object.assign(status.accounts[value].claims['7d_oi'],{effective_utilization:null,freshness:'awaiting_reading',
+    reset:receipt-60,blocked_until:receipt+300});
+  await timers.get(10000)();
+  const recheck=elements.accounts.innerHTML;
+  assert(recheck.includes('Fable 7d')&&recheck.includes('rejected')&&recheck.includes('recheck')
+    &&!recheck.includes('<b>100%</b>'),'an active block still renders without stale utilization');
   const pills=elements.pills.innerHTML;
   assert(pills.includes('Default: ')&&pills.includes('Fable: ')&&pills.includes('&lt;/mark&gt;2</span>'));
   assert(elements.devices.innerHTML.includes('strict (config)')&&elements.devices.innerHTML.includes('data-pin='));

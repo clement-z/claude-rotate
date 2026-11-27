@@ -16,6 +16,7 @@ import errno
 import fcntl
 import getpass
 import grp
+import heapq
 import json
 import math
 import os
@@ -31,6 +32,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 PREFIX = os.environ.get("CLAUDE_ROTATE_PREFIX", "")
@@ -45,6 +47,7 @@ CONFIG = ETC / "config.json"
 TOKENS = ETC / "tokens"
 STATE_DIR = P("/var/lib/claude-rotate")
 STATE = STATE_DIR / "state.json"
+RATELIMIT_HEADERS = STATE_DIR / "ratelimit_headers.json"
 AUDIT_PATH = P("/var/log/claude-rotate/audit.jsonl")
 AUDIT_TAIL_BYTES = 32 * 1024 * 1024
 AUDIT_TAIL_BACKUPS = 32
@@ -1459,10 +1462,11 @@ def fmt_duration(seconds):
 def claim_line(claim, last_seen, now):
     utilization = claim["effective_utilization"]
     status = claim["status"]
-    if claim["freshness"] == "awaiting_reading" or (utilization is None and not status and not claim["block_reason"]):
+    reason = claim["block_reason"]
+    if not reason and (claim["freshness"] == "awaiting_reading" or (utilization is None and not status)):
         return None
     fields = [f"{utilization:.0%} used"] if utilization is not None else []
-    reason = claim["block_reason"] or status
+    reason = reason or status
     if reason and reason != "allowed":
         fields.append(reason)
     if claim["reset"] and claim["reset"] > now:
@@ -1585,7 +1589,7 @@ def cmd_status(args) -> int:
 
 
 def audit_tail(stream, end, size):
-    """Yield complete lines in reverse order, joining lines split across reads."""
+    """Yield complete lines in reverse order, using None for an oversized line."""
     start = end - size
     pending = b""
     while end > start:
@@ -1596,11 +1600,13 @@ def audit_tail(stream, end, size):
         if len(parts) > 1:
             if pending is not None and len(parts[-1]) + len(pending) <= AUDIT_TAIL_LINE_BYTES:
                 yield parts[-1] + pending
+            else:
+                yield None
             yield from reversed(parts[1:-1])
             pending = parts[0]
         elif pending is not None:
             pending = parts[0] + pending if len(parts[0]) + len(pending) <= AUDIT_TAIL_LINE_BYTES else None
-    if not start and pending:
+    if pending is None or (not start and pending):
         yield pending
 
 
@@ -1613,14 +1619,32 @@ def header_view(headers):
             if isinstance(value, str)}
 
 
+def attempt_time(entry, record):
+    at = state_number(entry.get("at"))
+    if at is not None:
+        try:
+            return at, datetime.fromtimestamp(at).astimezone().isoformat(timespec="milliseconds")
+        except (ValueError, OverflowError, OSError):
+            pass
+    timestamp = entry_text(record.get("ts"), 40)
+    if timestamp:
+        try:
+            return datetime.fromisoformat(timestamp).timestamp(), timestamp
+        except (ValueError, OverflowError, OSError):
+            pass
+    return -1, timestamp
+
+
 def recent_rate_limits(count):
     attempts = []
+    skipped = 0
+    sequence = 0
     if not count:
-        return attempts, False
+        return attempts, False, skipped
     try:
         directory = os.open(AUDIT_PATH.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return attempts, False
+        return attempts, False, skipped
     remaining = AUDIT_TAIL_BYTES
     seen_files = set()
     try:
@@ -1640,6 +1664,9 @@ def recent_rate_limits(count):
                 seen_files.add(inode)
                 size = min(info.st_size, remaining)
                 for line in audit_tail(stream, info.st_size, size):
+                    if line is None:
+                        skipped += 1
+                        continue
                     if b'"rate_limits"' not in line:
                         continue
                     try:
@@ -1652,9 +1679,13 @@ def recent_rate_limits(count):
                     for entry in reversed(entries[-10:]):
                         if not isinstance(entry, dict):
                             continue
+                        at, timestamp = attempt_time(entry, record)
+                        sequence -= 1
+                        if len(attempts) == count and at <= attempts[0][0]:
+                            continue
                         error = object_fields(entry.get("error"))
-                        attempts.append({
-                            "time": entry_text(record.get("ts"), 40),
+                        row = {
+                            "time": timestamp,
                             "device": entry_text(record.get("device"), 64),
                             "model": entry_text(record.get("model"), 256),
                             "account": entry_text(entry.get("account"), 64),
@@ -1663,15 +1694,18 @@ def recent_rate_limits(count):
                             "headers": header_view(entry.get("headers")),
                             "error": {k: entry_text(error[k], cap) for k, cap in (("type", 100), ("message", 300))
                                       if isinstance(error.get(k), str)},
-                        })
-                        if len(attempts) == count:
-                            return attempts, False
+                        }
+                        item = (at, sequence, row)
+                        if len(attempts) < count:
+                            heapq.heappush(attempts, item)
+                        else:
+                            heapq.heapreplace(attempts, item)
                 remaining -= size
                 if not remaining:
-                    return attempts, True
+                    break
     finally:
         os.close(directory)
-    return attempts, False
+    return [row for _, _, row in sorted(attempts, reverse=True)], remaining == 0, skipped
 
 
 def latest_ratelimits(cfg):
@@ -1687,12 +1721,16 @@ def latest_ratelimits(cfg):
                 return live["latest_ratelimits"], "live", None
             detail = detail or "the live rate-limit table is invalid"
     try:
-        state = read_state()
-    except Refused as exc:
-        return {}, "unavailable", str(exc)
-    if state is not None and isinstance(state.get("latest_ratelimits"), dict):
-        return state["latest_ratelimits"], "state.json", detail
-    return {}, "unavailable", detail or "state.json has no rate-limit table yet"
+        refuse_symlink(RATELIMIT_HEADERS, "rate-limit snapshot")
+        saved = json.loads(RATELIMIT_HEADERS.read_text())
+        if not isinstance(saved, dict):
+            raise ValueError("expected an account mapping")
+    except FileNotFoundError:
+        return {}, "unavailable", detail or "no rate-limit snapshot saved yet"
+    except (OSError, ValueError, RecursionError, Refused) as exc:
+        return {}, "unavailable", f"{RATELIMIT_HEADERS.name} is unreadable ({type(exc).__name__})"
+    age = "offline snapshot, normally up to a minute old"
+    return saved, RATELIMIT_HEADERS.name, f"{age}; {detail}" if detail else age
 
 
 def diagnostic_text(value):
@@ -1714,10 +1752,10 @@ def cmd_ratelimits(args) -> int:
                                             "path": entry_text(row.get("path"), 1024),
                                             "headers": header_view(row.get("headers"))}
                               for model, row in list(models.items())[-16:] if isinstance(row, dict)}
-    attempts, limited = recent_rate_limits(args.last)
+    attempts, limited, skipped = recent_rate_limits(args.last)
     if args.json:
         out(json.dumps({"source": source, "detail": detail, "latest_ratelimits": accounts,
-                        "rate_limits": attempts, "audit_limited": limited}, indent=2))
+                        "rate_limits": attempts, "audit_limited": limited, "audit_skipped_lines": skipped}, indent=2))
         return EXIT_OK
     out(f"Latest rate-limit headers ({source})" + (f" — {detail}" if detail else ""))
     for account, models in accounts.items():
@@ -1729,6 +1767,8 @@ def cmd_ratelimits(args) -> int:
     if not accounts and source != "unavailable":
         out("  No answers recorded")
     out("Recent upstream 429s" + (" (audit scan limit reached)" if limited else ""))
+    if skipped:
+        out(f"  Skipped {skipped} oversized audit line(s)")
     for entry in attempts:
         out(diagnostic_text(f"{entry['time'] or '?'}  {entry['device'] or '?'} / {entry['model'] or '(no model)'}"
                             f" / {entry['account'] or '?'}  {entry['verdict'] or '?'}"
@@ -1738,7 +1778,7 @@ def cmd_ratelimits(args) -> int:
         for name, value in entry["error"].items():
             out("  " + diagnostic_text(f"{name}: {value}"))
     if not attempts:
-        out("  No 429s found" if args.last else "  Skipped (--last 0)")
+        out("  No 429s found in scanned lines" if args.last else "  Skipped (--last 0)")
     return EXIT_OK
 
 

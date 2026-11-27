@@ -403,8 +403,9 @@ with the device name to restore the configured choice.
 The audit trail in `logs/audit.jsonl` contains one JSON record per request.
 
 On either Claude endpoint, `rate_limits` lists upstream 429s, including ones
-the proxy retried. Each entry records the account, rotation verdict, raw
-`Retry-After`, rate-limit headers, and the upstream error type and message when
+the proxy retried. Each entry records when the headers arrived (`at`, in Unix
+seconds), the account, rotation verdict, raw `Retry-After`, rate-limit headers,
+and the upstream error type and message when
 available. The audit keeps the first nine and the latest attempt if there are
 more than ten, and counts omitted attempts in `rate_limits_omitted`.
 
@@ -423,9 +424,10 @@ the first Fable-only 429. Compare its headers and verdict with the latest
 Fable and default model answers to see which claim Anthropic reported.
 The command shows the latest answer per account and model, including idle
 probes, and five recent upstream 429 attempts by default. Use `--last` to
-change that count. The gateway saves the latest table with each existing
-atomic state write, keeping the 16 most recently seen models per account.
-The admin reads the table live or from `state.json` and identifies the source.
+change that count. The gateway keeps the 16 most recently seen models per
+account and saves the table separately in `ratelimit_headers.json` next to
+`state.json` during minute maintenance and on clean shutdown. The admin
+identifies its source. The offline snapshot is normally up to a minute old.
 See [deployment notes](deploy/README.md#runtime-and-operations).
 
 ## OpenAI-compatible endpoint
