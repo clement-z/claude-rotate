@@ -340,42 +340,52 @@ async def quota_rate_worker(c):
         "account": "acct", "path": "/v1/messages", "method": "POST", "model": "claude-opus-5",
         "util": {"7d": used}, "usage": {"output_tokens": 200_000},
     }) + "\n" for age, used in ((60, .1), (30, .2))))
+    bad_history = tmp / "unreadable-provider-history.json"
+    bad_history.write_text("{broken")
     loop = asyncio.get_running_loop()
     main_thread = threading.get_ident()
     resumed = asyncio.Event()
-    release = threading.Event()
+    stopped = asyncio.Event()
     threads = []
     original = R.compute_quota_rate
 
-    def compute():
-        threads.append(threading.get_ident())
+    def compute(stop):
+        threads.append((threading.get_ident(), threading.current_thread().daemon))
         if len(threads) == 2:
             raise RuntimeError("mock quota scan failure")
         if len(threads) == 3:
             loop.call_soon_threadsafe(resumed.set)
-            if not release.wait(3):
+            if not stop.wait(3):
                 raise RuntimeError("test did not release the quota worker")
-            return b'{"computed_at":1,"summary":[],"fits":[]}'
-        return original()
+            loop.call_soon_threadsafe(stopped.set)
+            raise R.quota_rate.ScanStopped
+        return original(stop)
 
     with patch.multiple(R, compute_quota_rate=compute, AUDIT_PATH=audit_path, STORAGE_ERRORS={},
-                        QUOTA_RATE_REPORT=b'{"computed_at":null,"summary":[],"fits":[]}'):
-        task = asyncio.create_task(R.quota_rate_loop(start_delay=0, interval=.01))
+                        QUOTA_HISTORY_PATH=bad_history, QUOTA_RATE_REPORT=R.QUOTA_RATE_REPORT):
+        response = await ask(c, "/rotate/quota-rate", "claude")
+        check("quota-rate says computing before the first report", response.json()["status"] == "computing")
+        stop = R.start_quota_rate_worker(start_delay=0, interval=.01)
         try:
             await asyncio.wait_for(resumed.wait(), 3)
             response = await asyncio.wait_for(ask(c, "/rotate/quota-rate", "claude"), 1)
             report = response.json()
             row = next(row for row in report["summary"] if row["account"] == "acct")
             check("quota-rate scans off the event loop and serves the last result while the next scan waits",
-                  len(threads) == 3 and main_thread not in threads and response.status_code == 200
+                  len(threads) == 3 and all(t != main_thread and daemon for t, daemon in threads)
+                  and response.status_code == 200 and report["status"] == "ready"
                   and response.headers["cache-control"] == "no-store" and report["computed_at"] > 0
                   and row["usd_per_percent"]["median"] == .5 and row["samples"] == 1)
             check("a failed quota-rate scan records a storage error and the loop retries",
                   R.STORAGE_ERRORS.get("quota_rate", {}).get("count") == 1)
+            check("a damaged OpenAI history keeps the Claude summary and adds a source error",
+                  report["source_errors"] == {"openai": [f"{bad_history.name} could not be read"]}
+                  and R.STORAGE_ERRORS.get("quota_rate_openai", {}).get("count") == 1)
         finally:
-            release.set()
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            stop.set()
+        await asyncio.wait_for(stopped.wait(), 1)
+        check("stopping the quota worker leaves its last report intact",
+              (await ask(c, "/rotate/quota-rate", "claude")).json() == report)
 
 
 async def reporting(c):

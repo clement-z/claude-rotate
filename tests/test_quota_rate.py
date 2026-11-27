@@ -10,9 +10,12 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 
 ROOT = Path(__file__).resolve().parent.parent
 HOUR = 3600
+sys.path.insert(0, str(ROOT))
+import quota_rate
 
 
 def check(label, condition):
@@ -79,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
                   usage=None, bytes=1000),
         audit_row(-11, **fable, util={"7d": .20, "7d_oi": .15, "learned": .20}),
         audit_row(-8, util={"7d": .90}, ratelimit={"unified-7d-reset": str(at(158))}),
-        audit_row(-5, util={"7d": .95}),
+        audit_row(-1, util={"7d": .95}),
         audit_row(-4, account="b", util={"7d": .03}),
     ])
     (state / "usage_history.json").write_text(json.dumps([
@@ -105,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
           and general["intervals"] == 7 and general["cost_intervals"] == 6)
     check("mid-window drop and scheduled reset split intervals, even when usage rises across the reset",
           general["usd_per_percent"] == {"median": .75, "q1": .5, "q3": 1}
-          and general["latest"] == {"at": at(-5), "used_percent": 95, "reset": at(158)})
+          and general["latest"] == {"at": at(-1), "used_percent": 95, "reset": at(158)})
     check("outside rise uses independently sampled intervals",
           general["sampled_intervals"] == 3 and general["outside_intervals"] == 1
           and math.isclose(general["outside_share"], 1 / 3))
@@ -114,7 +117,8 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
                                    "fable_usd_per_percent": .5, "other_usd_per_percent": 1.0})
     check("time left adds each segment's rise inside the last 24 h and excludes reset jumps",
           general["remaining"]["percent"] == 5 and general["remaining"]["usd"] == 3.75
-          and general["remaining"]["pace_points_per_day"] == 40 and general["remaining"]["hours"] == 3)
+          and general["remaining"]["pace_points_per_day"] == 45
+          and math.isclose(general["remaining"]["hours"], 5 / 3, abs_tol=.01))
     fable_week = rows["a", "7d_oi"]
     check("Fable weekly and an additional Fable claim include only their reporting family",
           fable_week["intervals"] == 2 and fable_week["cost_intervals"] == 2
@@ -148,7 +152,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
               "usd_per_percent": {"median": .75, "q1": .5, "q3": 1},
               "output_tokens_per_percent": general["tokens_per_percent"]["output_tokens"], "usd_left": 3.75,
               "time_left": {k: general["remaining"][k] for k in
-                            ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day")},
+                            ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day", "stale", "exhausts_at")},
               "samples": 6,
           })
 
@@ -157,7 +161,7 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     table, sep, details = summary_output.partition("\nclaude a / 7d")
     check("the summary table precedes the details and the fit displays dollars per point",
           r.returncode == 0 and sep and "Account" in table and "Samples" in table
-          and all(label in table for label in ("Fable 7d", "codex 7d", "images 24h", "3.00 h"))
+          and all(label in table for label in ("Fable 7d", "codex 7d", "images 24h", "1.67 h"))
           and "Fable $0.50 per 1%, other $1.00 per 1% (n=6)" in details)
 
     r = run("--days", "1", "--min-step", "25")
@@ -265,14 +269,15 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     general = next(row for row in report["series"] if row["name"] == "a" and row["limit"] == "7d")
     check("a long stream does not extend coverage past the earliest retained completion",
           report["audit"]["from"] == at(-18) and general["sampled_intervals"] == 1
-          and general["cost_intervals"] == 1 and general["remaining"]["hours"] == 28)
+          and general["cost_intervals"] == 1 and general["remaining"]["stale"])
 
     save_rows(audit, [
         audit_row(-22, util={"7d": .10}),
         audit_row(-21, model=fable["model"], output=25_000, util={"7d": .15}),
-        audit_row(-20, model=fable["model"], output=50_000, util={"7d_oi": .10}),
+        audit_row(-20, model=fable["model"], output=50_000),
         audit_row(-19, output=40_000, util={"7d": .20}),
-        audit_row(-18, model=fable["model"], output=0, util={"7d_oi": .11}),
+        audit_row(-2.5, model=fable["model"], output=0, util={"7d_oi": .10}),
+        audit_row(-.5, model=fable["model"], output=0, util={"7d_oi": .11}),
     ])
     (state / "usage_history.json").write_text(json.dumps([
         {"ts": at(h), "accounts": {"b": [used, at(105.6)]}}
@@ -281,15 +286,60 @@ with tempfile.TemporaryDirectory(prefix="quota-rate-test-") as scratch:
     rows = rows_for()
     b = rows["b", "7d"]
     check("sub-threshold readings project past the reset without any priced intervals",
-          b["cost_intervals"] == 0 and b["remaining"]["hours"] == 1980
+          b["cost_intervals"] == 0 and math.isclose(b["remaining"]["hours"], 1978, abs_tol=.01)
           and b["remaining"]["lasts_until_reset"] and b["remaining"]["usd"] is None)
     r = run()
     projection_output = r.stdout
     check("the report caps time at the reset and uses days for uncapped projections over 48 hours",
           r.returncode == 0 and "won't run out before the reset in 4.40 d" in projection_output
-          and "Time left at the last 24 h quota pace: 7.42 d" in projection_output
-          and "1980.00 h" not in projection_output and "178.00 h" not in projection_output)
+          and "Time left at the last 24 h quota pace: 7.40 d" in projection_output
+          and "1978.00 h" not in projection_output and "177.50 h" not in projection_output)
     fit = rows["a", "7d"]["fable_fit"]
     check("a non-positive fit coefficient keeps raw JSON coefficients and makes the estimate unavailable",
           fit["a"] == 5 and fit["b"] == -5 and fit["fable_usd_per_percent"] is None
           and fit["other_usd_per_percent"] is None and "7d fit: not enough data (n=2)" in projection_output)
+
+    fit = quota_rate.fit_fable([(.1, .5, 5), (2, 1, 10)])
+    check("a near-zero coefficient from floating-point noise is not inverted",
+          abs(fit["a"]) < 1e-12 and fit["b"] > 0 and fit["fable_usd_per_percent"] is None)
+    fit = quota_rate.fit_fable([(1, 1, 10), (1.1, 1, 10.5)])
+    check("positive coefficients are insufficient when Fable's share barely changes",
+          fit["a"] > 0 and fit["b"] > 0 and fit["other_usd_per_percent"] is None)
+
+    (state / "usage_history.json").unlink()
+    save_rows(audit, [
+        audit_row(-23.5, model=fable["model"], util={"7d_oi": .55},
+                  ratelimit={"unified-7d_oi-reset": str(at(-10))}),
+        audit_row(-22.5, model=fable["model"], util={"7d_oi": .65}),
+        audit_row(-7, util={"7d": .10}),
+        audit_row(-6, util={"7d": .20}),
+        audit_row(-3, account="b", model=fable["model"], util={"7d_oi": .80, "7d": .88},
+                  ratelimit={"unified-7d_oi-reset": str(at(2))}),
+        audit_row(-2, account="b", model=fable["model"], util={"7d_oi": .85, "7d": .95}),
+        audit_row(-1.5, model=fable["model"], util={"7d_oi": .10},
+                  ratelimit={"unified-7d_oi-reset": str(at(10))}),
+        audit_row(-.5, model=fable["model"], util={"7d_oi": .20}),
+    ])
+    rows = rows_for()
+    remaining = rows["b", "7d_oi"]["remaining"]
+    check("exhaustion is projected from the last reading and compared with now and reset",
+          remaining["exhausts_at"] == at(1) and math.isclose(remaining["hours"], 1, abs_tol=.01)
+          and not remaining["lasts_until_reset"] and rows["b", "7d"]["remaining"]["hours"] == 0)
+    remaining = rows["a", "7d_oi"]["remaining"]
+    check("two one-hour rises across a 21-hour reset gap give 240 points a day",
+          remaining["pace_points_per_day"] == 240 and math.isclose(remaining["hours"], 7.5, abs_tol=.01))
+    remaining = rows["a", "7d"]["remaining"]
+    check("a projection from a reading over four hours old is marked stale",
+          remaining["stale"] and remaining["hours"] is None and "projection stale" in run().stdout)
+
+    stop = Event()
+    lines = quota_rate.audit_log_lines(audit, {}, stop)
+    next(lines)
+    stop.set()
+    try:
+        next(lines)
+    except quota_rate.ScanStopped:
+        cancelled = True
+    else:
+        cancelled = False
+    check("the audit reader checks the stop flag before the next line", cancelled)

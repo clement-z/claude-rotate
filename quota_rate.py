@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import stat
+from array import array
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -22,9 +23,12 @@ CLAUDE_PATHS = ("/v1/messages", "/v1/chat/completions")
 OPENAI_ENDPOINTS = ("v1/responses", "v1/chat/completions")
 RESET_TOLERANCE = 60
 DROP_NOISE = 1
+PROJECTION_STALE_S = 4 * 3600
+MIN_FABLE_SHARE_SPREAD = .10
+MAX_FIT_DOLLARS_PER_POINT = 1_000_000
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Reading:
     at: float
     percent: float
@@ -33,12 +37,62 @@ class Reading:
     completion_time: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RequestUsage:
     at: float
     tokens: tuple | None
     cost: float | None
     fable: bool
+
+
+class ReadingSeries:
+    """Store readings in packed columns and unpack only the series being reported."""
+
+    def __init__(self):
+        self.times = array("d")
+        self.values = array("d")
+        self.resets = None
+        self.flags = bytearray()
+
+    def __len__(self):
+        return len(self.times)
+
+    def __getitem__(self, i):
+        flags = self.flags[i]
+        reset = self.resets[i] if self.resets is not None else None
+        return Reading(self.times[i], self.values[i], reset or None, bool(flags & 1), bool(flags & 2))
+
+    def __setitem__(self, i, point):
+        self.times[i], self.values[i] = point.at, point.percent
+        if point.reset is not None and self.resets is None:
+            self.resets = array("d", [0]) * len(self.times)
+        if self.resets is not None:
+            self.resets[i] = point.reset or 0
+        self.flags[i] = point.sampled | (point.completion_time << 1)
+
+    def append(self, point):
+        if point.reset is not None and self.resets is None:
+            self.resets = array("d", [0]) * len(self.times)
+        if self.resets is not None:
+            self.resets.append(point.reset or 0)
+        self.times.append(point.at)
+        self.values.append(point.percent)
+        self.flags.append(point.sampled | (point.completion_time << 1))
+
+    def reverse(self):
+        for column in (self.times, self.values, self.flags):
+            column.reverse()
+        if self.resets is not None:
+            self.resets.reverse()
+
+
+class ScanStopped(Exception):
+    pass
+
+
+def check_stop(stop):
+    if stop is not None and stop.is_set():
+        raise ScanStopped
 
 
 def mapping(value):
@@ -85,7 +139,7 @@ def request_usage(record, at, prices, provider=None):
 
 
 def collect_audit(records, accounts, providers, start, now, prices):
-    readings = defaultdict(list)
+    readings = defaultdict(ReadingSeries)
     traffic = defaultdict(list)
     reporters = defaultdict(set)
     earliest = None
@@ -134,13 +188,7 @@ def collect_audit(records, accounts, providers, start, now, prices):
 
 
 def add_claude_history(readings, history, accounts, start, now):
-    rounded_headers = defaultdict(list)
-    for name in accounts:
-        series = readings.setdefault(("claude", name, "7d", None), [])
-        for i, point in enumerate(series):
-            rounded = round(point.at)
-            if not point.completion_time and rounded < point.at:
-                rounded_headers[name, rounded, point.percent].append(i)
+    samples = defaultdict(list)
     for sample in history:
         sample = mapping(sample)
         at = number(sample.get("ts"))
@@ -152,17 +200,28 @@ def add_claude_history(readings, history, accounts, start, now):
             used, reset = number(point[0]), reset_time(point[1])
             if used is None or (reset is not None and reset <= at):
                 continue
-            percent = round(100 * used, 10)
-            # Rounding can move a sample ahead of the header it copied.
-            series = readings[("claude", name, "7d", None)]
-            candidates = rounded_headers.get((name, at, percent), ())
-            match = max((i for i in candidates if not changed_reset(series[i].reset, reset)),
+            samples[name].append(Reading(at, round(100 * used, 10), reset, sampled=True))
+    for name in accounts:
+        series = readings[("claude", name, "7d", None)]
+        if name not in samples:
+            continue
+        # Rounding can move a sample ahead of the header it copied.
+        sample_keys = {(p.at, p.percent) for p in samples[name]}
+        rounded_headers = defaultdict(list)
+        for i, point in enumerate(series):
+            rounded = round(point.at)
+            key = (rounded, point.percent)
+            if not point.completion_time and rounded < point.at and key in sample_keys:
+                rounded_headers[key].append(i)
+        for sample in samples[name]:
+            candidates = rounded_headers.get((sample.at, sample.percent), ())
+            match = max((i for i in candidates if not changed_reset(series[i].reset, sample.reset)),
                         key=lambda i: series[i].at, default=None)
             if match is None:
-                series.append(Reading(at, percent, reset, sampled=True))
+                series.append(sample)
             else:
                 point = series[match]
-                series[match] = replace(point, reset=point.reset or reset, sampled=True)
+                series[match] = replace(point, reset=point.reset or sample.reset, sampled=True)
 
 
 def add_provider_history(readings, history, providers, start, now):
@@ -242,23 +301,19 @@ def measurement_intervals(accepted, min_step, covered_from):
 
 
 def recent_quota_pace(accepted, now):
-    """Points per day over the observed span, adding rises within each segment."""
-    first = last = previous = None
-    rise = 0
-    has_pair = False
+    """Points per day over time observed inside segments."""
+    previous = None
+    rise = elapsed = 0
     for point, restart in accepted:
         if restart:
             previous = None
         if point.at < now - DAY or (point.reset is not None and point.reset <= point.at):
             continue
-        if first is None:
-            first = point.at
         if previous is not None:
-            has_pair = has_pair or point.at > previous.at
             rise += point.percent - previous.percent
+            elapsed += point.at - previous.at
         previous = point
-        last = point.at
-    return rise * DAY / (last - first) if has_pair else None
+    return rise * DAY / elapsed if elapsed else None
 
 
 def fit_fable(rows):
@@ -273,7 +328,9 @@ def fit_fable(rows):
         oy = fsum(o * y for _, o, y in rows)
         a, b = (fy * oo - oy * fo) / determinant, (oy * ff - fy * fo) / determinant
         report.update(a=a, b=b)
-        if a > 0 and b > 0:
+        shares = [f / (f + o) for f, o, _ in rows if f + o > 0]
+        minimum = max(1e-6 * max(a, b), 1 / MAX_FIT_DOLLARS_PER_POINT)
+        if min(a, b) >= minimum and max(shares) - min(shares) >= MIN_FABLE_SHARE_SPREAD:
             report.update(fable_usd_per_percent=1 / a, other_usd_per_percent=1 / b)
     return report
 
@@ -297,7 +354,8 @@ def series_report(points, requests, min_step, covered_from, now, *, general_week
             fable = fsum(request.cost for request in period if request.fable)
             other = fsum(request.cost for request in period if not request.fable)
             dollar_rates.append((fable + other) / rise)
-            fit_rows.append((fable, other, rise))
+            if general_week:
+                fit_rows.append((fable, other, rise))
     dollars = None
     if dollar_rates:
         q1, _, q3 = quantiles(dollar_rates, n=4, method="inclusive") if len(dollar_rates) > 1 else (None, None, None)
@@ -308,13 +366,16 @@ def series_report(points, requests, min_step, covered_from, now, *, general_week
         left = max(0, 100 - latest.percent)
         usd = left * dollars["median"] if dollars else None
         pace = recent_quota_pace(accepted, now)
-        hours = 0 if left == 0 else 24 * left / pace if pace else None
+        stale = now - latest.at > PROJECTION_STALE_S
+        exhausts_at = latest.at if left == 0 else latest.at + DAY * left / pace if pace else None
+        hours = max(0, (exhausts_at - now) / 3600) if exhausts_at is not None and not stale else None
         reset_hours = (latest.reset - now) / 3600 if latest.reset is not None else None
-        lasts_until_reset = (reset_hours is not None and left > 0
-                             and (pace == 0 or (hours is not None and hours > reset_hours)))
+        lasts_until_reset = (not stale and latest.reset is not None and left > 0
+                             and (pace == 0 or (exhausts_at is not None and exhausts_at > latest.reset)))
         remaining = {"percent": left, "usd": usd,
                      "tokens": {k: left * v for k, v in tokens.items()} if tokens else None,
                      "hours": hours, "reset_in_hours": reset_hours, "lasts_until_reset": lasts_until_reset,
+                     "stale": stale, "exhausts_at": exhausts_at,
                      "pace_points_per_day": pace}
     result = {
         "latest": {"at": latest.at, "used_percent": latest.percent, "reset": latest.reset} if latest else None,
@@ -330,7 +391,7 @@ def series_report(points, requests, min_step, covered_from, now, *, general_week
     return result
 
 
-def analyse(records, history, provider_history, accounts, providers, start, now, min_step, prices):
+def analyse(records, history, provider_history, accounts, providers, start, now, min_step, prices, stop=None):
     readings, traffic, reporters, earliest = collect_audit(records, accounts, providers, start, now, prices)
     add_claude_history(readings, history, accounts, start, now)
     add_provider_history(readings, provider_history, providers, start, now)
@@ -338,7 +399,9 @@ def analyse(records, history, provider_history, accounts, providers, start, now,
         if not any(kind == "openai" and owner == name for kind, owner, _, _ in readings):
             readings[("openai", name, "codex", None)] = []
     reports = []
-    for key, points in sorted(readings.items()):
+    for key in sorted(readings):
+        check_stop(stop)
+        points = readings.pop(key)
         kind, name, limit, minutes = key
         note = None
         if kind == "claude":
@@ -382,7 +445,7 @@ def audit_tail(stream, end, size):
         yield pending
 
 
-def audit_log_lines(audit_path, scan):
+def audit_log_lines(audit_path, scan, stop=None):
     scan.update(limited=False, skipped_lines=0)
     try:
         directory = os.open(audit_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -392,6 +455,7 @@ def audit_log_lines(audit_path, scan):
     seen_files = set()
     try:
         for n in range(AUDIT_TAIL_BACKUPS + 1):
+            check_stop(stop)
             name = f"{audit_path.name}.{n}" if n else audit_path.name
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
@@ -407,6 +471,7 @@ def audit_log_lines(audit_path, scan):
                 seen_files.add(inode)
                 size = min(info.st_size, remaining)
                 for line in audit_tail(stream, info.st_size, size):
+                    check_stop(stop)
                     if line is None:
                         scan["skipped_lines"] += 1
                     elif line:
@@ -441,8 +506,8 @@ def quota_history_file(path, default, warnings):
     return default
 
 
-def quota_audit_records(audit_path, scan):
-    for line in audit_log_lines(audit_path, scan):
+def quota_audit_records(audit_path, scan, stop=None):
+    for line in audit_log_lines(audit_path, scan, stop):
         try:
             record = json.loads(line)
         except (ValueError, RecursionError):
@@ -473,7 +538,8 @@ def quota_rate_summary(series):
             "usd_per_percent": row["usd_per_percent"],
             "output_tokens_per_percent": tokens["output_tokens"] if tokens else None,
             "usd_left": remaining["usd"] if remaining else None,
-            "time_left": {k: remaining[k] for k in ("hours", "reset_in_hours", "lasts_until_reset", "pace_points_per_day")}
+            "time_left": {k: remaining[k] for k in ("hours", "reset_in_hours", "lasts_until_reset",
+                                                    "pace_points_per_day", "stale", "exhausts_at")}
             if remaining else None,
             "samples": row["cost_intervals"],
         })
@@ -481,14 +547,19 @@ def quota_rate_summary(series):
 
 
 def read_report(audit_path, history_path, provider_history_path, accounts, providers, prices, now,
-                *, days=14, min_step=5):
-    scan, warnings = {}, []
-    history = quota_history_file(history_path, [], warnings)
-    provider_history = quota_history_file(provider_history_path, {}, warnings)
+                *, days=14, min_step=5, stop=None):
+    scan, claude_errors, openai_errors = {}, [], []
+    check_stop(stop)
+    history = quota_history_file(history_path, [], claude_errors)
+    check_stop(stop)
+    provider_history = quota_history_file(provider_history_path, {}, openai_errors)
     if provider_history and provider_history.get("version") != 1:
-        warnings.append("provider_quota_history.json has an unsupported version")
+        openai_errors.append("provider_quota_history.json has an unsupported version")
         provider_history = {}
-    series, earliest = analyse(quota_audit_records(audit_path, scan), history, provider_history, accounts, providers,
-                               now - days * DAY, now, min_step, prices)
+    series, earliest = analyse(quota_audit_records(audit_path, scan, stop), history, provider_history,
+                               accounts, providers, now - days * DAY, now, min_step, prices, stop)
+    source_errors = {source: errors for source, errors in (("claude", claude_errors), ("openai", openai_errors))
+                     if errors}
     return {"days": days, "min_step": min_step, "audit": {"from": earliest, **scan},
-            "warnings": warnings, "summary": quota_rate_summary(series), "series": series}
+            "warnings": claude_errors + openai_errors, "source_errors": source_errors,
+            "summary": quota_rate_summary(series), "series": series}

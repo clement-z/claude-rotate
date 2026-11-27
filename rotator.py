@@ -40,6 +40,7 @@ import re
 import stat
 import sys
 import tempfile
+import threading
 import time
 import weakref
 from collections import deque
@@ -77,11 +78,12 @@ PRIVATE_HEADERS = {"cookie", "referer", "origin", "forwarded", "x-real-ip", "x-o
 
 @asynccontextmanager
 async def lifespan(app):
-    tasks = [asyncio.create_task(refresh_loop()), asyncio.create_task(providers.maintain_loop(PROVIDERS)),
-             asyncio.create_task(quota_rate_loop())]
+    quota_stop = start_quota_rate_worker()
+    tasks = [asyncio.create_task(refresh_loop()), asyncio.create_task(providers.maintain_loop(PROVIDERS))]
     try:
         yield
     finally:
+        quota_stop.set()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1562,34 +1564,63 @@ def load_prices() -> dict:
 
 
 PRICES = load_prices()
-QUOTA_RATE_REPORT = b'{"computed_at":null,"summary":[],"fits":[]}'
+QUOTA_RATE_REPORT = b'{"status":"computing","computed_at":null,"summary":[],"fits":[],"source_errors":{}}'
 ALERT_CFG = CFG.get("alerts", {
     "device_tokens_per_hour": 5_000_000,
     "util_warn": 0.8,
 })
 
 
-def compute_quota_rate():
+def compute_quota_rate(stop):
     accounts = {account["name"] for account in CFG["accounts"]}
     report = quota_rate.read_report(AUDIT_PATH, HISTORY_PATH, QUOTA_HISTORY_PATH, accounts,
-                                    set(quota_histories()), PRICES, time.time())
-    if report["warnings"]:
-        raise ValueError("; ".join(report["warnings"]))
+                                    set(quota_histories()), PRICES, time.time(), stop=stop)
     fits = [dict(row["fable_fit"], account=row["name"]) for row in report["series"]
             if row.get("fable_fit", {}).get("fable_usd_per_percent") is not None]
-    return json.dumps({"computed_at": time.time(), "summary": report["summary"], "fits": fits},
-                      allow_nan=False).encode()
+    source_errors = report["source_errors"]
+    payload = {"status": "ready", "computed_at": time.time(), "summary": report["summary"],
+               "fits": fits, "source_errors": source_errors}
+    return json.dumps(payload, allow_nan=False).encode(), source_errors
 
 
-async def quota_rate_loop(start_delay=2, interval=600):
+def finish_quota_rate(stop, result, error):
     global QUOTA_RATE_REPORT
-    await asyncio.sleep(start_delay)
-    while True:
+    if stop.is_set():
+        return
+    if error is not None:
+        storage_error("quota_rate", error)
+        return
+    QUOTA_RATE_REPORT, source_errors = result
+    for source, errors in source_errors.items():
+        storage_error("quota_rate_" + source, ValueError("; ".join(errors)))
+
+
+def quota_rate_worker(loop, stop, start_delay, interval):
+    stop.wait(start_delay)
+    while not stop.is_set():
+        result = error = None
         try:
-            QUOTA_RATE_REPORT = await asyncio.to_thread(compute_quota_rate)
+            result = compute_quota_rate(stop)
+        except quota_rate.ScanStopped:
+            return
         except Exception as exc:
-            storage_error("quota_rate", exc)
-        await asyncio.sleep(interval)
+            error = exc.with_traceback(None)
+        if stop.is_set():
+            return
+        try:
+            loop.call_soon_threadsafe(finish_quota_rate, stop, result, error)
+        except RuntimeError:
+            if stop.is_set():
+                return
+            raise
+        stop.wait(interval)
+
+
+def start_quota_rate_worker(start_delay=2, interval=600):
+    stop = threading.Event()
+    threading.Thread(target=quota_rate_worker, args=(asyncio.get_running_loop(), stop, start_delay, interval),
+                     name="quota-rate", daemon=True).start()
+    return stop
 
 
 def price_for(model: str | None, default=DEFAULT_PRICE) -> list[float] | None:
@@ -2146,8 +2177,9 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  <button class="linkbtn" id="tbl">Table</button></h2>
  <div id="weekly" class="muted">collecting data</div><div class="tip" id="tip"></div></section>
 <section class="card"><h2>Quota rates <span id="quota-rate-age" class="muted" style="font-weight:400"></span></h2>
- <p id="quota-rate-empty" class="muted">Not enough data</p>
+ <p id="quota-rate-empty" class="muted">Computing…</p>
  <table id="quota-rates" class="cards"></table><div id="quota-rate-fits" class="muted small"></div>
+ <div id="quota-rate-errors" class="muted small"></div>
  <p class="muted small">API list prices. Estimates skip detected outside-only rises and split at mid-window credits. See <code>claude-rotate-admin quota-rate</code> for details.</p>
 </section>
 <section class="card"><h2>Subscriptions <span class="muted" style="font-weight:400">billing periods &middot; USD list prices</span></h2><div id="billing"></div></section>
@@ -2333,6 +2365,7 @@ function updateQuotaRateAge(){
     'computed '+Math.max(0,Math.floor((Date.now()/1000-quotaRateComputedAt)/60))+' min ago';
 }
 function quotaRateTime(t){
+  if(t?.stale===true) return 'Projection stale';
   if(t?.lasts_until_reset===true&&Number.isFinite(t.reset_in_hours))
     return "won't run out before the reset in "+(t.reset_in_hours/24).toFixed(2)+' d';
   if(Number.isFinite(t?.hours)) return t.hours>48?(t.hours/24).toFixed(2)+' d':t.hours.toFixed(2)+' h';
@@ -2345,7 +2378,8 @@ async function refreshQuotaRate(){
     const data=await response.json();
     if(!Number.isFinite(data?.computed_at)||!Array.isArray(data.summary)||data.computed_at<quotaRateComputedAt) return;
     const columns=['Account','Limit','Used','$ / 1%','Output tok / 1%','$ left','Time left','Samples'];
-    const dollars=n=>'$'+n.toFixed(2), value=(n,format)=>Number.isFinite(n)?esc(format(n)):'&ndash;';
+    const dollars=n=>'$'+(n>=1000?Math.round(n).toLocaleString():n.toFixed(2));
+    const value=(n,format)=>Number.isFinite(n)?esc(format(n)):'&ndash;';
     const none='<span class="muted small">Not enough data</span>';
     const rows=data.summary.map(row=>{
       const c=row.usd_per_percent;
@@ -2361,12 +2395,20 @@ async function refreshQuotaRate(){
       Number.isFinite(f.fable_usd_per_percent)&&Number.isFinite(f.other_usd_per_percent)).map(f=>
       '<div><b>'+esc(f.account)+'</b> &middot; '+esc('Fable '+dollars(f.fable_usd_per_percent)+
         ' per 1%, other '+dollars(f.other_usd_per_percent)+' per 1%')+'</div>');
+    const errors=Object.entries(data.source_errors||{}).filter(([,messages])=>Array.isArray(messages))
+      .map(([source,messages])=>(source==='claude'?'Claude':source==='openai'?'OpenAI':source)+': '+messages.join(', '));
     $('quota-rates').innerHTML=rows.length?'<tr>'+columns.map(c=>'<th scope="col">'+esc(c)+'</th>').join('')+'</tr>'+rows.join(''):'';
     $('quota-rate-fits').innerHTML=fits.join('');
+    $('quota-rate-errors').textContent=errors.join(' · ');
+    $('quota-rate-empty').textContent='Not enough data';
     $('quota-rate-empty').hidden=rows.length>0;
     quotaRateComputedAt=data.computed_at;
     updateQuotaRateAge();
   }catch(err){ /* keep the last report */ }
+}
+async function pollQuotaRate(){
+  await refreshQuotaRate();
+  setTimeout(pollQuotaRate,quotaRateComputedAt===null?30000:300000);
 }
 function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1,y=x=>(h-2-x/m*(h-4)).toFixed(1);
   return `<svg width="${w}" height="${h}"><polyline points="${v.map((x,i)=>(i/(v.length-1)*w).toFixed(1)+','+y(x)).join(' ')}" fill="none" stroke="var(--muted)" stroke-width="1.5"/><circle cx="${w}" cy="${y(v[v.length-1])}" r="3" fill="var(--s1)"/></svg>`}
@@ -2601,7 +2643,7 @@ async function refresh(){
 }
 refresh(); setInterval(refresh, 10000);
 refreshQuotaHistory(); setInterval(refreshQuotaHistory, 60000);
-refreshQuotaRate(); setInterval(refreshQuotaRate, 300000);
+pollQuotaRate();
 window.addEventListener('resize',resizeQuotaPlots);
 </script></body></html>"""
 

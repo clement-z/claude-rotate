@@ -404,8 +404,10 @@ access as the panel. `GET /rotate/status` returns per-account `claims`,
 events. The legacy `active_account` field projects the default route.
 `GET /rotate/stats` returns rollups, alerts, the longer `periods` and `billing`.
 `GET /rotate/quota-rate` returns the last computed quota-rate summary, its
-computation time in Unix seconds and the weekly Fable cost fits. It uses the same panel
-authorization and `Cache-Control: no-store`.
+computation time in Unix seconds and the weekly Fable cost fits. It reports
+`"status":"computing"` before the first result and includes any per-source
+history errors in `source_errors`. It uses the same panel authorization and
+`Cache-Control: no-store`.
 Both panel writes require same-origin JSON. `POST /rotate/switch` takes
 `{"account": NAME}` or `{"auto": true}`. `POST /rotate/device-pin` takes
 `{"device": NAME, "account_pin": {"account": ACCOUNT, "mode": MODE}}`.
@@ -477,22 +479,26 @@ The summary table shows each limit's latest usage, median cost and output
 tokens per point, dollars and time left, and the number of priced intervals.
 The same summary appears under `summary` in JSON. Remaining dollars and
 tokens use the latest reading and the median rates. The general weekly fit
-reports dollars per point for Fable and other models when both fitted rates
-are positive. JSON also retains the original coefficients.
+reports dollars per point for Fable and other models when the coefficients
+are large enough to invert and the Fable share of cost varies by at least ten
+percentage points across intervals. JSON also retains the original coefficients.
 
 The panel's **Quota rates** section below the weekly chart shows the same
 summary and fits using the default lookback and minimum rise. The gateway
 computes it in a worker thread shortly after startup and every ten minutes,
-using the same bounded audit scan as the command. The panel fetches the report
-on open and every five minutes. A failed computation or fetch keeps the last
-successful result and its timestamp.
+using the same bounded audit scan as the command. The panel fetches on open,
+every 30 seconds until the first result, then every five minutes. A damaged
+history file is reported alongside results from the healthy source. A failed
+scan or fetch keeps the last successful result and its timestamp.
 
 Time left uses quota readings from the last 24 h, including usage outside the
-gateway. It adds the rise from the first to last reading within each segment,
-skips jumps at resets, and divides by the elapsed time between the earliest
-and latest usable readings. It needs at least two readings in one segment
-and works without priced intervals. When the estimate extends past a known
-reset, the report shows when the quota resets. Durations above 48 h use days.
+gateway. It adds rises and elapsed time within segments, skipping jumps and
+unobserved gaps between segments. It needs at least two readings in one
+segment and works without priced intervals. It projects an exhaustion time
+from the last reading and compares it with the current time and the reset.
+Readings older than four hours give a stale projection. When the estimate
+extends past a known reset, the report shows when the quota resets.
+Durations above 48 h use days.
 
 Outside usage can increase quota readings, including in intervals with
 gateway traffic. Unobserved resets can also skew estimates. An unconfirmed

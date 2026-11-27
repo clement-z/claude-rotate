@@ -1756,6 +1756,8 @@ def quota_token_text(tokens):
 
 def quota_time_text(projection):
     if projection:
+        if projection["stale"]:
+            return "projection stale"
         if projection["lasts_until_reset"]:
             return f"won't run out before the reset in {projection['reset_in_hours'] / 24:.2f} d"
         hours = projection["hours"]
