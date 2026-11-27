@@ -509,15 +509,18 @@ class OpenAISiwc:
                 slot, window = next(iter(observed.items()))
                 minutes = window["window_minutes"]
                 latest[slot] = None
+                matching_slot = empty_slot = None
                 # A header can report a window in a different slot.
                 for which in slots:
                     prev = prior.get(which)
                     if not isinstance(prev, dict):
+                        if empty_slot is None or which == slot:
+                            empty_slot = which
                         continue
                     latest[which] = {"seen_at": prior.get("seen_at")} | prev
                     if minutes and prev.get("window_minutes") == minutes:
-                        slot = which
-                latest[slot] = window
+                        matching_slot = which
+                latest[matching_slot or empty_slot or slot] = window
                 if "plan" not in latest and "plan" in prior:
                     latest["plan"] = prior["plan"]
             self.quotas[limit] = latest

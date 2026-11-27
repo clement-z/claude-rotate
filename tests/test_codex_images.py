@@ -472,6 +472,27 @@ async def history_checks():
               [s["limit"] for s in series] == [f"limit_{i:02d}" for i in range(1, 17)]
               and all(len(s["points"]) == 20 for s in series))
 
+        now += P.USAGE_POLL_S
+        weekly_seen, weekly_reset = now, int(now) + 3600
+        poll = {"rate_limit": {"primary_window": {
+            "used_percent": 95, "limit_window_seconds": 604800, "reset_at": weekly_reset}}}
+        with patch.object(OAI.images, "_remaining", return_value=86400):
+            await OAI.maintain()
+        siwc["openai"].answer = lambda request: httpx.Response(200, headers={
+            "x-codex-primary-used-percent": "4", "x-codex-primary-window-minutes": "300"}, json={"ok": True})
+        now += 1
+        await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
+        meters = (await C.get("/rotate/status", headers=headers)).json()["providers"]["openai"]["quotas"]["codex"]
+        alerts = (await C.get("/rotate/stats", headers=headers)).json()["alerts"]
+        check("a new duration uses the empty slot and keeps the weekly meter and warning",
+              meters["primary"] == {"window_minutes": 10080, "used_percent": 95, "resets_at": weekly_reset,
+                                    "seen_at": int(weekly_seen)}
+              and meters["secondary"] == {"window_minutes": 300, "used_percent": 4, "resets_at": None,
+                                          "seen_at": int(now)}
+              and any(a["text"].startswith("provider openai: quota codex at 95%") for a in alerts)
+              and points(OAI, "codex", 10080) == [[weekly_seen, 95, weekly_reset, "usage"]]
+              and points(OAI, "codex", 300) == [[now, 4, None, "inference"]])
+
 
 async def main():
     global C
