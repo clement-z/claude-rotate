@@ -368,6 +368,19 @@ async def history_checks():
               points(OAI, "codex", 300) == [[start, 0, reset, "usage"], [now, 88, None, "inference"]])
         now = start + 602
         saved = R.quota_history_snapshot(now)
+        admission = gate()
+        admission.active = admission.limit
+        try:
+            reply = await C.get("/rotate/quota-history", headers={"authorization": f"Bearer {DESK}"})
+        finally:
+            admission.active = 0
+        check("the uncached history endpoint serves observations even at proxy capacity",
+              reply.status_code == 200 and reply.headers["cache-control"] == "no-store"
+              and reply.json() == {"as_of": now, "providers": saved})
+        body = (await C.get("/rotate/status", headers={"authorization": f"Bearer {DESK}"})).json()
+        check("status still serves latest figures without including quota history",
+              body["providers"]["openai"]["quotas"] == OAI.quotas
+              and "quota_history" not in body["providers"]["openai"] and "quota_history" not in body)
         path = R.QUOTA_HISTORY_PATH
         with patch.object(Path, "replace", side_effect=OSError("temporary disk error")):
             R.save_quota_history(now)

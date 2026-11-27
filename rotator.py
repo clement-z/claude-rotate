@@ -204,7 +204,7 @@ class RequestAdmission:
     async def __call__(self, scope, receive, send):
         admin = (scope.get("method"), scope.get("path")) in {
             ("GET", "/rotate/status"), ("GET", "/rotate/stats"), ("GET", "/rotate/panel"),
-            ("POST", "/rotate/switch")}
+            ("GET", "/rotate/quota-history"), ("POST", "/rotate/switch")}
         if scope["type"] != "http" or not self.limit or admin:
             return await self.app(scope, receive, send)
         # One event loop, with no await between the check and increment.
@@ -873,6 +873,14 @@ async def rotate_status(request: Request):
         "weekly": weekly_outlook(now),
         "providers": {name: p.status() for name, p in PROVIDERS.items()},
     }
+
+
+@app.get("/rotate/quota-history")
+async def rotate_quota_history(request: Request):
+    if not panel_allowed(request):
+        return JSONResponse({"error": "unknown device key"}, status_code=401)
+    now = time.time()
+    return {"as_of": now, "providers": quota_history_snapshot(now)}
 
 
 @app.post("/rotate/switch")
