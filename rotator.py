@@ -314,7 +314,11 @@ def seed_routes(state: dict) -> None:
     manual = state.get("pinned")
     if manual != active or ACCOUNTS[active].get("disabled"):
         manual = None
-    state["routes"] = {family: {"active_account": active, "last_switch_ts": state.get("last_switch_ts", 0),
+    switched_at = state.get("last_switch_ts")
+    if not providers.number(switched_at) or switched_at < 0:
+        switched_at = 0
+    state["last_switch_ts"] = switched_at
+    state["routes"] = {family: {"active_account": active, "last_switch_ts": switched_at,
                                 "manual_account": manual} for family in MODEL_FAMILIES}
 
 
@@ -344,6 +348,8 @@ def load_state() -> dict:
             pace = info.get("pace_until")
             if providers.number(pace) and pace > now:
                 info["pace_by_family"] = dict.fromkeys(MODEL_FAMILIES, pace)
+            else:
+                info.pop("pace_until", None)
             if info.get("status") == "rejected":
                 info.pop("status")
         state["version"] = STATE_VERSION
@@ -351,13 +357,40 @@ def load_state() -> dict:
         if exists:
             write_state(state)
     elif state.get("version") == STATE_VERSION:
+        repaired = False
+        now = time.time()
+        for info in state["accounts"].values():
+            pace = info.get("pace_until")
+            if "pace_until" in info and (not providers.number(pace) or pace <= now):
+                del info["pace_until"]
+                repaired = True
+            if "pace_by_family" in info:
+                stored = info["pace_by_family"]
+                items = stored.items() if isinstance(stored, dict) else ()
+                deadlines = {family: deadline for family, deadline in items
+                             if family in MODEL_FAMILIES and providers.number(deadline) and deadline > now}
+                if deadlines != stored:
+                    info["pace_by_family"] = deadlines
+                    repaired = True
         # The offline rotate command still writes the legacy default route.
         route = state["routes"]["default"]
+        switched_at = state.get("last_switch_ts", 0)
+        for family, entry in state["routes"].items():
+            timestamp = entry.get("last_switch_ts")
+            if not providers.number(timestamp) or timestamp < 0:
+                entry["last_switch_ts"] = (switched_at if family == "default"
+                                           and providers.number(switched_at) and switched_at >= 0 else 0)
+                repaired = True
+        if not providers.number(switched_at) or switched_at < 0:
+            state["last_switch_ts"] = route["last_switch_ts"]
+            repaired = True
         if state.get("active_account") in ACCOUNTS and (
                 state["active_account"] != route["active_account"]
                 or state.get("last_switch_ts", 0) != route["last_switch_ts"]
                 or state.get("pinned") != route.get("manual_account")):
             seed_routes(state)
+            repaired = True
+        if repaired:
             write_state(state)
     return state
 
@@ -635,7 +668,26 @@ def select_account(family: str, now: float) -> str | None:
     return target
 
 
-def parse_claims(headers: httpx.Headers) -> dict:
+def claim_field(field: str, value: str) -> float | str | None:
+    if len(value) > 256:
+        return None
+    values = [part.strip().lower() for part in value.split(",")]
+    if field == "status":
+        if CLAIM_STATUS.fullmatch(values[0]) and all(part == values[0] for part in values):
+            return values[0]
+        return None
+    try:
+        numbers = [float(part) for part in values]
+    except ValueError:
+        return None
+    number = numbers[0]
+    if (providers.number(number) and (number > 0 if field == "reset" else number >= 0)
+            and all(part == number for part in numbers)):
+        return number
+    return None
+
+
+def parse_claims(headers: httpx.Headers, existing: dict) -> dict:
     claims = {}
     learned_count = 0
     for name, value in headers.items():
@@ -645,34 +697,25 @@ def parse_claims(headers: httpx.Headers) -> dict:
         claim, field = match.groups()
         if claim == "overage" or claim.startswith(("overage-", "overage_")):
             continue
-        if claim not in KNOWN_CLAIMS and claim not in claims:
+        if claim in KNOWN_CLAIMS or claim in existing:
+            claims.setdefault(claim, {})
+        parsed = claim_field(field, value)
+        if parsed is None:
+            continue
+        if claim not in claims:
             if learned_count >= MAX_LEARNED_CLAIMS:
                 continue
             learned_count += 1
-        reading = claims.setdefault(claim, {})
-        if len(value) > 256:
-            continue
-        values = [part.strip().lower() for part in value.split(",")]
-        if field == "status":
-            if CLAIM_STATUS.fullmatch(values[0]) and all(part == values[0] for part in values):
-                reading[field] = values[0]
-            continue
-        try:
-            numbers = [float(part) for part in values]
-        except ValueError:
-            continue
-        number = numbers[0]
-        if (providers.number(number) and (number > 0 if field == "reset" else number >= 0)
-                and all(part == number for part in numbers)):
-            reading[field] = number
+        claims.setdefault(claim, {})[field] = parsed
     return claims
 
 
 def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str | None, now: float) -> None:
-    reported = parse_claims(headers)
+    claims = account_claims(info)
+    reported = parse_claims(headers, claims)
     if not reported:
         return
-    claims = info.setdefault("claims", account_claims(info))
+    info["claims"] = claims
     learned = info.setdefault("learned_claims", {}) if family is not None else {}
     members = set(learned.get(family, ()))
     weekly = reported.get("7d", {})
@@ -697,8 +740,8 @@ def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str 
             count += claim not in claims
             members.add(claim)
         reading = claims.setdefault(claim, {})
-        if ("reset" in fields and reading.get("reset", now + 1) <= now
-                and fields["reset"] > now):
+        if reading.get("reset", now + 1) <= now and (
+                fields.get("reset", 0) > now or ("utilization" in fields and "reset" not in fields)):
             # A new window cannot inherit the old window's usage or rejection.
             reading.clear()
         if ("status" not in fields and 200 <= status < 300
@@ -798,7 +841,7 @@ async def refresh_idle_accounts() -> None:
             print(f"warning: usage refresh of {name} failed ({type(exc).__name__})", file=sys.stderr)
             continue
         if "anthropic-ratelimit-unified-status" in r.headers:
-            await note_response(name, r.headers, r.status_code, automatic=False)
+            await note_response(name, r.headers, r.status_code, family=None, automatic=False)
         else:
             # note_response would read a headerless 429 as a burst and pace the account.
             print(f"warning: usage refresh of {name}: HTTP {r.status_code} without usage headers",
@@ -954,7 +997,7 @@ def weekly_snapshot() -> dict:
     snapshot = {}
     for name in ACCOUNTS:
         reading = claim_reading(name, "7d")
-        if not disabled(name) and "utilization" in reading and reading.get("reset"):
+        if not disabled(name) and reading.get("reset"):
             snapshot[name] = [round(util_7d(name), 4), reading["reset"]]
     return snapshot
 

@@ -244,6 +244,33 @@ with tempfile.TemporaryDirectory() as tmp:
                   R.load_state() == migrated and migrated["events"] == legacy["events"]
                   and migrated["other"] == legacy["other"] and "status" not in migrated["accounts"]["a"]
                   and migrated["accounts"]["a"]["pace_by_family"] == {"default": now + 60, "fable": now + 60})
+        with patch.object(R, "STATE", migrated), patch.object(R, "BILLING", {}):
+            check("migrated reset-only 7d retains capacity with unknown usage counted as zero",
+                  R.weekly_snapshot() == {"b": [0.0, now + 100000]}
+                  and R.weekly_outlook(now)["capacity"] == 100)
+        path.write_text(json.dumps(legacy | {"last_switch_ts": "bad", "accounts": {
+            "a": {"pace_until": "not a deadline"}, "b": {"pace_until": now + 60}}}))
+        repaired = R.load_state()
+        check("legacy migration normalizes cooldown and pace while retaining live numeric deadlines",
+              repaired["last_switch_ts"] == 0
+              and all(route["last_switch_ts"] == 0 for route in repaired["routes"].values())
+              and "pace_until" not in repaired["accounts"]["a"]
+              and "pace_by_family" not in repaired["accounts"]["a"]
+              and repaired["accounts"]["b"]["pace_until"] == now + 60
+              and repaired["accounts"]["b"]["pace_by_family"] == {"default": now + 60, "fable": now + 60})
+        repaired["last_switch_ts"] = "bad"
+        repaired["routes"]["default"]["last_switch_ts"] = "bad"
+        repaired["routes"]["fable"].update(active_account="b", last_switch_ts=now - 10)
+        repaired["accounts"]["a"]["pace_until"] = "bad"
+        repaired["accounts"]["b"]["pace_by_family"]["default"] = "bad"
+        path.write_text(json.dumps(repaired))
+        repaired = R.load_state()
+        check("already migrated malformed deadlines repair without reseeding the valid Fable route",
+              repaired["last_switch_ts"] == repaired["routes"]["default"]["last_switch_ts"] == 0
+              and repaired["routes"]["fable"]["active_account"] == "b"
+              and repaired["routes"]["fable"]["last_switch_ts"] == now - 10
+              and "pace_until" not in repaired["accounts"]["a"]
+              and repaired["accounts"]["b"]["pace_by_family"] == {"fable": now + 60})
 
 # 14. Claims are learned from model answers and retired only by authoritative snapshots.
 R.STATE = migrated
@@ -289,6 +316,24 @@ run(R.note_response("a", headers(u5=1, r5=now - 1), 429))
 check("expired claim utilization is unknown", R.claim_utilization("a", "5h") is None)
 run(R.note_response("a", headers(r5=now + 100), 200))
 check("a reset alone does not carry old usage into a new window", R.claim_utilization("a", "5h") is None)
+run(R.note_response("a", headers(u7=1, r7=now - 1), 200))
+run(R.note_response("a", headers(u7=0.42), 200))
+check("fresh utilization without a reset replaces expired weekly evidence",
+      R.claim_utilization("a", "7d") == R.util_7d("a") == info["util_7d"] == 0.42
+      and "reset" not in info["claims"]["7d"] and "reset_7d" not in info)
+
+learned_header = "anthropic-ratelimit-unified-model-x"
+run(R.note_response("a", httpx.Headers(weekly | {f"{learned_header}-utilization": "0.5"}), 200))
+many_claims = {f"anthropic-ratelimit-unified-malformed-{i}-utilization": "NaN"
+               for i in range(R.MAX_LEARNED_CLAIMS)}
+many_claims.update({f"anthropic-ratelimit-unified-new-{i}-utilization": "0.2"
+                    for i in range(R.MAX_LEARNED_CLAIMS)})
+many_claims.update(weekly | {f"{learned_header}-utilization": "1", f"{learned_header}-reset": str(now + 1000)})
+run(R.note_response("a", httpx.Headers(many_claims), 200))
+check("valid new IDs fill the cap without masking a later existing learned blocker",
+      R.claim_utilization("a", "model-x") == 1 and R.blocker_deadline("a", "default", now) == now + 1000
+      and len(info["learned_claims"]["default"]) == R.MAX_LEARNED_CLAIMS
+      and "new-0" in info["claims"] and not any(key.startswith("malformed-") for key in info["claims"]))
 
 # 15. The chart, projection and billing ledger follow general weekly usage only.
 R.STATE["accounts"] = {

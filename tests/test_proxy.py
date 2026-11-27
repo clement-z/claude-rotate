@@ -595,6 +595,27 @@ check("refresh never changes the active account", R.STATE["active_account"] == "
 asyncio.run(R.refresh_idle_accounts())
 check("a just-refreshed account is not probed again", len(probes) == 1)
 
+fresh_state(active="a", accounts={"a": {"last_seen": time.time()}, "b": {
+    "util_5h": 0.14, "claims": {"5h": {"utilization": 0.14}, "ordinary": {"utilization": 0.65}},
+    "learned_claims": {"default": ["ordinary"]}, "last_success_claims": {"default": ["5h", "ordinary"]}}})
+probes.clear()
+R._REFRESH_TRIED.clear()
+
+
+def weekly_probe(req):
+    probes.append(json.loads(req.content)["model"])
+    return httpx.Response(200, headers=unified(u5=None, u7="0.69"))
+
+
+use_upstream(weekly_probe)
+asyncio.run(R.refresh_idle_accounts())
+info = R.STATE["accounts"]["b"]
+check("a weekly-only Haiku idle probe updates 7d without retiring live model claims",
+      probes == ["claude-haiku-4-5"] and info["util_7d"] == 0.69 and info["util_5h"] == 0.14
+      and info["claims"]["ordinary"]["utilization"] == 0.65
+      and info["learned_claims"] == {"default": ["ordinary"]}
+      and info["last_success_claims"] == {"default": ["5h", "ordinary"]})
+
 fresh_state(active="a", accounts={"a": {"last_seen": time.time()}, "b": {}})
 R._REFRESH_TRIED.clear()
 probes.clear()
