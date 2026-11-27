@@ -1,9 +1,14 @@
 """Offline tests for claude-rotate switch logic (pick_account / note_response)."""
 import asyncio
+import json
 import sys
+import tempfile
 import time
 import types
 from pathlib import Path
+from unittest.mock import patch
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import rotator as R
@@ -213,5 +218,97 @@ R.STATE["accounts"] = {"a": {"util_5h": 0.5}, "b": {"util_5h": 1.0, "reset_5h": 
                        "c": {"util_5h": 1.0, "reset_5h": now + 900}}
 v = run(R.note_response("a", headers(u5=1.0, r5=now + 600, status="rejected"), 429))
 check("the pin ends at quota exhaustion without a switch", v == "exhausted" and "pinned" not in R.STATE)
+
+# 13. Old files migrate atomically and can be loaded again without rewriting.
+legacy = {"active_account": "a", "pinned": "a", "last_switch_ts": now - 100,
+          "events": [{"type": "switch", "to": "a"}], "other": {"keep": True},
+          "accounts": {"a": {"util_5h": 0.3, "reset_5h": now + 1000, "util_7d": 0.69,
+                             "status": "rejected", "last_seen": now - 20, "pace_until": now + 60},
+                       "b": {"reset_7d": now + 100000}, "c": {}}}
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "state.json"
+    path.write_text(json.dumps(legacy))
+    with patch.object(R, "STATE_PATH", path):
+        migrated = R.load_state()
+        check("legacy state migrates once to general claims and both family routes",
+              migrated == json.loads(path.read_text()) and migrated["version"] == R.STATE_VERSION
+              and migrated["accounts"]["a"]["claims"] == {
+                  "5h": {"utilization": 0.3, "reset": now + 1000, "seen_at": now - 20},
+                  "7d": {"utilization": 0.69, "seen_at": now - 20}}
+              and migrated["accounts"]["b"]["claims"] == {"7d": {"reset": now + 100000}}
+              and migrated["accounts"]["c"]["claims"] == {}
+              and migrated["routes"] == {family: {"active_account": "a", "manual_account": "a",
+                                                 "last_switch_ts": now - 100}
+                                         for family in ("default", "fable")})
+        with patch.object(R, "write_state", side_effect=AssertionError("state migrated again")):
+            check("reloading keeps claims, event history and the live pace without a shared rejected claim",
+                  R.load_state() == migrated and migrated["events"] == legacy["events"]
+                  and migrated["other"] == legacy["other"] and "status" not in migrated["accounts"]["a"]
+                  and migrated["accounts"]["a"]["pace_by_family"] == {"default": now + 60, "fable": now + 60})
+
+# 14. Claims are learned from model answers and retired only by authoritative snapshots.
+R.STATE = migrated
+weekly = headers(u7=0.69, r7=now + 200000, status="allowed")
+fable = weekly | {"anthropic-ratelimit-unified-7d_oi-utilization": "0.48",
+                  "anthropic-ratelimit-unified-7d_oi-reset": str(now + 100000),
+                  "anthropic-ratelimit-unified-7d_oi-status": "allowed",
+                  "anthropic-ratelimit-unified-model-x-utilization": "0.7",
+                  "anthropic-ratelimit-unified-overage-status": "rejected"}
+run(R.note_response("a", httpx.Headers(fable), 200, family=R.model_family("Claude-FaBlE-5-2")))
+info = R.STATE["accounts"]["a"]
+check("a weekly-only answer retires 5h, keeps general 7d and records Fable utilization as reported",
+      set(info["claims"]) == {"7d", "7d_oi", "model-x"} and "util_5h" not in info and "reset_5h" not in info
+      and R.util_7d("a") == 0.69 and R.claim_utilization("a", "7d_oi") == 0.48
+      and set(R.applicable_claims(info, "default")) == {"7d"}
+      and set(R.applicable_claims(info, "fable")) == {"7d", "7d_oi", "model-x"}
+      and R.model_family(None) == R.model_family("claude-opus-5") == "default")
+run(R.note_response("a", httpx.Headers(weekly | {"anthropic-ratelimit-unified-model-x-utilization": "0.8"}),
+                    200, family="default"))
+run(R.note_response("a", weekly, 200, family="default"))
+run(R.note_response("a", weekly, 200, family=None))
+run(R.note_response("a", headers(), 200, family="fable"))
+run(R.note_response("a", weekly, 429, family="fable"))
+check("default, unrelated, headerless and partial 429 answers keep Fable evidence",
+      set(R.applicable_claims(info, "fable")) == {"7d", "7d_oi", "model-x"}
+      and R.applicable_claims(info, "default").keys() == {"7d"}
+      and info["last_success_claims"] == {"default": ["7d"], "fable": ["7d", "7d_oi", "model-x"]})
+
+malformed = httpx.Headers([*weekly.items(), ("anthropic-ratelimit-unified-7d_oi-utilization", "0.99"),
+                           ("anthropic-ratelimit-unified-7d_oi-utilization", "0.1"),
+                           ("anthropic-ratelimit-unified-7d_oi-reset", "NaN"),
+                           ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+                           ("anthropic-ratelimit-unified-empty-utilization", "-1")])
+run(R.note_response("a", malformed, 200, family="fable"))
+check("conflicting or malformed fields keep known values and do not create a zero reading",
+      R.claim_utilization("a", "7d_oi") == 0.48 and info["claims"]["7d_oi"]["reset"] == now + 100000
+      and info["claims"]["7d_oi"]["status"] == "rejected" and "empty" not in info["claims"])
+run(R.note_response("a", weekly, 200, family="fable"))
+check("an authoritative Fable answer can retire missing Fable claims",
+      set(info["claims"]) == {"7d"} and R.claim_utilization("a", "7d_oi") is None)
+
+run(R.note_response("a", headers(u5=1, r5=now - 1), 429))
+check("expired claim utilization is unknown", R.claim_utilization("a", "5h") is None)
+run(R.note_response("a", headers(r5=now + 100), 200))
+check("a reset alone does not carry old usage into a new window", R.claim_utilization("a", "5h") is None)
+
+# 15. The chart, projection and billing ledger follow general weekly usage only.
+R.STATE["accounts"] = {
+    "a": {"util_7d": 1, "reset_7d": now + 10, "claims": {
+        "7d": {"utilization": 0.69, "reset": now + 200000},
+        "7d_oi": {"utilization": 1, "reset": now + 100000}}},
+    "b": {"claims": {"7d_oi": {"utilization": 1, "reset": now + 100000}}}}
+with tempfile.TemporaryDirectory() as tmp:
+    sample_time = int(now)
+    with patch.object(R, "HISTORY_PATH", Path(tmp) / "usage_history.json"), patch.object(
+            R, "HISTORY", [{"ts": sample_time - 3600, "accounts": {"a": [0.5, now + 200000]}}]), patch.object(
+            R, "ROLLUP", {}), patch.object(R, "BILLING", {}):
+        R.record_history(sample_time)
+        ledger = R.ROLLUP["quota"][time.strftime("%Y-%m-%d", time.localtime(sample_time))]["a"]
+        outlook = R.weekly_outlook(sample_time)
+        check("weekly history, projection and billing use general 7d and its reset",
+              R.HISTORY[-1]["accounts"] == {"a": [0.69, now + 200000]}
+              and R.weekly_reset("a") == now + 200000 and outlook["capacity"] == 100
+              and outlook["projection"][0][1:] == [69, 100]
+              and abs(ledger[0] - 19) < 0.01 and ledger[1] == 0)
 
 print(f"\nall {PASS} checks passed")

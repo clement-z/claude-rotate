@@ -36,6 +36,7 @@ A device key given as a string reaches the Claude accounts only; an object
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -266,28 +267,100 @@ def storage_error(operation: str, error: Exception) -> None:
     STORAGE_ERRORS[operation] = prior
 
 
+STATE_VERSION = 1
+MODEL_FAMILIES = ("default", "fable")
+GENERAL_CLAIMS = ("5h", "7d")
+KNOWN_CLAIMS = {"5h": MODEL_FAMILIES, "7d": MODEL_FAMILIES, "7d_oi": ("fable",)}
+CLAIM_HEADER = re.compile(r"anthropic-ratelimit-unified-([a-z0-9][a-z0-9_-]{0,31})-(utilization|status|reset)")
+CLAIM_STATUS = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+MAX_LEARNED_CLAIMS = 29
+
+
+def model_family(model) -> str:
+    return "fable" if isinstance(model, str) and "fable" in model.lower() else "default"
+
+
+def legacy_claims(info: dict) -> dict:
+    claims = {}
+    for claim in GENERAL_CLAIMS:
+        reading = {}
+        for field, prefix in (("utilization", "util"), ("reset", "reset")):
+            value = info.get(f"{prefix}_{claim}")
+            if providers.number(value) and (value > 0 if field == "reset" else value >= 0):
+                reading[field] = value
+        if reading:
+            if providers.number(info.get("last_seen")):
+                reading["seen_at"] = info["last_seen"]
+            claims[claim] = reading
+    return claims
+
+
+def sync_legacy_claims(info: dict) -> None:
+    # The old routing and offline admin still read these fields.
+    for claim in GENERAL_CLAIMS:
+        reading = info["claims"].get(claim, {})
+        for field, prefix in (("utilization", "util"), ("reset", "reset")):
+            key = f"{prefix}_{claim}"
+            if field in reading:
+                info[key] = reading[field]
+            else:
+                info.pop(key, None)
+
+
+def seed_routes(state: dict) -> None:
+    # Legacy routing remains authoritative until the family routing change.
+    active = state.get("active_account")
+    if active not in ACCOUNTS:
+        active = next(iter(ACCOUNTS))
+    manual = state.get("pinned")
+    if manual != active or ACCOUNTS[active].get("disabled"):
+        manual = None
+    state["routes"] = {family: {"active_account": active, "last_switch_ts": state.get("last_switch_ts", 0),
+                                "manual_account": manual} for family in MODEL_FAMILIES}
+
+
+def write_state(state: dict) -> None:
+    # Write-then-rename so a crash mid-write can never leave a truncated
+    # state.json (which would refuse to parse on the next start).
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(STATE_PATH)
+    except OSError as exc:
+        storage_error("state_write", exc)
+
+
 def load_state() -> dict:
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {
-        "active_account": CFG["accounts"][0]["name"],
-        "accounts": {a["name"]: {} for a in CFG["accounts"]},
+    exists = STATE_PATH.exists()
+    state = json.loads(STATE_PATH.read_text()) if exists else {
+        "active_account": next(iter(ACCOUNTS)),
+        "accounts": {name: {} for name in ACCOUNTS},
         "events": [],
     }
+    if "version" not in state:
+        now = time.time()
+        for info in state["accounts"].values():
+            info["claims"] = legacy_claims(info)
+            sync_legacy_claims(info)
+            pace = info.get("pace_until")
+            if providers.number(pace) and pace > now:
+                info["pace_by_family"] = dict.fromkeys(MODEL_FAMILIES, pace)
+            if info.get("status") == "rejected":
+                info.pop("status")
+        state["version"] = STATE_VERSION
+        seed_routes(state)
+        if exists:
+            write_state(state)
+    return state
 
 
 STATE = load_state()
 
 
 def save_state() -> None:
-    # Write-then-rename so a crash mid-write can never leave a truncated
-    # state.json (which would refuse to parse on the next start).
-    tmp = STATE_PATH.with_suffix(".json.tmp")
-    try:
-        tmp.write_text(json.dumps(STATE, indent=2))
-        tmp.replace(STATE_PATH)
-    except OSError as exc:
-        storage_error("state_write", exc)
+    if STATE.get("version") == STATE_VERSION:
+        seed_routes(STATE)
+    write_state(STATE)
 
 
 def audit(rec: dict) -> None:
@@ -326,20 +399,34 @@ def _write_audit(rec: dict) -> None:
         f.write(line)
 
 
+def account_claims(info: dict) -> dict:
+    return info["claims"] if "claims" in info else legacy_claims(info)
+
+
+def applicable_claims(info: dict, family: str) -> dict:
+    learned = info.get("learned_claims", {}).get(family, ())
+    return {claim: reading for claim, reading in account_claims(info).items()
+            if family in KNOWN_CLAIMS.get(claim, ()) or claim in learned}
+
+
+def claim_reading(name: str, claim: str) -> dict:
+    return account_claims(STATE["accounts"].get(name, {})).get(claim, {})
+
+
+def claim_utilization(name: str, claim: str) -> float | None:
+    reading = claim_reading(name, claim)
+    reset = reading.get("reset")
+    if reset is not None and reset <= time.time():
+        return None
+    return reading.get("utilization")
+
+
 def utilization(name: str) -> float:
-    info = STATE["accounts"].get(name, {})
-    now = time.time()
-    # A window that has reset no longer counts against the account.
-    if info.get("reset_5h") and now >= info["reset_5h"]:
-        return 0.0
-    return info.get("util_5h", 0.0)
+    return claim_utilization(name, "5h") or 0.0
 
 
 def util_7d(name: str) -> float:
-    info = STATE["accounts"].get(name, {})
-    if info.get("reset_7d") and time.time() >= info["reset_7d"]:
-        return 0.0
-    return info.get("util_7d", 0.0)
+    return claim_utilization(name, "7d") or 0.0
 
 
 def priority(name: str) -> int:
@@ -414,7 +501,7 @@ def usable(name: str) -> bool:
 
 
 def weekly_reset(name: str) -> float:
-    return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
+    return claim_reading(name, "7d").get("reset") or float("inf")
 
 
 def earliest_relief() -> float:
@@ -446,31 +533,91 @@ def pick_account() -> str | None:
     return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
 
 
-async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
+def parse_claims(headers: httpx.Headers) -> dict:
+    claims = {}
+    learned_count = 0
+    for name, value in headers.items():
+        match = CLAIM_HEADER.fullmatch(name.lower())
+        if not match:
+            continue
+        claim, field = match.groups()
+        if claim == "overage" or claim.startswith(("overage-", "overage_")):
+            continue
+        if claim not in KNOWN_CLAIMS and claim not in claims:
+            if learned_count >= MAX_LEARNED_CLAIMS:
+                continue
+            learned_count += 1
+        reading = claims.setdefault(claim, {})
+        if len(value) > 256:
+            continue
+        values = [part.strip().lower() for part in value.split(",")]
+        if field == "status":
+            if CLAIM_STATUS.fullmatch(values[0]) and all(part == values[0] for part in values):
+                reading[field] = values[0]
+            continue
+        try:
+            numbers = [float(part) for part in values]
+        except ValueError:
+            continue
+        number = numbers[0]
+        if (providers.number(number) and (number > 0 if field == "reset" else number >= 0)
+                and all(part == number for part in numbers)):
+            reading[field] = number
+    return claims
+
+
+def observe_claims(info: dict, headers: httpx.Headers, status: int, family: str | None, now: float) -> None:
+    reported = parse_claims(headers)
+    if not reported:
+        return
+    claims = info.setdefault("claims", account_claims(info))
+    learned = info.setdefault("learned_claims", {}) if family is not None else {}
+    members = set(learned.get(family, ()))
+    weekly = reported.get("7d", {})
+    if family is not None and 200 <= status < 300:
+        info.setdefault("last_success_claims", {})[family] = sorted(reported)
+        if "utilization" in weekly and weekly.get("reset", 0) > now:
+            if "5h" not in reported:
+                claims.pop("5h", None)
+            if family == "fable" and "7d_oi" not in reported:
+                claims.pop("7d_oi", None)
+            for claim in members - reported.keys():
+                if not any(claim in ids for other, ids in learned.items() if other != family):
+                    claims.pop(claim, None)
+            members.intersection_update(reported)
+    count = sum(claim not in KNOWN_CLAIMS for claim in claims)
+    for claim, fields in reported.items():
+        if not fields:
+            continue
+        if claim not in KNOWN_CLAIMS:
+            if family is None or (claim not in claims and count >= MAX_LEARNED_CLAIMS):
+                continue
+            count += claim not in claims
+            members.add(claim)
+        reading = claims.setdefault(claim, {})
+        if ("reset" in fields and reading.get("reset", now + 1) <= now
+                and fields["reset"] > now):
+            # A new window cannot inherit the old window's usage or rejection.
+            reading.clear()
+        reading.update(fields, seen_at=now)
+    if family is not None:
+        learned[family] = sorted(members)
+    sync_legacy_claims(info)
+
+
+async def note_response(account: str, headers: httpx.Headers, status: int, *, family: str | None = "default") -> str | None:
     """Update account state from unified rate-limit headers; maybe switch.
 
     Returns what happened: "burst" (per-minute 429, paced — no rotation),
     "switched" (active account changed, retry can ride it), "exhausted"
     (quota gone and nowhere better to go), or None.
     """
-    def _f(h):
-        v = headers.get(h)
-        return float(v) if v is not None else None
-
     async with state_lock:
         info = STATE["accounts"].setdefault(account, {})
-        for key, header in (
-            ("util_5h", "anthropic-ratelimit-unified-5h-utilization"),
-            ("util_7d", "anthropic-ratelimit-unified-7d-utilization"),
-            ("reset_5h", "anthropic-ratelimit-unified-5h-reset"),
-            ("reset_7d", "anthropic-ratelimit-unified-7d-reset"),
-        ):
-            val = _f(header)
-            if val is not None:
-                info[key] = val
+        now = time.time()
+        observe_claims(info, headers, status, family, now)
         if headers.get("anthropic-ratelimit-unified-status"):
             info["status"] = headers["anthropic-ratelimit-unified-status"]
-        now = time.time()
         info["last_seen"] = now
 
         quota_hit = info.get("status") == "rejected" or (
@@ -484,6 +631,7 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             except ValueError:
                 pace = 15.0
             info["pace_until"] = now + pace
+            info["pace_by_family"] = dict.fromkeys(MODEL_FAMILIES, info["pace_until"])
             save_state()
             return "burst"
 
@@ -722,8 +870,12 @@ HISTORY = load_history()
 
 
 def weekly_snapshot() -> dict:
-    return {n: [round(util_7d(n), 4), STATE["accounts"][n]["reset_7d"]] for n in ACCOUNTS
-            if not disabled(n) and STATE["accounts"].get(n, {}).get("reset_7d")}
+    snapshot = {}
+    for name in ACCOUNTS:
+        reading = claim_reading(name, "7d")
+        if not disabled(name) and "utilization" in reading and reading.get("reset"):
+            snapshot[name] = [round(util_7d(name), 4), reading["reset"]]
+    return snapshot
 
 
 def record_history(now: float) -> None:
@@ -1999,7 +2151,7 @@ def add_claude_audit_fields(rec: dict, upstream: httpx.Response, account: str, r
 
 
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, rec: dict,
-                        request: Request | None = None):
+                        request: Request | None = None, *, family: str | None = None):
     """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
     pick the active account, pace bursts, retry through switches, optionally hold
     until the soonest window reset. Returns (upstream, account, retries, noted,
@@ -2029,7 +2181,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                 stream=True)
             if upstream.status_code != 429:
                 return upstream, account, retries, noted, verdict
-            verdict = await note_response(account, upstream.headers, 429)
+            verdict = await note_response(account, upstream.headers, 429, family=family)
             retry_after = upstream.headers.get("retry-after")
             entry = {"account": account, "verdict": verdict,
                      "retry_after": retry_after[:200] if retry_after is not None else None,
@@ -2110,8 +2262,9 @@ async def openai_chat(request: Request):
     fwd = {"content-type": "application/json", "accept-encoding": "identity",
            "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
     rec = {"device": device, "path": "/v1/chat/completions", "method": "POST", "model": abody.get("model")}
+    family = model_family(rec["model"])
     upstream, account, retries, noted, verdict = await send_upstream(
-        "POST", "/v1/messages", fwd, json.dumps(abody).encode(), rec, request)
+        "POST", "/v1/messages", fwd, json.dumps(abody).encode(), rec, request, family=family)
 
     add_claude_audit_fields(rec, upstream, account, retries)
     resp_headers = {"x-rotate-account": account}
@@ -2150,7 +2303,7 @@ async def openai_chat(request: Request):
                 rec["util_5h"] = upstream.headers.get(
                     "anthropic-ratelimit-unified-5h-utilization")
                 audit(rec)
-                await note_response(account, upstream.headers, upstream.status_code)
+                await note_response(account, upstream.headers, upstream.status_code, family=family)
 
         return StreamingResponse(relay(), status_code=200, headers=resp_headers,
                                  media_type="text/event-stream")
@@ -2159,7 +2312,7 @@ async def openai_chat(request: Request):
     if upstream.status_code == 429:
         rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
     if not noted:
-        await note_response(account, upstream.headers, upstream.status_code)
+        await note_response(account, upstream.headers, upstream.status_code, family=family)
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     if upstream.status_code != 200:
         try:
@@ -2592,10 +2745,12 @@ async def proxy(request: Request, path: str):
     body = await bounded_body(request)
     fwd_headers = forward_headers(request)
     model = request_model(request, body)
-    url = upstream_url(UPSTREAM, upstream_path(request), upstream_query(request))
+    raw_path = upstream_path(request)
+    family = model_family(model) if request.method == "POST" and raw_path == "/v1/messages" else None
+    url = upstream_url(UPSTREAM, raw_path, upstream_query(request))
     rec = {"device": device, "path": "/" + path, "method": request.method, "model": model}
     upstream, account, retries, noted, _verdict = await send_upstream(
-        request.method, url, fwd_headers, body, rec, request)
+        request.method, url, fwd_headers, body, rec, request, family=family)
 
     add_claude_audit_fields(rec, upstream, account, retries)
     resp_headers = response_headers(upstream)
@@ -2622,7 +2777,7 @@ async def proxy(request: Request, path: str):
                 rec["usage"] = summarize_usage(usage_acc)
                 rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
                 audit(rec)
-                await note_response(account, upstream.headers, upstream.status_code)
+                await note_response(account, upstream.headers, upstream.status_code, family=family)
 
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
@@ -2636,7 +2791,7 @@ async def proxy(request: Request, path: str):
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     audit(rec)
     if not noted:
-        await note_response(account, upstream.headers, upstream.status_code)
+        await note_response(account, upstream.headers, upstream.status_code, family=family)
     return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
 
 
