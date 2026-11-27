@@ -304,11 +304,11 @@ async def history_checks():
     start = int(time.time()) // 300 * 300 + 10
     now = start
     reset = start + 3600
-    poll = {"rate_limit": {
-        "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": reset},
+    poll = {"plan_type": "prolite", "rate_limit": {
+        "primary_window": {"used_percent": 95, "limit_window_seconds": 18000, "reset_at": reset},
         "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800, "reset_at": reset}},
         "additional_rate_limits": [{"metered_feature": "old-limit", "rate_limit": {
-            "primary_window": {"used_percent": 3, "limit_window_seconds": 86400}}}]}
+            "primary_window": {"used_percent": 0, "limit_window_seconds": 86400}}}]}
     status = 200
     image_used = 12
 
@@ -330,17 +330,24 @@ async def history_checks():
         now += 1
         await OAI.maintain()
         check("a skipped poll makes no observation, and a successful zero is recorded",
-              points(OAI, "codex", 300) == [[start, 0, reset, "usage"]])
+              points(OAI, "codex", 300) == [[start, 95, reset, "usage"]]
+              and points(OAI, "old_limit", 1440) == [[start, 0, None, "usage"]])
         now += 299
         windows = poll["rate_limit"]
         windows["primary_window"], windows["secondary_window"] = windows["secondary_window"], windows["primary_window"]
         del poll["additional_rate_limits"]
         await OAI.maintain()
         check("unchanged polls survive a primary/secondary swap, and omitted limits retain history",
-              points(OAI, "codex", 300) == [[start, 0, reset, "usage"], [now, 0, reset, "usage"]]
+              points(OAI, "codex", 300) == [[start, 95, reset, "usage"], [now, 95, reset, "usage"]]
               and len(points(OAI, "codex", 10080)) == 2
-              and points(OAI, "old_limit", 1440) == [[start, 3, None, "usage"]])
-        now += 300
+              and points(OAI, "old_limit", 1440) == [[start, 0, None, "usage"]])
+        siwc["openai"].answer = lambda request: httpx.Response(200, headers={
+            "x-codex-secondary-used-percent": "88", "x-codex-secondary-window-minutes": "10080"}, json={"ok": True})
+        now += 1
+        await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
+        check("a later header reading wins when a usage poll shares its bucket",
+              points(OAI, "codex", 10080) == [[start, 34, reset, "usage"], [now, 88, None, "inference"]])
+        now += 299
         status = 503
         before = OAI.quota_history.snapshot(now)
         await OAI.maintain()
@@ -360,13 +367,21 @@ async def history_checks():
               PLAIN.quota_history.snapshot(now) == [
                   {"limit": "codex", "minutes": 300, "points": [[now, 80, None, "inference"]]}]
               and len(points(OAI, "codex", 300)) == 2)
-        siwc["openai"].answer = lambda request: httpx.Response(200, headers={
-            "x-codex-secondary-used-percent": "88", "x-codex-secondary-window-minutes": "300"}, json={"ok": True})
-        now = start + 301
         await call("POST", "/openai/v1/responses", content=js({"model": "gpt-5.1-codex"}))
-        check("a later header reading wins when a usage poll shares its bucket",
-              points(OAI, "codex", 300) == [[start, 0, reset, "usage"], [now, 88, None, "inference"]])
-        now = start + 602
+        headers = {"authorization": f"Bearer {DESK}"}
+        meters = (await C.get("/rotate/status", headers=headers)).json()["providers"]["openai"]["quotas"]["codex"]
+        check("a weekly-only header keeps the 5h meter and its original receipt time even after a slot swap",
+              meters["secondary"] == {"window_minutes": 300, "used_percent": 95, "resets_at": reset,
+                                      "seen_at": start + 300}
+              and meters["primary"] == {"window_minutes": 10080, "used_percent": 88, "resets_at": None,
+                                        "seen_at": int(now)}
+              and meters["plan"] == "prolite")
+        alerts = (await C.get("/rotate/stats", headers=headers)).json()["alerts"]
+        check("the 5h warning survives and only the weekly history gets a new observation",
+              any(a["text"].startswith("provider openai: quota codex at 95%") for a in alerts)
+              and points(OAI, "codex", 300) == [[start, 95, reset, "usage"], [start + 300, 95, reset, "usage"]]
+              and points(OAI, "codex", 10080)[-1] == [now, 88, None, "inference"]
+              and len(points(OAI, "codex", 10080)) == 3)
         saved = R.quota_history_snapshot(now)
         admission = gate()
         admission.active = admission.limit
@@ -395,8 +410,11 @@ async def history_checks():
               and stat.S_IMODE(path.stat().st_mode) == 0o600 and path.stat().st_mtime_ns == mtime)
         for p in (OAI, PLAIN, DRAW):
             p.quota_history = P.QuotaHistory()
+        R.QUOTAS_PATH.write_text(json.dumps(R.quota_figures()))
+        OAI.quotas = {}
         R.load_quotas()
-        check("latest cache load makes no history points", not R.quota_history_snapshot(now))
+        check("loading the populated latest cache restores meters and their timestamps without history points",
+              OAI.quotas.get("codex") == meters and not R.quota_history_snapshot(now))
         R.load_quota_history()
         check("restart restores observations exactly", R.quota_history_snapshot(now) == saved)
 
@@ -439,6 +457,20 @@ async def history_checks():
         R.save_quota_history(now)
         check("idle maintenance prunes expired observations from memory and disk",
               not OAI.quota_history.series and not json.loads(path.read_text())["providers"])
+
+        poll = {"additional_rate_limits": [
+            {"metered_feature": f"limit_{i:02d}", "rate_limit": {
+                "primary_window": {"used_percent": 10, "limit_window_seconds": 3600}}}
+            for i in range(17)]}
+        status = 200
+        with patch.object(OAI.images, "_remaining", return_value=86400):
+            for _ in range(20):
+                now += P.USAGE_POLL_S
+                await OAI.maintain()
+        series = OAI.quota_history.snapshot(now)
+        check("twenty identical polls with seventeen windows retain twenty points in the same sixteen series",
+              [s["limit"] for s in series] == [f"limit_{i:02d}" for i in range(1, 17)]
+              and all(len(s["points"]) == 20 for s in series))
 
 
 async def main():
@@ -929,12 +961,15 @@ async def main():
     check("/rotate/status keeps the provider's quotas keyed imagegen_premium and codex",
           set(quotas) == {"imagegen_premium", "codex"})
     check("imagegen_premium from the image answer: primary window, plan, route images, seen_at",
-          img.get("primary") == {"used_percent": 95.0, "window_minutes": 10080, "resets_at": resets}
+          img.get("primary") == {"used_percent": 95.0, "window_minutes": 10080, "resets_at": resets,
+                                 "seen_at": img["seen_at"]}
           and img.get("secondary") is None and img.get("plan") == "plus" and img.get("route") == "images"
           and abs(img.get("seen_at", 0) - time.time()) < 60)
     check("codex from the /v1/responses answer: primary and secondary windows, route inference",
-          cdx.get("primary") == {"used_percent": 40.0, "window_minutes": 300, "resets_at": resets - 3600}
-          and cdx.get("secondary") == {"used_percent": 20.0, "window_minutes": 10080, "resets_at": resets + 86400}
+          cdx.get("primary") == {"used_percent": 40.0, "window_minutes": 300, "resets_at": resets - 3600,
+                                 "seen_at": cdx["seen_at"]}
+          and cdx.get("secondary") == {"used_percent": 20.0, "window_minutes": 10080, "resets_at": resets + 86400,
+                                       "seen_at": cdx["seen_at"]}
           and cdx.get("route") == "inference" and abs(cdx.get("seen_at", 0) - time.time()) < 60)
     r = await C.get("/rotate/stats", headers={"authorization": f"Bearer {DESK}"})
     alerts = [a["text"] for a in r.json()["alerts"] if "quota" in a["text"]]
@@ -971,12 +1006,15 @@ async def main():
           and not leaks(polls[0], SECRETS - CODEX_SECRETS))
     q = OAI.status()["quotas"]
     check("its 5-hour and weekly windows become quota codex, route usage, with the plan",
-          q.get("codex", {}).get("primary") == {"used_percent": 12.0, "window_minutes": 300, "resets_at": now + 600}
-          and q["codex"].get("secondary") == {"used_percent": 34.0, "window_minutes": 10080, "resets_at": now + 86400}
+          q.get("codex", {}).get("primary") == {"used_percent": 12.0, "window_minutes": 300, "resets_at": now + 600,
+                                               "seen_at": q["codex"]["seen_at"]}
+          and q["codex"].get("secondary") == {"used_percent": 34.0, "window_minutes": 10080,
+                                             "resets_at": now + 86400, "seen_at": q["codex"]["seen_at"]}
           and q["codex"].get("route") == "usage" and q["codex"].get("plan") == "prolite")
     check("an additional limit lands under its metered feature",
           q.get("imagegen_premium", {}).get("primary") == {"used_percent": 3.0, "window_minutes": 1440,
-                                                            "resets_at": now + 99}
+                                                            "resets_at": now + 99,
+                                                            "seen_at": q["imagegen_premium"]["seen_at"]}
           and q["imagegen_premium"].get("route") == "usage" and login.usage_error is None)
     await OAI.maintain()
     check("the usage is not read again within 5 minutes",
@@ -1012,7 +1050,6 @@ async def main():
     R.load_quotas()
     check("an unreadable file is ignored", OAI.quotas == {})
     OAI.quotas = before
-    R.save_quotas()
 
     audit_text = R.AUDIT_PATH.read_text()
     check("no token or device key appears in /rotate/status, /rotate/stats or the audit log",

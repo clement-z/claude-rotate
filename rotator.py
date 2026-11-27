@@ -1604,7 +1604,7 @@ function quotas(name,p){const now=Date.now()/1000, q=p.quotas||{}, im=p.images;
   // A window that has reset since the figure counts as 0, as for the Claude accounts.
   const row=(what,f,w)=>{const past=w.resets_at&&w.resets_at<=now;
     return meter(esc(wlabel(w.window_minutes)||'–'),past?0:(w.used_percent||0)/100,0.9,
-      esc([what,past?'window reset since':w.resets_at?'resets in '+dur(w.resets_at-now):'','seen '+ago(Math.round((now-(f.seen_at||now))/60))].filter(Boolean).join(' · ')))};
+      esc([what,past?'window reset since':w.resets_at?'resets in '+dur(w.resets_at-now):'','seen '+ago(Math.round((now-(w.seen_at??f.seen_at??now))/60))].filter(Boolean).join(' · ')))};
   const empty=(label,text)=>`<div class="meter-row"><span class="muted">${esc(label)}</span><div class="meter"></div><span class="muted small">${esc(text)}</span></div>`;
   const ids=Object.keys(q), images=ids.filter(id=>/^image/.test(id));
   let rows=q.codex?wins(q.codex).map(w=>row('model',q.codex,w)).join(''):empty('–',im?'model · no figure yet: read every 5 min':'model · read only with an images login');

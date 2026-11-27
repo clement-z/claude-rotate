@@ -26,11 +26,12 @@ const value = '<mark data-audit="marker">&\'"</mark>';
 const elements = {}, urls = [], replaced = [];
 const usage = {requests:1,input_tokens:1,output_tokens:1,cache_read:0,cache_write:0,cost_usd:0};
 const D=86400, now=1_800_000_000, start=now-14*D, reset=now-5*D;
+const receipt=Math.floor(Date.now()/1000);
 const stats = {devices:{[value]:{last_model:value,last_account:value,key_suffix:value}},alerts:[{level:'warn',text:value}],by_device:{[value]:usage},by_model:{[value]:usage},by_account:{[value]:usage},periods:{since:value,'7d':{device:{[value]:usage},model:{[value]:usage}},'30d':{device:{[value]:usage},model:{[value]:usage}},all:{device:{[value]:usage,[value+'-gone']:usage},model:{[value]:usage}},trend:{[value]:[0,1,2]}},billing:{[value]:{plan:value,price:200,renews:value,periods:[{start:value,end:value,days:31,elapsed:20,covered:18,plans:[value],price:180.5,used:70,peak:80,pool_peak:60,limited_h:1,blocked_h:0.5,usage,whatif:[{plan:value,price:-100,pool_peak:120}]}]}}};
 const status = {accounts:{[value]:{priority:100},[value+'2']:{priority:100}},active_account:value,pinned:value,strategy:value,switch_threshold:.8,switch_threshold_7d:.98,recent_events:[{ts:value,from:value,to:value,reason:value}],weekly:{series:[[now-2*D,0,100],[now,10,100]],projection:[[now,10,100],[now+2*D,100,100]],rate_per_day:5,eta:now+2*D,back:now+3*D,back_account:value,capacity:200},
   providers:{[value]:{kind:'openai-siwc',state:value,reason:value,
                       quotas:{[value]:{primary:{used_percent:95,window_minutes:value,resets_at:value},secondary:{used_percent:value,window_minutes:300,resets_at:0},plan:value,route:value,seen_at:value},
-                              imagegen_premium:{primary:{used_percent:40,window_minutes:10080,resets_at:9e9},secondary:null,plan:value,route:'images',seen_at:0}},
+                              imagegen_premium:{primary:{used_percent:40,window_minutes:10080,resets_at:9e9,seen_at:receipt-7200},secondary:null,plan:value,route:'images',seen_at:receipt}},
                       images:{state:value,reason:value,unsaved:value,last_error:value,access_token_min:value,last_answer:{status:value,at:value}}},
              [value+'-bare']:{kind:'openai-siwc',state:'ok',quotas:{}},
              [value+'-static']:{kind:'static-bearer',state:'ok',reason:value}}};
@@ -205,6 +206,7 @@ elements.tip.parentNode=new Element();
   assert(!oai.includes(value+'-static')&&!oai.includes('&lt;mark data-audit=&quot;marker&quot;&gt;&amp;&#39;&quot;&lt;/mark&gt;-static'),'static-bearer provider got a quota card');
   assert(oai.includes('images ')&&oai.includes('title="&lt;mark'),'images badge or its escaped title missing');
   assert(oai.includes('>7d<')&&oai.includes('images · ')&&oai.includes('model · read only with an images login'),'quota rows or the empty card missing');
+  assert(oai.includes('seen 2.0 h ago'),'a meter displays its window receipt time');
   assert(elements.pills.innerHTML.includes('>Rotate<')&&!elements.pills.innerHTML.includes('disabled'),'rotate button missing');
   assert(elements.accounts.innerHTML.includes('Resume auto')&&elements.accounts.innerHTML.includes('>Select<'),'account buttons missing');
   elements.accounts.onclick({target:{closest:()=>({dataset:{sw:value+'2'}})}});

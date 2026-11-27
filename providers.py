@@ -235,9 +235,12 @@ class QuotaHistory:
             self.dirty = True
 
     def cap_series(self) -> None:
-        while len(self.series) > QUOTA_MAX_SERIES:
-            oldest = min(self.series, key=lambda key: max(self.series[key].values())[0])
-            del self.series[oldest]
+        excess = len(self.series) - QUOTA_MAX_SERIES
+        if excess > 0:
+            oldest = sorted(self.series, key=lambda key: (
+                max(self.series[key].values())[0], len(self.series[key]), key))
+            for key in oldest[:excess]:
+                del self.series[key]
             self.dirty = True
 
     def prune(self, now: float) -> None:
@@ -492,15 +495,32 @@ class OpenAISiwc:
             await self.refresh(self.rec["access_token"])
 
     def record_quotas(self, quotas: dict, source: str, seen: float) -> None:
+        slots = ("primary", "secondary")
         for limit, figures in quotas.items():
-            self.quotas[limit] = figures | {"route": source, "seen_at": int(seen)}
-            for slot in ("primary", "secondary"):
-                if window := figures.get(slot):
-                    reset = window["resets_at"]
-                    if not (number(reset) and 0 < reset < QUOTA_RESET_MAX):
-                        reset = None
-                    self.quota_history.add(limit, window["window_minutes"],
-                                           [seen, window["used_percent"], reset, source])
+            observed = {slot: figures[slot] | {"seen_at": int(seen)} for slot in slots if figures.get(slot)}
+            for window in observed.values():
+                reset = window["resets_at"]
+                if not (number(reset) and 0 < reset < QUOTA_RESET_MAX):
+                    reset = None
+                self.quota_history.add(limit, window["window_minutes"], [seen, window["used_percent"], reset, source])
+            latest = figures | observed | {"route": source, "seen_at": int(seen)}
+            prior = self.quotas.get(limit, {})
+            if source != "usage" and len(observed) == 1:
+                slot, window = next(iter(observed.items()))
+                minutes = window["window_minutes"]
+                latest[slot] = None
+                # A header can report a window in a different slot.
+                for which in slots:
+                    prev = prior.get(which)
+                    if not isinstance(prev, dict):
+                        continue
+                    latest[which] = {"seen_at": prior.get("seen_at")} | prev
+                    if minutes and prev.get("window_minutes") == minutes:
+                        slot = which
+                latest[slot] = window
+                if "plan" not in latest and "plan" in prior:
+                    latest["plan"] = prior["plan"]
+            self.quotas[limit] = latest
         self.quota_history.cap_series()
 
     def status(self) -> dict:
