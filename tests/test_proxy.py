@@ -45,7 +45,7 @@ R.HOLD_MAX_S = 0
 def fresh_state(active="a", accounts=None):
     R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
                "last_switch_ts": 0}
-    R.RECOVERY_PROBES.clear()
+    R.LAST_BLOCKED_ACCOUNT.clear()
     R.AUDIT_PATH.write_text("")
 
 
@@ -397,45 +397,70 @@ check("a 4 KiB audit file keeps the attempt and error after dropping both header
       and "ratelimit" not in rec and "headers" not in rec["rate_limits"][0]
       and rec["rate_limits"][0]["error"] == returned_error)
 
-# --- 7. every account spent, hold on → bounded recovery probe -----------------
+# --- 7. blocked pools dispatch in family order and can recover ---------------
 now = time.time()
-fresh_state("a", {"a": {"util_5h": 0.1, "reset_5h": now + 100},
-                  "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
-R.HOLD_MAX_S = 2  # deadline caps the wait so the test stays fast
+spent = {"a": {"util_5h": 1.0, "reset_5h": now + 100},
+         "b": {"util_5h": 1.0, "reset_5h": now + 2000}}
+fresh_state("a", {name: reading.copy() for name, reading in spent.items()})
 calls = []
+
+
+def spent_answer():
+    return httpx.Response(429, json={"error": returned_error}, headers=unified(
+        u5="1.0", status="rejected",
+        **{"retry-after": "19", "anthropic-ratelimit-unified-5h-reset": str(now + 100)}))
+
+
+def stale_block(req):
+    account = req.headers["authorization"][-1]
+    calls.append(account)
+    if account == "a":
+        return spent_answer()
+    return httpx.Response(200, json={"content": []}, headers=unified(u5=None))
+
+
+use_upstream(stale_block)
+first = call(body={"model": "claude-opus-5"})
+fable = call(body={"model": "claude-fable-5"})
+second = call(body={"model": "claude-opus-5"})
+third = call(body={"model": "claude-opus-5"})
+check("each family starts at earliest relief and round-robin reaches the account with a stale block",
+      [r.status_code for r in (first, fable, second, third)] == [429, 429, 200, 200]
+      and calls == ["a", "a", "b", "b"] and "5h" not in R.STATE["accounts"]["b"]["claims"])
+
+fresh_state("a", {"a": spent["a"].copy()})
+calls = []
+with patch.dict(R.ACCOUNTS, {"a": R.ACCOUNTS["a"]}, clear=True):
+    start = time.monotonic()
+    with patch.object(R, "HOLD_MAX_S", 0.05):
+        opaque = call("/v1/messages/count_tokens", body={"model": "claude-opus-5"})
+    elapsed = time.monotonic() - start
+    exhausted = call(chat, body=chat_body)
+check("count_tokens holds once, then relays the lone spent account's upstream 429",
+      opaque.status_code == 429 and opaque.json() == {"error": returned_error}
+      and opaque.headers["retry-after"] == "19" and elapsed >= 0.05
+      and calls == ["a", "a"] and [e["type"] for e in R.STATE["events"]] == ["hold"])
+check("chat converts the lone blocked account's upstream 429 to 503 with the relief deadline",
+      exhausted.status_code == 503 and int(exhausted.headers["retry-after"]) in range(95, 101)
+      and [rec["rate_limits"][0]["error"] for rec in audit_recs()] == [returned_error, returned_error])
 
 
 def hold_handler(req):
     calls.append(1)
     if len(calls) == 1:
-        # Keep the active account's reset the soonest (see scenario 6) so the
-        # verdict is "exhausted" and the hold path actually engages.
-        return httpx.Response(429, json={"error": "limit"},
-                              headers=unified(
-                                  u5="1.0", status="rejected",
-                                  **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}))
+        return spent_answer()
     return httpx.Response(200, json={"usage": {"input_tokens": 1, "output_tokens": 1}},
                           headers=unified(u5=None))
 
 
 use_upstream(hold_handler)
-t0 = time.time()
-with patch.object(R, "RECOVERY_PROBE_S", 0.05):
-    r = call()
-elapsed = time.time() - t0
-check("a held request probes after the interval and recovers after the plan drops 5h",
-      r.status_code == 200 and len(calls) == 2 and "5h" not in R.STATE["accounts"]["a"]["claims"])
-check("the recovery probe runs before the held request's deadline", 0.04 <= elapsed < R.HOLD_MAX_S)
-check("hold event recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
-R.HOLD_MAX_S = 0
-
 # At the deadline a route can have recovered since the saved 429.
 fresh_state("a", {"b": {"util_5h": 1.0, "reset_5h": now + 2000}})
 calls = []
 clock = [now]
 
 
-async def recover_on_expiry(seconds, request=None, *, wake=None):
+async def recover_on_expiry(seconds, request=None):
     clock[0] += seconds
     if seconds:
         R.STATE["accounts"]["a"]["claims"].pop("5h", None)
@@ -454,7 +479,7 @@ calls = []
 clock = [now]
 
 
-async def advance_hold(seconds, request=None, *, wake=None):
+async def advance_hold(seconds, request=None):
     clock[0] += seconds
 
 
@@ -487,10 +512,10 @@ async def family_replay(path, ambiguous):
     reset = time.time() + 10000
     wait_for_retry = R.retry_wait
 
-    async def retry_wait(seconds, request, *, wake=None):
+    async def retry_wait(seconds, request):
         if seconds:
             await asyncio.wait_for(opus_done.wait(), 2)
-        await wait_for_retry(seconds, request, wake=wake)
+        await wait_for_retry(seconds, request)
 
     async def respond(req):
         model = json.loads(req.content)["model"]
@@ -584,23 +609,15 @@ async def late_stream():
 
 check("a late Fable stream close cannot restore old claim readings or reverse the switch", asyncio.run(late_stream()))
 
-fresh_state("a", {"a": {"util_7d": 1, "reset_7d": time.time() + 100},
-                  "b": {"util_7d": 1, "reset_7d": time.time() + 500}})
-for family in R.MODEL_FAMILIES:
-    R.recovery_probe(family).next_at = time.monotonic() + 60
-
-
-def reject_dispatch(req):
-    raise AssertionError("blocked account was dispatched")
-
-
-use_upstream(reject_dispatch)
-local = call()
-chat_local = call(chat, body=chat_body)
-check("throttled probes return local 429 and chat 503 capped at the next probe opportunity",
-      local.status_code == 429 and chat_local.status_code == 503 and 55 <= int(local.headers["retry-after"]) <= 60
-      and 55 <= int(chat_local.headers["retry-after"]) <= 60
-      and all(rec["local"] and "rate_limits" not in rec for rec in audit_recs()))
+fresh_state()
+pin = {"account": "a", "mode": "strict"}
+use_upstream(lambda req: httpx.Response(429, content=b"not UTF-8 \xff", headers={"retry-after": "19"}))
+with patch.dict(R.CFG, {"account_pins": {"laptop": pin}}):
+    strict = call(chat, body=chat_body)
+check("strict chat relays the first 429 and Retry-After for a non-UTF-8 upstream refusal",
+      strict.status_code == 429 and strict.headers["retry-after"] == "19"
+      and strict.json()["error"]["message"] == "upstream: not UTF-8 \ufffd"
+      and len(audit_recs()) == 1 and len(audit_recs()[0]["rate_limits"]) == 1)
 
 # --- 8. admin endpoints ------------------------------------------------------
 fresh_state()

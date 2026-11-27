@@ -407,9 +407,25 @@ def test_rotate_rejections_do_not_mutate(f):
     r = f.run("rotate")  # every other account is ineligible
     assert r.returncode == 1 and "no other eligible" in r.stderr, r
     r = f.run("rotate", "acct-1")
-    assert r.returncode == 0 and "already the active" in r.stdout
+    assert r.returncode == 1 and "already active for every eligible family" in r.stderr
     assert f.state.read_bytes() == before_state and f.config.read_bytes() == before_cfg
     assert f.calls() == []  # never stopped the service for a refusal
+
+
+def test_rotate_refuses_split_route_noop(f):
+    reset = time.time() + 3600
+    write_state(f, {"active_account": "acct-1", "routes": {
+        "default": {"active_account": "acct-1"}, "fable": {"active_account": "acct-2"}},
+        "accounts": {"acct-1": {"claims": {"7d_oi": {"utilization": 1, "reset": reset}}},
+                     "acct-2": {"blocks_by_family": {"default": {"until": reset, "reason": "rejected"}}}},
+        "events": []})
+    before = f.state.read_bytes()
+    f.set_active(True)
+    f.reset_calls()
+    for args in (("acct-2",), ()):
+        r = f.run("rotate", *args)
+        assert r.returncode == 1 and "acct-2" in r.stderr and "already active for every eligible family" in r.stderr
+    assert f.state.read_bytes() == before and f.calls() == []
 
 
 def test_rotate_switches_after_stop_and_preserves_state(f):
@@ -570,7 +586,8 @@ def main():
              "test_readiness_needs_enabled_nonempty_token", "test_inherited_lock_descriptor",
              "test_restart_failure_is_reported", "test_concurrent_add_users_are_serialized",
              "test_status_has_no_secrets", "test_status_live_query_uses_header",
-             "test_rotate_rejections_do_not_mutate", "test_rotate_switches_after_stop_and_preserves_state",
+             "test_rotate_rejections_do_not_mutate", "test_rotate_refuses_split_route_noop",
+             "test_rotate_switches_after_stop_and_preserves_state",
              "test_remove_token_and_setup_needed", "test_set_url_and_symlinked_config"]
     tests = [(n, globals()[n]) for n in order]  # the fixture is built up step by step
     assert sorted(order) == sorted(n for n, g in globals().items() if n.startswith("test_") and callable(g))

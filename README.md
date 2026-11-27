@@ -709,11 +709,11 @@ answer. The weekly chart and billing use general weekly quota.
   the affected family until recheck. Shared-claim exhaustion blocks both.
 - **Holds and recovery**: if every enabled account is blocked for a family,
   its earliest relief is the first account whose applicable blockers all
-  end. With `hold_max_s` set, the proxy waits within that budget and reselects
-  as windows reopen. A request can probe the earliest-relief account while
-  all accounts are blocked. Each family allows one probe in flight and one
-  start per minute. A successful probe wakes held requests. Local exhaustion
-  replies cap `Retry-After` at the next probe opportunity, even with holds off.
+  end. With `hold_max_s` set, the proxy waits until that relief or the hold
+  deadline, then reselects. With holds off or the budget spent, if every account
+  is still blocked, the proxy sends one upstream attempt. Each family cycles
+  through enabled accounts, starting with the one due to recover first, so
+  traffic can refresh stale quota readings.
 
 ### Preferring one account over another
 
@@ -1021,9 +1021,8 @@ Roadmap, in intended order:
       loop is shared with the transparent proxy (`send_upstream`).
 - [x] **Exhaustion signal.** The OpenAI endpoint returns 503 +
       `Retry-After` when the requested family exhausts the pool (after any
-      hold). The transparent proxy relays an upstream 429 or returns a local
-      429 when all accounts are known blocked. A strict pin relays the first
-      upstream 429 on either endpoint.
+      hold). The transparent proxy relays the upstream 429. A strict pin
+      relays the first upstream 429 on either endpoint.
 - [ ] **Webhook alerts** (Slack/Teams/generic POST) firing on the same rules
       as the panel's alerts section.
 - [ ] **In-process audit rotation** — roll `logs/audit.jsonl` past a size/age

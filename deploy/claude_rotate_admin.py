@@ -1130,7 +1130,7 @@ def cmd_set_url(args) -> int:
 
 
 def choose_rotate_target(cfg: dict, state, requested):
-    """Validate an explicit target or pick the next eligible account after the current one."""
+    """Pick a target that can move at least one family route."""
     names = [a["name"] for a in cfg["accounts"]]
     if not names:
         raise Refused("no accounts configured; nothing changed")
@@ -1142,28 +1142,31 @@ def choose_rotate_target(cfg: dict, state, requested):
         if requested not in names:
             raise Refused(f"account '{requested}' is not in the configuration; nothing changed")
         eligible = eligible_routes(cfg, state, requested)
-        routes = (state or {}).get("routes", {})
-        if requested == current and all(routes.get(family, {}).get("active_account", current) == current
-                                        for family in eligible):
-            return current, None
         if not eligible:
             reasons = account_eligibility(cfg, state, requested)
             raise Refused(f"account '{requested}' cannot be made active: {'; '.join(reasons)}; nothing changed")
+        if not moving_routes(state, current, requested, eligible):
+            raise Refused(f"account '{requested}' is already active for every eligible family; nothing changed")
         return current, requested
     start = names.index(current) + 1 if current in names else 0
     report = []
     for name in names[start:] + names[:start]:
-        if name == current:
-            continue
-        if eligible_routes(cfg, state, name):
+        eligible = eligible_routes(cfg, state, name)
+        if moving_routes(state, current, name, eligible):
             return current, name
-        reasons = account_eligibility(cfg, state, name)
-        report.append(f"{name}: {'; '.join(reasons)}")
+        reason = ("already active for every eligible family" if eligible
+                  else "; ".join(account_eligibility(cfg, state, name)))
+        report.append(f"{name}: {reason}")
     raise Refused("no other eligible account; nothing changed" + (": " + " | ".join(report) if report else ""))
 
 
 def eligible_routes(cfg: dict, state, target: str) -> list:
     return [family for family in MODEL_FAMILIES if not account_eligibility(cfg, state, target, family)]
+
+
+def moving_routes(state, current: str, target: str, eligible: list) -> list:
+    routes = (state or {}).get("routes", {})
+    return [family for family in eligible if routes.get(family, {}).get("active_account", current) != target]
 
 
 def cmd_rotate(args) -> int:
@@ -1172,9 +1175,6 @@ def cmd_rotate(args) -> int:
         cfg = load_config()
         # Refusals are decided before the service is touched.
         current, target = choose_rotate_target(cfg, read_state(), args.account)
-        if target is None:
-            out(f"account '{current}' is already the active account; nothing changed")
-            return EXIT_OK
         managed = systemctl_available() and unit_installed()
         stopped_by_us = False
         if managed:
@@ -1206,6 +1206,11 @@ def cmd_rotate(args) -> int:
                 reasons = account_eligibility(cfg, state, target)
                 raise Refused(f"account '{target}' is no longer eligible after the service drained: "
                               f"{'; '.join(reasons)}; rotation state unchanged")
+            current = (state or {}).get("active_account") or current
+            changes = moving_routes(state, current, target, eligible)
+            if not changes:
+                raise Refused(f"account '{target}' is already active for every eligible family after the service "
+                              "drained; rotation state unchanged")
             if state is None:
                 state = default_state(cfg)
             if not isinstance(state.get("accounts"), dict):
@@ -1215,8 +1220,8 @@ def cmd_rotate(args) -> int:
             previous = state.get("active_account")
             now = time.time()
             routes = state.setdefault("routes", {})
-            scope = "active account" if "default" in eligible else "Fable active account"
-            display_previous = previous if "default" in eligible else routes.get("fable", {}).get("active_account", previous)
+            scope = "active account" if "default" in changes else "Fable active account"
+            display_previous = previous if "default" in changes else routes.get("fable", {}).get("active_account", previous)
             legacy_manual = previous if state.get("pinned") == previous else None
             last_switch = state.get("last_switch_ts")
             if type(last_switch) not in (int, float) or not 0 <= last_switch < 1e15:
@@ -1226,7 +1231,7 @@ def cmd_rotate(args) -> int:
                                                    "last_switch_ts": last_switch,
                                                    "manual_account": legacy_manual})
                 source = route["active_account"]
-                if family not in eligible or target == source:
+                if family not in changes:
                     continue
                 route.update(active_account=target, last_switch_ts=now, manual_account=None)
                 util = effective_utilization(state["accounts"].get(source) or {}, now)[0]

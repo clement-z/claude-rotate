@@ -560,44 +560,7 @@ def disabled(name: str) -> bool:
 
 
 RECHECK_S = 300
-RECOVERY_PROBE_S = 60
-
-
-class RecoveryProbe:
-    def __init__(self):
-        self.next_at = 0.0
-        self.in_flight = False
-        self.changed = asyncio.Event()
-
-    def wake_waiters(self) -> None:
-        self.changed.set()
-        self.changed = asyncio.Event()
-
-
-RECOVERY_PROBES: dict[str, RecoveryProbe] = {}
-
-
-def recovery_probe(family: str) -> RecoveryProbe:
-    if family not in RECOVERY_PROBES:
-        RECOVERY_PROBES[family] = RecoveryProbe()
-    return RECOVERY_PROBES[family]
-
-
-class ProbeStream(httpx.AsyncByteStream):
-    def __init__(self, stream: httpx.AsyncByteStream, probe: RecoveryProbe):
-        self.stream, self.probe = stream, probe
-
-    async def __aiter__(self):
-        async for chunk in self.stream:
-            yield chunk
-
-    async def aclose(self) -> None:
-        try:
-            await self.stream.aclose()
-        finally:
-            self.probe.in_flight = False
-
-
+LAST_BLOCKED_ACCOUNT: dict[str, str] = {}
 
 
 def family_route(family: str) -> dict:
@@ -660,9 +623,14 @@ def earliest_relief(family: str = "default", now: float | None = None) -> float:
                default=now + RECHECK_S)
 
 
-def recovery_delay(family: str, now: float, monotonic: float) -> float:
-    probe_delay = max(1, recovery_probe(family).next_at - monotonic)
-    return min(earliest_relief(family, now) - now, probe_delay)
+def next_blocked_account(family: str, enabled: list[str], now: float) -> str:
+    previous = LAST_BLOCKED_ACCOUNT.get(family)
+    if previous in enabled:
+        account = enabled[(enabled.index(previous) + 1) % len(enabled)]
+    else:
+        account = min(enabled, key=lambda name: blocker_deadline(name, family, now))
+    LAST_BLOCKED_ACCOUNT[family] = account
+    return account
 
 
 def routing_util(name: str, family: str, now: float) -> float:
@@ -2472,23 +2440,17 @@ async def rotate_panel(request: Request):
                     headers={"Content-Security-Policy": "frame-ancestors 'none'", "X-Frame-Options": "DENY"})
 
 
-async def retry_wait(seconds: float, request: Request | None, *, wake: asyncio.Event | None = None) -> None:
+async def retry_wait(seconds: float, request: Request | None) -> None:
     """Release held request bodies promptly when their caller has left."""
     deadline = time.monotonic() + seconds
     while True:
         if request is not None and await request.is_disconnected():
             raise HTTPException(status_code=499, detail="client disconnected")
         remaining = deadline - time.monotonic()
-        if remaining <= 0 or (wake is not None and wake.is_set()):
+        if remaining <= 0:
             return
         interval = min(remaining, 1.0) if request is not None else remaining
-        if wake is None:
-            await asyncio.sleep(interval)
-        else:
-            try:
-                await asyncio.wait_for(wake.wait(), interval)
-            except asyncio.TimeoutError:
-                pass
+        await asyncio.sleep(interval)
 
 
 RATE_LIMIT_PREFIX = "anthropic-ratelimit-"
@@ -2528,8 +2490,8 @@ def add_claude_audit_fields(rec: dict, upstream: httpx.Response, account: str, r
     if retries:
         rec["retries"] = retries
     model = rec["model"]
-    if not rec.get("local") and ((isinstance(model, str) and "fable" in model.lower())
-                                 or "anthropic-ratelimit-unified-5h-utilization" not in upstream.headers):
+    if ((isinstance(model, str) and "fable" in model.lower())
+            or "anthropic-ratelimit-unified-5h-utilization" not in upstream.headers):
         rec["ratelimit"] = rate_limit_headers(upstream.headers)
 
 
@@ -2541,17 +2503,13 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
     retries = 0
     verdict = None
     account = None
-    pending = None
     burst_accounts = set()
     retrying = False
     try:
         while True:
             await retry_wait(0, request)
-            monotonic = time.monotonic()
-            remaining = hold_deadline - monotonic
-            now = time.time()
-            reservation = None
             async with state_lock:
+                now = time.time()
                 pin, _ = device_pin(rec["device"])
                 policy = pin["mode"] if pin else "automatic"
                 account = None
@@ -2564,73 +2522,45 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                         account = target
                 if account is None:
                     account = select_account(route_family, now, update=policy == "automatic")
-                if account is None:
+                all_blocked = account is None
+                if all_blocked:
                     enabled = [name for name in ACCOUNTS if not disabled(name)]
                     if not enabled:
                         raise HTTPException(status_code=503, detail="no enabled accounts")
-                    probe = recovery_probe(route_family)
-                    if family is not None and not probe.in_flight and monotonic >= probe.next_at:
-                        account = min(enabled, key=lambda name: blocker_deadline(name, route_family, now))
-                        probe.in_flight, probe.next_at = True, monotonic + RECOVERY_PROBE_S
-                        reservation = probe
+                    wait = min(earliest_relief(route_family, now) - now, hold_deadline - time.monotonic())
+                    if wait > 0:
+                        source = family_route(route_family)["active_account"]
+                        STATE["events"].append({
+                            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold", "family": route_family,
+                            "from": source, "to": source, "reason": f"all accounts spent; holding {round(wait)}s"})
+                        STATE["events"] = STATE["events"][-200:]
+                        save_state()
                     else:
-                        wake = probe.changed
-                        delay = recovery_delay(route_family, now, monotonic)
-                        wait = min(delay, remaining)
-                        if wait > 0:
-                            source = family_route(route_family)["active_account"]
-                            STATE["events"].append({
-                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold", "family": route_family,
-                                "from": source, "to": source, "reason": f"all accounts spent; holding {round(wait)}s"})
-                            STATE["events"] = STATE["events"][-200:]
-                            save_state()
+                        account = next_blocked_account(route_family, enabled, now)
+                elif policy != "strict":
+                    LAST_BLOCKED_ACCOUNT.pop(route_family, None)
                 if account is not None:
                     info = STATE["accounts"].get(account, {})
-                    pace = (0 if policy == "strict" or reservation else
+                    pace = (0 if policy == "strict" or all_blocked else
                             info.get("pace_by_family", {}).get(route_family, info.get("pace_until", 0)) - now)
                     token = ACCOUNTS[account]["token"]
             if account is None:
-                if wait > 0:
-                    await retry_wait(wait, request, wake=wake)
-                    continue
-                if pending:
-                    return pending[0], pending[1], retries, "exhausted"
-                rec["local"] = True
-                retry_after = str(max(1, round(delay)))
-                return httpx.Response(429, headers={"retry-after": retry_after}, json={
-                    "type": "error", "error": {"type": "rate_limit_error",
-                                              "message": "claude-rotate: every account's window is spent"}}), None, retries, "exhausted"
+                await retry_wait(wait, request)
+                continue
             if pace > 0:
                 await retry_wait(min(pace, 60), request)
                 continue
             if retrying:
                 retries += 1
-            pending = None
             fwd_headers["authorization"] = f"Bearer {token}"
+            upstream = await client.send(
+                client.build_request(method, url, headers=fwd_headers, content=body), stream=True)
             try:
-                upstream = await client.send(
-                    client.build_request(method, url, headers=fwd_headers, content=body), stream=True)
-                try:
-                    verdict = await note_response(account, upstream.headers, upstream.status_code, family=family,
-                                                  repeated_burst=account in burst_accounts, policy=policy)
-                except BaseException:
-                    await upstream.aclose()
-                    raise
+                verdict = await note_response(account, upstream.headers, upstream.status_code, family=family,
+                                              repeated_burst=account in burst_accounts, policy=policy)
             except BaseException:
-                if reservation:
-                    reservation.in_flight = False
+                await upstream.aclose()
                 raise
-            if reservation:
-                if upstream.is_closed:
-                    reservation.in_flight = False
-                else:
-                    upstream.stream = ProbeStream(upstream.stream, reservation)
-                if 200 <= upstream.status_code < 300:
-                    reservation.wake_waiters()
-            elif verdict == "exhausted":
-                # A normal 429 just confirmed the block. Give it one probe interval.
-                probe = recovery_probe(route_family)
-                probe.next_at = max(probe.next_at, time.monotonic() + RECOVERY_PROBE_S)
             if upstream.status_code != 429:
                 return upstream, account, retries, verdict
             if policy == "strict":
@@ -2646,14 +2576,14 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                 entries[-1] = entry
                 rec["rate_limits_omitted"] = rec.get("rate_limits_omitted", 0) + 1
 
+            if all_blocked:
+                return upstream, account, retries, "exhausted"
             retry = (verdict == "exhausted" and time.monotonic() < hold_deadline
                      or verdict in ("switched", "burst") and retries < 5)
             if not retry:
                 return upstream, account, retries, verdict
             content = await bounded_response(upstream)
             rate_limit_error(entry, content, upstream.headers)
-            # Keep the actual 429 if the pool becomes blocked before the retry.
-            pending = (httpx.Response(429, content=content, headers=response_headers(upstream)), account)
             if verdict == "burst":
                 burst_accounts.add(account)
             else:
@@ -2724,9 +2654,9 @@ async def openai_chat(request: Request):
 
     if upstream.status_code == 429 and verdict == "exhausted":
         content = await bounded_response(upstream)
-        if not rec.get("local"):
-            rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
-        retry_after = max(1, round(recovery_delay(family, time.time(), time.monotonic())))
+        rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
+        now = time.time()
+        retry_after = max(1, round(earliest_relief(family, now) - now))
         rec["status"] = 503
         audit(rec)
         return JSONResponse(
@@ -2757,14 +2687,14 @@ async def openai_chat(request: Request):
                                  media_type="text/event-stream")
 
     content = await bounded_response(upstream)
-    if upstream.status_code == 429 and not rec.get("local"):
+    if upstream.status_code == 429:
         rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     if upstream.status_code != 200:
         try:
             msg = json.loads(content).get("error", {}).get("message") \
                 or content[:200].decode(errors="replace")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
             msg = content[:200].decode(errors="replace")
         audit(rec)
         return JSONResponse({"error": {"message": f"upstream: {msg}",
@@ -3228,7 +3158,7 @@ async def proxy(request: Request, path: str):
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=resp_headers)
 
     content = await bounded_response(upstream)
-    if upstream.status_code == 429 and not rec.get("local"):
+    if upstream.status_code == 429:
         rate_limit_error(rec["rate_limits"][-1], content, upstream.headers)
     try:
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))

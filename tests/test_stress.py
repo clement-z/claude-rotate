@@ -15,7 +15,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import httpx
 
@@ -47,7 +46,7 @@ R.HOLD_MAX_S = 0
 def fresh_state(active="a", accounts=None):
     R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
                "last_switch_ts": 0}
-    R.RECOVERY_PROBES.clear()
+    R.LAST_BLOCKED_ACCOUNT.clear()
     R.AUDIT_PATH.write_text("")
 
 
@@ -158,96 +157,35 @@ check("burst storm: zero rotations",
       not any(e["type"] == "switch" for e in R.STATE["events"])
       and R.STATE["active_account"] == "a")
 
-# --- 4. concurrent holds share one probe while every account is blocked -----
+# --- 4. concurrent holds dispatch once each at the deadline -----------------
 now = time.time()
-fresh_state("b", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-                  "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
-R.HOLD_MAX_S = 2
-hold_calls = []
-
-
-async def recovered(req):
-    hold_calls.append(req.headers["authorization"])
-    await asyncio.sleep(0.08)
-    h = unified()
-    del h["anthropic-ratelimit-unified-5h-utilization"], h["anthropic-ratelimit-unified-5h-reset"]
-    return httpx.Response(200, json=OK_JSON, headers=h)
-
-
-use_upstream(recovered)
-resps, secs = blast(20)
-check("a recovery probe picks the account with earliest relief and wakes all 19 waiters",
-      all(r.status_code == 200 for r in resps) and hold_calls == ["Bearer tok-a"] * 20
-      and "5h" not in R.STATE["accounts"]["a"]["claims"] and secs < R.HOLD_MAX_S)
-check("waiters really parked while the probe was in flight",
-      sum(e["type"] == "hold" for e in R.STATE["events"]) >= 19)
-
-fresh_state("b", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-                  "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 2000},
+                  "b": {"util_5h": 1.0, "reset_5h": now + 100}})
 R.HOLD_MAX_S = 0.2
 hold_calls = []
+start = time.monotonic()
 
 
 async def still_spent(req):
-    hold_calls.append(req.headers["authorization"])
-    await asyncio.sleep(0.08)
+    account = req.headers["authorization"][-1]
+    hold_calls.append((account, time.monotonic() - start))
+    await asyncio.sleep(0.03)
     return httpx.Response(429, json={"error": "still spent"}, headers=unified(
-        u5="1.0", status="rejected", **{"anthropic-ratelimit-unified-5h-reset": str(now + 100)}))
+        u5="1.0", status="rejected", **{"retry-after": "42",
+                                       "anthropic-ratelimit-unified-5h-reset": str(now + 1000)}))
 
 
 use_upstream(still_spent)
 resps, _ = blast(20)
 records = audit_recs()
-check("a still-blocked family sends one probe while other holds expire with capped local responses",
-      all(r.status_code == 429 for r in resps) and hold_calls == ["Bearer tok-a"]
-      and sum(rec.get("local", False) for rec in records) == 19
-      and sum("rate_limits" in rec for rec in records) == 1
-      and sum(1 for r in resps if r.headers.get("retry-after") is not None
-              and 1 <= int(r.headers["retry-after"]) <= R.RECOVERY_PROBE_S) == 19)
+check("twenty held requests dispatch at expiry in round-robin starting with earliest relief",
+      [a for a, _ in hold_calls] == ["b", "a"] * 10 and all(t >= R.HOLD_MAX_S for _, t in hold_calls)
+      and sum(e["type"] == "hold" for e in R.STATE["events"]) == 20)
+check("all held requests relay the upstream 429 and audit exactly one attempt each",
+      all(r.status_code == 429 and r.json() == {"error": "still spent"} and r.headers["retry-after"] == "42"
+          for r in resps)
+      and len(records) == 20 and all(len(rec["rate_limits"]) == 1 and "local" not in rec for rec in records))
 R.HOLD_MAX_S = 0
-
-
-async def probe_body_overlap():
-    fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-                      "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
-    reading, finish = asyncio.Event(), asyncio.Event()
-    calls = []
-    headers = unified(u5="1", status="rejected") | {"content-type": "application/json"}
-    content = b'{"error":"still spent"}'
-
-    class SlowBody(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            reading.set()
-            await finish.wait()
-            yield content
-
-    def respond(req):
-        calls.append(req)
-        if len(calls) == 1:
-            return httpx.Response(429, headers=headers, stream=SlowBody())
-        return httpx.Response(429, headers=headers, content=content)
-
-    use_upstream(respond)
-    with patch.object(R, "RECOVERY_PROBE_S", 0.02):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=R.app), base_url="http://proxy") as client:
-            async def ask():
-                return await client.post("/v1/messages", headers={"authorization": "Bearer devkey-1"},
-                                         json={"model": "claude-opus-5", "messages": []})
-
-            first = asyncio.create_task(ask())
-            await asyncio.wait_for(reading.wait(), 2)
-            await asyncio.sleep(0.04)
-            blocked = await ask()
-            count_during_read = len(calls)
-            finish.set()
-            original = await asyncio.wait_for(first, 2)
-            next_probe = await ask()
-    return (blocked.status_code == original.status_code == next_probe.status_code == 429
-            and "Retry-After" in blocked.headers and original.content == next_probe.content == content
-            and count_during_read == 1 and len(calls) == 2)
-
-
-check("a probe keeps its slot through the body even past the next probe interval", asyncio.run(probe_body_overlap()))
 
 # --- 5. parallel SSE streams relay byte-identical ----------------------------
 fresh_state()

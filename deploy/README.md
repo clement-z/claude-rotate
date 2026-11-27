@@ -141,13 +141,13 @@ the normal config activation flow. The panel's **Edit** control applies
 immediately and lasts until restart. **Use config** removes the override.
 **Auto until restart** also overrides a configured pin.
 
-`rotate` restarts the service to set the active account for eligible
-automatic routes. Panel **Select** sets a soft preference without restarting.
-Device pins take precedence over both. If all enabled accounts are blocked
-for one family, a request can probe the one with earliest relief. Each family
-can start one probe per minute and have one in flight. A successful probe
-wakes held requests. Local exhaustion replies cap `Retry-After` at the next
-probe opportunity.
+`rotate` restarts the service when the target can change at least one
+eligible automatic route. Panel **Select** sets a soft preference without
+restarting. Device pins take precedence over both. If all enabled accounts
+are blocked for a family, the proxy waits for the earliest relief or the hold
+deadline if holds are enabled. When the pool is still blocked at dispatch,
+each request tries one enabled account, cycling per family from the account
+due to recover first.
 
 systemd creates `/var/lib/claude-rotate` and `/var/log/claude-rotate` owned by the
 service account with mode `0700`. The process umask is `0077`. Code, config,
