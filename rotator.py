@@ -1581,10 +1581,13 @@ $('weekly').onpointerdown=$('weekly').onpointermove=e=>{  // pointerdown: a tap 
     row.className='row'; b.className='v'; b.textContent=Math.round(v)+'%';
     if(c){const key=document.createElement('span'); key.className='key'; key.style.borderColor=c; a.append(key)} a.append(k); row.append(a,b); tip.append(row)}
   const c=e.currentTarget.parentNode.getBoundingClientRect(), px=e.clientX-c.left;
+  tip.style.pointerEvents=e.pointerType==='touch'?'auto':'none';
   tip.style.display='block'; tip.style.top=(r.top-c.top+8)+'px';
   tip.style.left=Math.max(8,px+16+tip.offsetWidth>c.width?px-16-tip.offsetWidth:px+16)+'px'};
-$('weekly').onpointerleave=e=>{if(e.pointerType==='touch') return;  // touch fires leave right after the tap
-  $('tip').style.display='none'; const xh=document.querySelector('#xh'); if(xh) xh.setAttribute('opacity','0')};
+function hideTip(){
+  $('tip').style.display='none'; const xh=$('xh'); if(xh) xh.setAttribute('opacity','0')}
+$('tip').onclick=hideTip;
+$('weekly').onpointerleave=e=>{if(e.pointerType!=='touch') hideTip()};  // touch fires leave right after the tap
 $('tbl').onclick=()=>{showTable=!showTable; $('tbl').textContent=showTable?'Chart':'Table'; refresh()};
 $('period').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p; if(p){period=p; refresh()}};
 const usable=a=>!a.disabled&&(a.effective_util_5h||0)<ST.switch_threshold&&(a.effective_util_7d||0)<ST.switch_threshold_7d;

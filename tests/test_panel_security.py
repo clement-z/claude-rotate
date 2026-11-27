@@ -1,19 +1,22 @@
 """Render the actual panel JavaScript with a tiny DOM sink harness (Node optional)."""
 import ast
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 
 def main():
+    tree = ast.parse((Path(__file__).resolve().parent.parent / "rotator.py").read_text())
+    panel = next(ast.literal_eval(n.value) for n in tree.body
+                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PANEL_HTML" for t in n.targets))
+    assert re.search(r'<div id="weekly"[^>]*>[^<]*</div>\s*<div class="tip" id="tip">', panel), \
+        "the tooltip must be outside the chart so its taps do not reach the chart"
     node = shutil.which("node")
     if not node:
         print("SKIP panel JavaScript execution: Node.js is not installed")
         return
-    tree = ast.parse((Path(__file__).resolve().parent.parent / "rotator.py").read_text())
-    panel = next(ast.literal_eval(n.value) for n in tree.body
-                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PANEL_HTML" for t in n.targets))
     script = panel.split("<script>", 1)[1].split("</script>", 1)[0]
     harness = r'''
 const vm = require('node:vm');
@@ -30,14 +33,44 @@ const status = {accounts:{[value]:{priority:100},[value+'2']:{priority:100}},act
                       images:{state:value,reason:value,unsaved:value,last_error:value,access_token_min:value,last_answer:{status:value,at:value}}},
              [value+'-bare']:{kind:'openai-siwc',state:'ok',quotas:{}},
              [value+'-static']:{kind:'static-bearer',state:'ok',reason:value}}};
-const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fake-viewer-key',href:'http://proxy/rotate/panel?key=fake-viewer-key'},history:{replaceState:(_a,_b,url)=>replaced.push(url)},document:{getElementById:id=>elements[id]??=( {innerHTML:'',textContent:''} )},setInterval:()=>{},fetch:async(url,opts)=>{urls.push({url,opts});return {ok:true,json:async()=>url.includes('/status')?status:stats}}});
+const document = {
+  getElementById:id=>elements[id]??=({innerHTML:'',textContent:''}),
+  createElement:()=>({style:{},append(){}}),
+};
+const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fake-viewer-key',href:'http://proxy/rotate/panel?key=fake-viewer-key'},history:{replaceState:(_a,_b,url)=>replaced.push(url)},document,setInterval:()=>{},fetch:async(url,opts)=>{urls.push({url,opts});return {ok:true,json:async()=>url.includes('/status')?status:stats}}});
 elements.confirm={showModal(){this.open=true},close(){this.open=false}};
+elements.tip={style:{},offsetWidth:190,replaceChildren(){},append(){}};
+elements.xh={setAttribute(name,value){this[name]=value}};
+const svg={getBoundingClientRect:()=>({left:48,top:0}),querySelector:()=>elements.xh};
+elements.weekly={clientWidth:360,querySelector:()=>svg,
+  parentNode:{getBoundingClientRect:()=>({left:0,top:0,width:360})}};
 (async()=>{
   vm.runInContext(script,context,{timeout:1000});
   await vm.runInContext('refresh()',context,{timeout:1000});
   assert(replaced.every(url=>!url.includes('key=')));
   assert(urls.every(({url,opts})=>!url.includes('key=')&&opts.headers.Authorization==='Bearer fake-viewer-key'));
   assert(elements.weekly.innerHTML.includes('class="hit"'),'shortfall band not drawn');
+  const {weekly,tip,xh}=elements;
+  const touch={pointerType:'touch',clientX:80,currentTarget:weekly};
+  weekly.onpointerdown(touch);
+  weekly.onpointerleave(touch);
+  assert.equal(tip.style.display,'block','the tooltip stays open after a chart tap');
+  assert.equal(tip.style.pointerEvents,'auto','the touch tooltip can receive taps');
+  assert.equal(xh.opacity,'.6');
+  const left=tip.style.left;
+  weekly.onpointerdown({...touch,clientX:320});
+  assert.notEqual(tip.style.left,left,'another chart tap moves the tooltip');
+  tip.onclick();
+  assert.equal(tip.style.display,'none','tapping the tooltip hides it');
+  assert.equal(xh.opacity,'0');
+  weekly.onpointerdown(touch);
+  const mouse={...touch,pointerType:'mouse'};
+  weekly.onpointermove(mouse);
+  assert.equal(tip.style.display,'block');
+  assert.equal(tip.style.pointerEvents,'none','the mouse tooltip lets the pointer through');
+  weekly.onpointerleave(mouse);
+  assert.equal(tip.style.display,'none','leaving the chart with a mouse hides the tooltip');
+  assert.equal(xh.opacity,'0');
   assert(elements.devices.innerHTML.includes('removed'),'removed device not listed');
   for(const id of ['pills','accounts','oai','weekly','billing','alerts','devices','models','by-account','events']){
     assert(!elements[id].innerHTML.includes('<mark'),id+' contains raw markup');
