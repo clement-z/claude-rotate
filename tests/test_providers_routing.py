@@ -423,6 +423,35 @@ async def device_pins(c):
               r.status_code == 200 and sent == [pinned_auth, default_auth]
               and R.family_route("fable")["manual_account"] is None
               and R.family_route("default")["manual_account"] == "backup")
+        r = await ask(c, "/rotate/status", "claude")
+        status = r.json()
+        backup = status["accounts"]["backup"]
+        fable = backup["claims"]["7d_oi"]
+        check("status shows separate family routes and keeps the default projection",
+              status["active_by_family"] == {"default": "backup", "fable": "acct"}
+              and status["active_account"] == "backup"
+              and status["manual_by_family"] == {"default": "backup", "fable": None})
+        check("status shows the applicable blocked claim without a synthetic 5h",
+              fable["label"] == "Fable weekly" and fable["families"] == ["fable"]
+              and fable["utilization"] == fable["effective_utilization"] == 1
+              and fable["reset"] == fable["blocked_until"] == reset and fable["seen_at"] > 0
+              and fable["freshness"] == "current" and fable["block_reason"] == "exhausted"
+              and backup["eligible_by_family"] == {"default": True, "fable": False}
+              and "5h" not in backup["claims"] and "effective_util_5h" not in backup)
+        check("status shows Claude device pins with source and lists unavailable targets",
+              status["device_pins"]["claude"] == {"account_pin": pins["claude"], "source": "config"}
+              and status["device_pins"]["tiny"] == {"account_pin": None, "source": "automatic"}
+              and "oaibox" not in status["device_pins"] and status["pin_targets"]["missing"] is False
+              and not any(k in r.text for k in KEY.values()))
+        stats = (await ask(c, "/rotate/stats", "claude")).json()
+        check("stats warns for a spent Fable weekly claim",
+              any("backup Fable weekly window at 100%" in a["text"] for a in stats["alerts"]))
+        R.STATE["accounts"]["backup"]["claims"]["7d_oi"]["reset"] = time.time() - 1
+        r = await ask(c, "/rotate/status", "claude")
+        expired = r.json()["accounts"]["backup"]["claims"]["7d_oi"]
+        check("status keeps expired usage as evidence while the meter awaits a reading",
+              expired["utilization"] == 1 and expired["effective_utilization"] is None
+              and expired["freshness"] == "awaiting_reading" and expired["block_reason"] is None)
 
         pins["claude"] = {"account": "missing", "mode": "strict"}
         r, sent = await dispatch("claude")
@@ -455,6 +484,9 @@ async def device_pins(c):
         check("Auto until restart has a runtime source and works at full proxy admission",
               r.status_code == 200 and r.json() == {"device": "claude", "account_pin": None, "source": "runtime"}
               and gate.active == 1)
+        status = (await ask(c, "/rotate/status", "claude")).json()
+        check("status shows runtime Auto in place of a configured pin",
+              status["device_pins"]["claude"] == {"account_pin": None, "source": "runtime"})
         check("a runtime pin override never writes the state file", (tmp / "state.json").read_bytes() == snapshot)
         r, sent = await dispatch("claude")
         check("runtime Auto overrides the configured strict pin", r.status_code == 200 and sent == [default_auth])

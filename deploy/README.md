@@ -120,6 +120,35 @@ the existing account. It replaces the token file and restarts the service.
 
 ## Runtime and operations
 
+`sudo claude-rotate-admin status` shows the active account for each Claude
+family, quota readings by claim, and each device's effective pin and source.
+It uses live status when the service is reachable. Offline status uses the
+persisted routes and readings and the pins in config. The legacy JSON field
+`active_account` represents the default route. The Fable route tracks its own
+weekly claim alongside the general weekly claim shared with default traffic.
+
+```sh
+sudo claude-rotate-admin pin-device laptop acct-1 --mode fallback
+sudo claude-rotate-admin unpin-device laptop
+sudo claude-rotate-admin rotate acct-2
+```
+
+A strict pin uses its account even after a quota block and relays its first
+429. A fallback pin goes through automatic routing if its account is
+unavailable or blocked for the request's family. Pins require the Claude grant.
+Clear or reassign a config pin before removing its account. Pin changes use
+the normal config activation flow. The panel's **Edit** control applies
+immediately and lasts until restart. **Use config** removes the override.
+**Auto until restart** also overrides a configured pin.
+
+`rotate` restarts the service to set the active account for eligible
+automatic routes. Panel **Select** sets a soft preference without restarting.
+Device pins take precedence over both. If all enabled accounts are blocked
+for one family, a request can probe the one with earliest relief. Each family
+can start one probe per minute and have one in flight. A successful probe
+wakes held requests. Local exhaustion replies cap `Retry-After` at the next
+probe opportunity.
+
 systemd creates `/var/lib/claude-rotate` and `/var/log/claude-rotate` owned by the
 service account with mode `0700`. The process umask is `0077`. Code, config,
 tokens, and home directories are not writable by the service. Writable private

@@ -294,6 +294,7 @@ STATE_VERSION = 1
 MODEL_FAMILIES = ("default", "fable")
 GENERAL_CLAIMS = ("5h", "7d")
 KNOWN_CLAIMS = {"5h": MODEL_FAMILIES, "7d": MODEL_FAMILIES, "7d_oi": ("fable",)}
+CLAIM_LABELS = {"5h": "5h", "7d": "General weekly", "7d_oi": "Fable weekly"}
 CLAIM_HEADER = re.compile(r"anthropic-ratelimit-unified-([a-z0-9][a-z0-9_-]{0,31})-(utilization|status|reset)")
 CLAIM_STATUS = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MAX_LEARNED_CLAIMS = 29
@@ -623,16 +624,23 @@ def current_util(reading: dict, now: float) -> float | None:
     return None if reset is not None and reset <= now else reading.get("utilization")
 
 
+def claim_block_until(reading: dict) -> float:
+    if reading.get("status") == "rejected" or reading.get("utilization", 0) >= 1:
+        return max(reading.get("reset", 0), reading.get("recheck_at", 0))
+    return 0
+
+
 def blocker_deadline(name: str, family: str, now: float) -> float:
     deadline = STATE["accounts"].get(name, {}).get("blocks_by_family", {}).get(family, {}).get("until", 0)
-    for reading in claim_readings(name, family).values():
-        if reading.get("status") == "rejected" or reading.get("utilization", 0) >= 1:
-            deadline = max(deadline, reading.get("reset", 0), reading.get("recheck_at", 0))
-    return deadline
+    return max(deadline, max(map(claim_block_until, claim_readings(name, family).values()), default=0))
+
+
+def claim_thresholds() -> dict:
+    return {"5h": THRESHOLD, "7d": THRESHOLD_7D, "7d_oi": THRESHOLD_7D}
 
 
 def soft_limited(name: str, family: str, now: float) -> bool:
-    thresholds = {"5h": THRESHOLD, "7d": THRESHOLD_7D, "7d_oi": THRESHOLD_7D}
+    thresholds = claim_thresholds()
     return any((current_util(reading, now) or 0) >= thresholds.get(claim, float("inf"))
                for claim, reading in claim_readings(name, family).items())
 
@@ -1198,6 +1206,31 @@ def summarize_usage(usage: dict | None) -> dict | None:
         "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
 
 
+def status_claims(info: dict, now: float) -> dict:
+    applicable = {family: applicable_claims(info, family) for family in MODEL_FAMILIES}
+    thresholds = claim_thresholds()
+    out = {}
+    for claim, reading in account_claims(info).items():
+        reset = reading.get("reset")
+        rejected = reading.get("status") == "rejected"
+        until = claim_block_until(reading)
+        current = current_util(reading, now)
+        if (reset is not None and reset <= now) or (current is None and not reading.get("status")):
+            freshness = "awaiting_reading"
+        else:
+            freshness = "current"
+        out[claim] = {
+            "label": CLAIM_LABELS.get(claim, claim),
+            "families": [family for family in MODEL_FAMILIES if claim in applicable[family]],
+            "utilization": reading.get("utilization"), "effective_utilization": current,
+            "reset": reset, "seen_at": reading.get("seen_at"), "status": reading.get("status"),
+            "freshness": freshness, "threshold": thresholds.get(claim),
+            "block_reason": ("rejected" if rejected else "exhausted") if until > now else None,
+            "blocked_until": until if until > now else None,
+        }
+    return out
+
+
 @app.get("/rotate/status")
 async def rotate_status(request: Request):
     if not panel_allowed(request):
@@ -1206,18 +1239,41 @@ async def rotate_status(request: Request):
     accounts = {}
     for name in ACCOUNTS:
         info = dict(STATE["accounts"].get(name, {}))
-        info["effective_util_5h"] = utilization(name)
-        info["effective_util_7d"] = util_7d(name)
+        info["claims"] = status_claims(info, now)
+        for claim in GENERAL_CLAIMS:
+            reading = info["claims"].get(claim)
+            for field, prefix in (("utilization", "util"), ("reset", "reset")):
+                key = f"{prefix}_{claim}"
+                if reading is not None and reading[field] is not None:
+                    info[key] = reading[field]
+                else:
+                    info.pop(key, None)
+            if reading is not None:
+                info[f"effective_util_{claim}"] = reading["effective_utilization"] or 0.0
         info["priority"] = priority(name)
         info["disabled"] = disabled(name)
+        info["eligible_by_family"] = {family: usable(name, family) for family in MODEL_FAMILIES}
+        info["blocks_by_family"] = {f: b for f, b in info.get("blocks_by_family", {}).items() if b["until"] > now}
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
             info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
         accounts[name] = info
+    active = {family: family_route(family)["active_account"] for family in MODEL_FAMILIES}
+    manual = {family: family_route(family).get("manual_account") for family in MODEL_FAMILIES}
+    pins = {}
+    for device in CFG["devices"]:
+        if granted(device, ANTHROPIC):
+            pin, source = device_pin(device)
+            pins[device] = {"account_pin": pin, "source": source}
     return {
-        "active_account": STATE["active_account"],
-        "pinned": STATE.get("pinned") if STATE.get("pinned") == STATE["active_account"] else None,
+        "active_account": active["default"],
+        "pinned": manual["default"] if manual["default"] == active["default"] else None,
+        "active_by_family": active,
+        "manual_by_family": manual,
+        "device_pins": pins,
+        "pin_targets": {name: name in ACCOUNTS and not disabled(name)
+                        for name in sorted(CFG["configured_accounts"])},
         "switch_threshold": THRESHOLD,
         "switch_threshold_7d": THRESHOLD_7D,
         "strategy": STRATEGY,
@@ -1617,9 +1673,19 @@ def aggregate_audit() -> dict:
                            "text": f"{dev} consumed {toks:,} tokens in the last hour "
                                    f"(threshold {ALERT_CFG['device_tokens_per_hour']:,})"})
     for name in ACCOUNTS:
-        u = utilization(name)
-        if u >= ALERT_CFG["util_warn"]:
-            alerts.append({"level": "warn", "text": f"{name} 5h window at {u:.0%} (switch threshold {THRESHOLD:.0%})"})
+        for claim in status_claims(STATE["accounts"].get(name, {}), now).values():
+            u = claim["effective_utilization"]
+            threshold = claim["threshold"]
+            text = f"{name} {claim['label']} window"
+            if u is not None and u >= ALERT_CFG["util_warn"]:
+                text += f" at {u:.0%}"
+                if threshold is not None:
+                    text += f" (switch threshold {threshold:.0%})"
+            elif not claim["block_reason"]:
+                continue
+            if claim["block_reason"]:
+                text += f" · {claim['block_reason']}"
+            alerts.append({"level": "warn", "text": text})
 
     # Roster covers every registered device, traffic or not.
     devices = {}
@@ -1928,6 +1994,8 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .meter-row{display:grid;grid-template-columns:28px 1fr 250px;gap:10px;align-items:center;margin:8px 0}
  .meter{position:relative;height:8px;border-radius:4px;background:var(--track)} .meter i{position:absolute;inset:0 auto 0 0;border-radius:4px}
  .meter .tick{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink2);opacity:.6}
+ .claim-meter .meter-row{grid-template-columns:112px minmax(48px,1fr) minmax(130px,1.4fr);row-gap:4px}
+ .claim-meter .meter-row>span{overflow-wrap:anywhere}
  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--ink2);font-weight:400;margin-left:auto}
  .key{display:inline-block;width:16px;border-top:2px solid;vertical-align:4px;margin-right:6px}
  .key.dash{border-top-style:dashed} .key.band{height:10px;border:0;vertical-align:-1px;background:rgba(208,59,59,.3)}
@@ -1953,6 +2021,9 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .linkbtn:disabled{opacity:.4;cursor:default} .linkbtn.primary{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
  dialog{background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:18px;max-width:min(440px,calc(100% - 24px))} dialog::backdrop{background:rgba(0,0,0,.6)}
  .acts{display:flex;justify-content:flex-end;gap:8px;margin-top:16px} .acts .linkbtn{font-size:13px;padding:5px 14px}
+ #pin-form{width:360px} #pin-title{font-weight:600;overflow-wrap:anywhere}
+ #pin-form label:not([hidden]){display:grid;gap:4px;margin-top:12px}
+ #pin-form select{width:100%;font:inherit;padding:4px}
  @media (max-width:900px){.kpis{grid-template-columns:1fr 1fr}.hero{grid-column:1/-1}.split{grid-template-columns:1fr}
   .meter-row{grid-template-columns:28px 1fr;row-gap:4px}.meter-row>span:last-child{grid-column:2}
   .cards,.cards tbody{display:block} .cards tr:first-child{display:none}
@@ -1961,6 +2032,7 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
   .cards td[data-l]::before{content:attr(data-l);display:block;color:var(--muted);font-size:11px}}
  @media (max-width:600px){main{padding:12px 12px 32px;gap:12px}.card{padding:14px}.cards tr{grid-template-columns:repeat(2,minmax(0,1fr))}
   th,td{padding:8px 6px} .split :is(th,td):nth-child(4){display:none}}
+ @media (max-width:900px){.claim-meter .meter-row{grid-template-columns:112px 1fr}}
 </style></head><body><main>
 <header><h1>claude-rotate</h1><span class="muted" id="host"></span><span id="pills"></span><span class="spacer"></span><span class="muted small" id="upd"></span></header>
 <div id="alerts"></div>
@@ -1988,6 +2060,15 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
 </main>
 <dialog id="confirm"><div id="cf-text"></div><div class="small" id="cf-err" style="color:var(--crit)"></div>
  <div class="acts"><button class="linkbtn" id="cf-no">Cancel</button><button class="linkbtn primary" id="cf-yes">Switch</button></div></dialog>
+<dialog id="pin-form" aria-labelledby="pin-title"><div id="pin-title"></div>
+ <p class="small muted">This choice lasts until restart.</p>
+ <label>Routing<select id="pin-mode">
+  <option value="use_config">Use config</option><option value="auto">Auto until restart</option>
+  <option value="strict">Strict pin</option><option value="fallback">Fallback pin</option>
+ </select></label>
+ <label id="pin-target">Claude account<select id="pin-account"></select></label>
+ <div class="small" id="pin-error" role="alert" style="color:var(--crit)"></div>
+ <div class="acts"><button class="linkbtn" id="pin-cancel">Cancel</button><button class="linkbtn primary" id="pin-save">Save</button></div></dialog>
 <script>
 const KEY = new URLSearchParams(location.search).get('key');
 const cleanURL = new URL(location.href);
@@ -2009,9 +2090,26 @@ function dur(s){return s<5400?Math.round(s/60)+' min':s<2*D?(s/H).toFixed(s<10*H
 function ago(min){return min==null?'never':min<1?'just now':min<60?min+' min ago':(min/60).toFixed(1)+' h ago'}
 function cell(b,l){return b?`<td data-l="${l}">${money(b.cost_usd)}<span class="sub">${fmt(tok(b))} tok &middot; ${fmt(b.requests)} req</span></td>`:`<td data-l="${l}" class="muted">&ndash;</td>`}
 function meter(label,u,thr,reset){
-  const sev=u>=1?['var(--crit)',' &#10005; limit reached']:u>=thr?['var(--warn)',' &#9888; past switch point']:['var(--s1)',''];
-  return `<div class="meter-row"><span class="muted">${label}</span><div class="meter"><i style="width:${Math.min(100,u*100)}%;background:${sev[0]}"></i><span class="tick" style="left:${thr*100}%"></span></div>`
-    +`<span><b>${Math.round(u*100)}%</b> <span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
+  const sev=u>=1?['var(--crit)',' &#10005; limit reached']:thr!=null&&u>=thr?['var(--warn)',' &#9888; past switch point']:['var(--s1)',''];
+  const fill=u==null?'':`<i style="width:${Math.min(100,u*100)}%;background:${sev[0]}"></i>`;
+  const tick=thr==null?'':`<span class="tick" style="left:${thr*100}%"></span>`;
+  return `<div class="meter-row"><span class="muted">${label}</span><div class="meter">${fill}${tick}</div>`
+    +`<span>${u==null?'':`<b>${Math.round(u*100)}%</b> `}<span class="muted small">${reset}</span><span class="small">${sev[1]}</span></span></div>`}
+const familyLabel=family=>family==='fable'?'Fable':'Default';
+function claimMeters(account,now){
+  const rows=Object.entries(account.claims||{}).map(([id,c])=>{
+    const meta=[(c.families||[]).map(familyLabel).join(' / ')];
+    if(c.freshness==='awaiting_reading')meta.push('awaiting reading');
+    else if(c.status)meta.push(c.status);
+    if(c.reset)meta.push(c.reset>now?'resets in '+dur(c.reset-now):'reset '+when(c.reset));
+    if(c.block_reason)meta.push(c.block_reason===c.status?'blocked':'blocked · '+c.block_reason);
+    if(c.blocked_until&&c.blocked_until!==c.reset)meta.push('recheck '+when(c.blocked_until));
+    if(c.seen_at)meta.push('seen '+ago(Math.round((now-c.seen_at)/60)));
+    return meter(esc(c.label||id),c.effective_utilization,c.threshold,esc(meta.filter(Boolean).join(' · ')))});
+  for(const [f,b] of Object.entries(account.blocks_by_family||{}))
+    rows.push(`<div class="small muted">${familyLabel(f)} blocked until ${esc(when(b.until))} · ${b.reason==='repeated_429'?'repeated 429s':'rejected'}</div>`);
+  return `<div class="claim-meter">${rows.join('')||'<span class="muted">Awaiting quota readings</span>'}</div>`;
+}
 function wlabel(m){return m==null?'':m%10080===0?(m/10080===1?'7d':m/10080+'w'):m%1440===0?(m/1440===1?'24h':m/1440+'d'):m%60===0?m/60+'h':m+'min'}
 function quotas(name,p){const now=Date.now()/1000, q=p.quotas||{}, im=p.images;
   const plan=(Object.values(q).find(f=>f&&f.plan)||{}).plan;
@@ -2110,7 +2208,12 @@ function refreshQuotaCards(status){
   }
   resizeQuotaPlots();
 }
-const panelFetch=path=>fetch(path,{headers:KEY?{Authorization:'Bearer '+KEY}:{},cache:'no-store'});
+function panelFetch(path,body){
+  const headers=KEY?{Authorization:'Bearer '+KEY}:{};
+  const opts={headers,cache:'no-store'};
+  if(body){headers['Content-Type']='application/json'; opts.method='POST'; opts.body=JSON.stringify(body)}
+  return fetch(path,opts);
+}
 async function refreshQuotaHistory(){
   try{
     const response=await panelFetch('/rotate/quota-history');
@@ -2253,24 +2356,58 @@ function refreshWeekly(wk){
 }
 $('tbl').onclick=()=>{showTable=!showTable; $('tbl').textContent=showTable?'Chart':'Table'; refresh()};
 $('period').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p; if(p){period=p; refresh()}};
-const usable=a=>!a.disabled&&(a.effective_util_5h||0)<ST.switch_threshold&&(a.effective_util_7d||0)<ST.switch_threshold_7d;
+const eligible=a=>Object.entries(a.eligible_by_family||{}).filter(([,ok])=>ok).map(([f])=>f);
 $('pills').onclick=$('accounts').onclick=e=>{const b=e.target.closest&&e.target.closest('button[data-sw],button[data-auto]'); if(!b||b.disabled) return;
   PENDING=b.dataset.auto?{auto:true}:{account:b.dataset.sw};
-  $('cf-text').innerHTML=PENDING.auto?`Hand <b>${esc(ST.active_account)}</b> back to the ${esc(ST.strategy)} strategy? It may switch account at the next request.`
-    :`Make <b>${esc(PENDING.account)}</b> the active account instead of <b>${esc(ST.active_account)}</b>? It stays active until it reaches a switch threshold or runs out of quota.`;
+  $('cf-text').innerHTML=PENDING.auto?`Resume the ${esc(ST.strategy)} strategy for both family routes?`
+    :`Prefer <b>${esc(PENDING.account)}</b> for ${eligible(ST.accounts[PENDING.account]).map(familyLabel).join(' and ')} automatic traffic? The preference lasts until a switch threshold or quota limit is reached, or the account is disabled.`;
   $('cf-err').textContent=''; $('confirm').showModal()};
 $('cf-no').onclick=()=>$('confirm').close();
 $('cf-yes').onclick=async()=>{$('cf-yes').disabled=true;
-  try{const r=await fetch('/rotate/switch',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},KEY?{Authorization:'Bearer '+KEY}:{}),body:JSON.stringify(PENDING)});
+  try{const r=await panelFetch('/rotate/switch',PENDING);
     if(r.ok){$('confirm').close(); refresh()} else $('cf-err').textContent=(await r.json().catch(()=>({}))).error||'error '+r.status}
   catch(err){$('cf-err').textContent='request failed'} finally{$('cf-yes').disabled=false}};
+let pinDevice;
+const pinMode=()=>$('pin-mode').value;
+const wantsPin=()=>['strict','fallback'].includes(pinMode());
+$('pin-mode').onchange=()=>{$('pin-target').hidden=!wantsPin()};
+$('devices').onclick=e=>{
+  const b=e.target.closest&&e.target.closest('button[data-pin]');
+  if(!b)return;
+  pinDevice=b.dataset.pin;
+  const {account_pin:pin,source}=ST.device_pins[pinDevice];
+  $('pin-title').textContent='Claude routing for '+pinDevice;
+  $('pin-error').textContent='';
+  $('pin-mode').value=source==='runtime'?(pin?pin.mode:'auto'):'use_config';
+  $('pin-account').innerHTML=Object.entries(ST.pin_targets||{}).map(([name,available])=>
+    `<option value="${esc(name)}">${esc(name)}${available?'':' (unavailable)'}</option>`).join('');
+  $('pin-account').value=pin?pin.account:Object.keys(ST.pin_targets||{})[0];
+  $('pin-mode').onchange();
+  $('pin-form').showModal();
+};
+$('pin-cancel').onclick=()=>$('pin-form').close();
+$('pin-save').onclick=async()=>{
+  $('pin-save').disabled=true;
+  const mode=pinMode(), payload={device:pinDevice};
+  if(mode==='use_config')payload.use_config=true;
+  else payload.account_pin=wantsPin()?{mode,account:$('pin-account').value}:null;
+  try{
+    const r=await panelFetch('/rotate/device-pin',payload);
+    if(r.ok){$('pin-form').close(); refresh()}
+    else $('pin-error').textContent=(await r.json().catch(()=>({}))).error||'error '+r.status;
+  }catch(err){$('pin-error').textContent='request failed'}finally{$('pin-save').disabled=false}
+};
 async function refresh(){
   const [st, stats] = await Promise.all([
     panelFetch('/rotate/status').then(r=>r.json()), panelFetch('/rotate/stats').then(r=>r.json())]);
   const per=stats.periods||{}, wk=st.weekly||{}, accts=Object.entries(st.accounts||{}); ST=st;
-  const names=accts.map(([n])=>n), i=names.indexOf(st.active_account), nxt=names.slice(i+1).concat(names.slice(0,i+1)).find(n=>n!==st.active_account&&usable(st.accounts[n]));
+  const active=st.active_by_family||{}, manual=st.manual_by_family||{};
+  const canSelect=(name,a)=>eligible(a).some(f=>active[f]!==name);
+  const i=accts.findIndex(([n])=>n===active.default);
+  const nxt=accts.slice(i+1).concat(accts.slice(0,i+1)).find(([n,a])=>canSelect(n,a))?.[0];
   $('host').textContent=location.host||'';
-  $('pills').innerHTML=`<span class="pill"><span class="dot" style="background:var(--good)"></span>active: ${esc(st.active_account)}</span> <button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is under its switch thresholds"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`
+  $('pills').innerHTML=Object.entries(active).map(([f,n])=>`<span class="pill">${familyLabel(f)}: ${esc(n||'–')}</span>`).join('')
+    +`<button class="linkbtn" data-sw="${esc(nxt)}"${nxt?'':' disabled title="no other account is eligible"'}>Rotate</button> <span class="pill">${esc(st.strategy)} &middot; ${accts.length} accounts &middot; ${Object.keys(stats.devices||{}).length} devices</span>`
     +Object.entries(st.providers||{}).map(([n,p])=>`<span class="pill" title="${esc(p.reason||p.unsaved||p.last_error||p.kind)}"><span class="dot" style="background:var(--${['down','unavailable'].includes(p.state)?'crit':p.state!=='ok'||p.unsaved||p.last_error?'warn':'good'})"></span>${esc(n)}</span>`).join('');
   $('alerts').innerHTML=(stats.alerts||[]).map(a=>`<div class="banner ${a.level==='warn'?'warn':''}">&#9888; <span><b>${a.level==='warn'?'Warning':'Note'}</b> ${esc(a.text)}</span></div>`).join('');
   // headline figures
@@ -2282,15 +2419,17 @@ async function refresh(){
   $('k-req').textContent=fmt(sum(stats.by_device,b=>b.requests)); $('k-req-sub').textContent=fmt(sum(stats.by_device,tok))+' tokens';
   $('k-cost').textContent=money(sum((per['7d']||{}).model,b=>b.cost_usd)); $('k-cost-sub').textContent=money(sum(stats.by_model,b=>b.cost_usd))+' in the last 24 h';
   // accounts
-  $('accounts').innerHTML=accts.map(([name,a])=>{const u5=a.effective_util_5h||0, u7=a.effective_util_7d||0, bl=(stats.billing||{})[name];
+  $('accounts').innerHTML=accts.map(([name,a])=>{const bl=(stats.billing||{})[name];
     const seen=a.last_seen?ago(Math.round((Date.now()/1000-a.last_seen)/60)):'never';
-    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${name===st.active_account?'<span class="badge"><span class="dot" style="background:var(--good)"></span>active'+(st.pinned===name?' &middot; manual':'')+'</span>':''}`
+    const badges=Object.entries(active).filter(([,n])=>n===name).map(([f])=>
+      `<span class="badge"><span class="dot" style="background:var(--good)"></span>${familyLabel(f)} active${manual[f]===name?' &middot; manual':''}</span>`).join('');
+    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${badges}`
       +(bl?`<span class="badge">${esc(bl.plan)}${bl.renews?' &middot; renews '+esc(day(Date.parse(bl.renews+'T00:00')/1000)):''}</span>`:'')
       +(a.disabled?'<span class="badge">disabled</span>':'')+(a.priority!==100?`<span class="badge">prio ${esc(a.priority)}</span>`:'')
       +`<span class="acct-side"><span class="muted small">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span>`
-      +(name!==st.active_account?`<button class="linkbtn" data-sw="${esc(name)}"${usable(a)?'':' disabled title="disabled or at a switch threshold"'}>Select</button>`:st.pinned===name?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
-      +meter('5h',u5,st.switch_threshold,a.reset_5h_in_min>0?'resets in '+dur(a.reset_5h_in_min*60):'window idle')
-      +meter('7d',u7,st.switch_threshold_7d,a.reset_7d_in_h>0?'resets in '+dur(a.reset_7d_in_h*H):'window idle')+'</div>'}).join('');
+      +(canSelect(name,a)?`<button class="linkbtn" data-sw="${esc(name)}">Select</button>`:'')
+      +(Object.values(manual).includes(name)?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
+      +claimMeters(a,Date.now()/1000)+'</div>'}).join('');
   refreshQuotaCards(st);
   refreshWeekly(wk);
   $('billing').innerHTML=billing(stats.billing);
@@ -2299,7 +2438,10 @@ async function refresh(){
   let dh=`<tr><th>Device</th><th class="l">Status</th><th class="l">Last model</th><th>24 h</th><th>7 d</th><th>30 d</th><th>All time${per.since?' <span class="muted">since '+esc(per.since)+'</span>':''}</th><th>30-day trend</th></tr>`;
   for(const name of Object.keys(roster).concat(gone)){const d=roster[name], removed=!d;
     const status=removed?'removed':d.online?'<span class="dot" style="background:var(--good)"></span>online':'<span class="dot" style="background:var(--muted)"></span>idle';
-    dh+=`<tr class="${removed?'removed':''}"><td><b>${esc(name)}</b>${d?'<span class="sub">key '+esc(d.key_suffix)+((d.providers||[]).join()!=='anthropic'?' &middot; '+esc((d.providers||[]).join(', ')):'')+'</span>':''}</td><td class="l">${status}${d?'<span class="sub">'+ago(d.last_seen_min)+'</span>':''}</td><td class="l" data-l="Last model">${d&&d.last_provider?esc(d.last_provider)+' &middot; ':''}${esc(d&&d.last_model||'–')}</td>`
+    const pins=st.device_pins||{}, pin=d&&Object.hasOwn(pins,name)?pins[name]:null;
+    const route=pin?.account_pin, source=pin?.source;
+    const routing=route?route.account+' · '+route.mode+' ('+source+')':source==='runtime'?'Auto until restart':'Automatic';
+    dh+=`<tr class="${removed?'removed':''}"><td><b>${esc(name)}</b>${d?'<span class="sub">key '+esc(d.key_suffix)+((d.providers||[]).join()!=='anthropic'?' &middot; '+esc((d.providers||[]).join(', ')):'')+'</span>':''}${pin?`<span class="sub">${esc(routing)} <button class="linkbtn" data-pin="${esc(name)}" aria-label="Edit Claude routing for ${esc(name)}">Edit</button></span>`:''}</td><td class="l">${status}${d?'<span class="sub">'+ago(d.last_seen_min)+'</span>':''}</td><td class="l" data-l="Last model">${d&&d.last_provider?esc(d.last_provider)+' &middot; ':''}${esc(d&&d.last_model||'–')}</td>`
       +cell((stats.by_device||{})[name],'24 h')+cell(((per['7d']||{}).device||{})[name],'7 d')+cell(((per['30d']||{}).device||{})[name],'30 d')
       +cell(((per.all||{}).device||{})[name],'All time'+(per.since?' since '+esc(per.since):''))+`<td data-l="30-day trend">${spark((per.trend||{})[name])}</td></tr>`}
   $('devices').innerHTML=dh;
@@ -2311,7 +2453,7 @@ async function refresh(){
   $('models').innerHTML=head.replace('{}','Model')+rows(PERIODS[period]==='24h'?stats.by_model:(per[PERIODS[period]]||{}).model);
   $('by-account').innerHTML=head.replace('{}','Account')+rows(stats.by_account)
     +rows(Object.fromEntries(Object.entries(stats.by_provider||{}).map(([n,b])=>[n+' (provider)',b])));
-  $('events').innerHTML=(st.recent_events||[]).slice().reverse().map(e=>`<div><span class="muted">${esc(String(e.ts||'').slice(5,16).replace('T',' '))}</span><span>${esc(e.from)} &rarr; ${esc(e.to)}</span><span class="badge" style="margin-left:auto">${esc(e.reason)}</span></div>`).join('')||'<span class="muted">none</span>';
+  $('events').innerHTML=(st.recent_events||[]).slice().reverse().map(e=>`<div><span class="muted">${esc(String(e.ts||'').slice(5,16).replace('T',' '))}</span><span>${e.family?familyLabel(e.family)+' · ':''}${esc(e.from)} &rarr; ${esc(e.to)}</span><span class="badge" style="margin-left:auto">${esc(e.reason)}</span></div>`).join('')||'<span class="muted">none</span>';
   $('upd').textContent='updated '+new Date().toLocaleTimeString();
 }
 refresh(); setInterval(refresh, 10000);

@@ -35,6 +35,16 @@ const status = {accounts:{[value]:{priority:100},[value+'2']:{priority:100}},act
                       images:{state:value,reason:value,unsaved:value,last_error:value,access_token_min:value,last_answer:{status:value,at:value}}},
              [value+'-bare']:{kind:'openai-siwc',state:'ok',quotas:{}},
              [value+'-static']:{kind:'static-bearer',state:'ok',reason:value}}};
+status.active_by_family={default:value,fable:value+'2'};
+status.manual_by_family={default:value,fable:null};
+status.pin_targets={[value]:true,[value+'2']:true,[value+'3']:false};
+status.device_pins={[value]:{account_pin:{account:value,mode:'strict'},source:'config'}};
+Object.assign(status.accounts[value],{eligible_by_family:{default:true,fable:false},claims:{
+  '7d':{label:'General weekly',families:['default','fable'],effective_utilization:.3,threshold:.98,freshness:'current',reset:receipt+D},
+  '7d_oi':{label:'Fable weekly',families:['fable'],effective_utilization:1,threshold:.98,freshness:'current',block_reason:'exhausted',reset:receipt+2*D},
+  [value]:{families:['default'],effective_utilization:null,freshness:'awaiting_reading',reset:receipt-D}
+}});
+status.accounts[value+'2'].eligible_by_family={default:true,fable:true};
 const quotaHistory={as_of:now,providers:{[value]:[
   {limit:value,minutes:10080,points:[
     [reset-850,10,reset,'usage'], [reset-550,20,reset+30,'usage'],
@@ -72,6 +82,8 @@ class Element {
   append(...children){this.children.push(...children)}
   prepend(...children){this.children.unshift(...children)}
   replaceChildren(){this.children=[]}
+  showModal(){this.open=true}
+  close(){this.open=false}
 }
 const html=e=>e.innerHTML+e.children.map(html).join('');
 const allText=e=>e.textContent+e.children.map(allText).join(' ');
@@ -86,7 +98,6 @@ const context = vm.createContext({URL,URLSearchParams,location:{search:'?key=fak
   if(url==='/rotate/quota-history') return {ok:historyOK,json:async()=>quotaHistory};
   return {ok:true,json:async()=>url==='/rotate/status'?status:stats};
 }});
-elements.confirm={showModal(){this.open=true},close(){this.open=false}};
 elements.tip=new Element();
 elements.tip.parentNode=new Element();
 (async()=>{
@@ -209,6 +220,13 @@ elements.tip.parentNode=new Element();
   assert(oai.includes('seen 2.0 h ago'),'a meter displays its window receipt time');
   assert(elements.pills.innerHTML.includes('>Rotate<')&&!elements.pills.innerHTML.includes('disabled'),'rotate button missing');
   assert(elements.accounts.innerHTML.includes('Resume auto')&&elements.accounts.innerHTML.includes('>Select<'),'account buttons missing');
+  const claims=elements.accounts.innerHTML;
+  assert.equal((claims.match(/class="meter-row"/g)||[]).length,3,'one meter for each reported claim');
+  assert(claims.includes('Fable weekly')&&claims.includes('blocked · exhausted')&&claims.includes('awaiting reading'));
+  assert(!claims.includes('>5h<')&&!claims.includes('<b>0%</b>'),'absent and expired usage do not show zero');
+  const pills=elements.pills.innerHTML;
+  assert(pills.includes('Default: ')&&pills.includes('Fable: ')&&pills.includes('&lt;/mark&gt;2</span>'));
+  assert(elements.devices.innerHTML.includes('strict (config)')&&elements.devices.innerHTML.includes('data-pin='));
   elements.accounts.onclick({target:{closest:()=>({dataset:{sw:value+'2'}})}});
   assert(elements.confirm.open,'confirmation not shown');
   assert(!elements['cf-text'].innerHTML.includes('<mark')&&elements['cf-text'].innerHTML.includes('&lt;mark'),'confirmation not escaped');
@@ -217,6 +235,34 @@ elements.tip.parentNode=new Element();
   assert(post&&post.opts.method==='POST'&&JSON.parse(post.opts.body).account===value+'2'
     &&post.opts.headers.Authorization==='Bearer fake-viewer-key'&&post.opts.headers['Content-Type']==='application/json','switch request');
   assert(!elements.confirm.open,'confirmation stays open after a switch');
+  const edit=()=>elements.devices.onclick({target:{closest:()=>({dataset:{pin:value}})}});
+  edit();
+  assert(elements['pin-form'].open&&elements['pin-target'].hidden&&elements['pin-mode'].value==='use_config');
+  assert(elements['pin-title'].textContent.includes(value)&&!elements['pin-account'].innerHTML.includes('<mark'));
+  elements['pin-mode'].value='fallback';
+  elements['pin-mode'].onchange();
+  elements['pin-account'].value=value+'2';
+  assert(!elements['pin-target'].hidden);
+  await timers.get(10000)();
+  assert(elements['pin-form'].open&&elements['pin-account'].value===value+'2','refresh preserves the open pin editor');
+  await elements['pin-save'].onclick();
+  edit();
+  elements['pin-mode'].value='auto';
+  await elements['pin-save'].onclick();
+  status.device_pins[value]={account_pin:null,source:'runtime'};
+  edit();
+  assert(elements['pin-mode'].value==='auto');
+  elements['pin-mode'].value='use_config';
+  await elements['pin-save'].onclick();
+  const pinPosts=urls.filter(u=>u.url==='/rotate/device-pin');
+  assert.equal(pinPosts.length,3);
+  assert(pinPosts.every(({opts})=>opts.method==='POST'&&opts.headers.Authorization==='Bearer fake-viewer-key'
+    &&opts.headers['Content-Type']==='application/json'&&opts.cache==='no-store'));
+  assert.deepEqual(pinPosts.map(({opts})=>JSON.parse(opts.body)),[
+    {device:value,account_pin:{mode:'fallback',account:value+'2'}},
+    {device:value,account_pin:null},
+    {device:value,use_config:true}
+  ]);
   console.log('panel JavaScript security checks passed');
 })().catch(error=>{console.error(error);process.exitCode=1});
 '''

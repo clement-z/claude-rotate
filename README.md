@@ -326,8 +326,7 @@ Open `http://<server>:8484/rotate/panel?key=<any device key>`:
 
 ![claude-rotate analytics panel — devices, account gauges, consumption and cost-equivalent tables](screenshots/panel.png)
 
-Live 5-hour and weekly gauges per account, straight from Anthropic's own
-rate-limit headers:
+Live per-account quota gauges, straight from Anthropic's rate-limit headers:
 
 ![account quota gauges with reset countdowns](screenshots/accounts.png)
 
@@ -336,14 +335,14 @@ rate-limit headers:
   requests in the last 24 h and the 7-day cost-equivalent. Alerts (device over
   N tokens/hour, account near the switch threshold; thresholds in
   `config.json`) sit in a banner above it.
-- **Accounts** — live 5-hour and weekly meters (from Anthropic's own headers)
-  with a tick at the switch threshold, reset countdowns, upstream status and
-  the active account. **Select** on an account, or **Rotate** next to the
-  active account (the next usable one in config order), switches to it after a
-  confirmation. The pick holds: consume-first and priority recovery leave it
-  alone until it reaches a switch threshold, runs out of quota or is disabled.
-  **Resume auto** hands it back to the strategy earlier.
-- **Weekly quota, all accounts** — the enabled accounts' current weekly
+- **Accounts** — one meter per reported quota claim, including **Fable weekly**
+  where available. Each meter shows which families use it, the reading and its
+  reset, and any block. After a reset it shows *awaiting reading*. Each family
+  has its own active account. **Select** and **Rotate** set a preference for
+  the eligible automatic routes. Each route keeps its preference until the
+  account reaches a threshold, runs out of quota or is disabled. **Resume auto**
+  clears both route preferences. Device pins take precedence.
+- **Weekly quota, all accounts** — the enabled accounts' current general weekly
   usage, summed (blue), against their combined capacity (orange: 100% per
   account, scaled by its plan's weight). Usage drops at each account's weekly
   reset by what that week used. A 7.5-day projection spends the last 24 h rate
@@ -372,7 +371,10 @@ rate-limit headers:
 - **Devices** — every registered device (online status, last seen, last model)
   and every removed device that still has history, with usage over 24 h, 7 d,
   30 d and all time plus a 30-day cost trend. 7 d and 30 d are calendar days,
-  today included.
+  today included. A Claude device's row shows its pin, mode and source. Use
+  **Edit** to set a pin until restart, choose **Auto until restart** to override
+  a config pin with automatic routing, or choose **Use config** to remove the
+  session override.
 - **By model** (24 h / 7 d / 30 d / all time) and **by account** (24 h) —
   requests, tokens, the share of prompt tokens served from cache, and a
   *cost-equivalent* column: what the usage would cost at API list prices (incl.
@@ -386,10 +388,17 @@ with every request and saved every minute. On first start it is rebuilt once
 from `audit.jsonl` and its rotated copies, and the weekly-quota part from
 `usage_history.json`, so all time reaches back as far as those files do.
 
-JSON endpoints: `/rotate/status` (accounts + switch events) and
-`/rotate/stats` (rollups, alerts, the longer `periods` and `billing`), same `?key=` or `Authorization: Bearer`
-auth. `POST /rotate/switch` with `{"account": NAME}` or `{"auto": true}` is the
-panel's switch; it accepts only `application/json`. Audit trail: `logs/audit.jsonl`, one JSON record per request.
+The panel's JSON endpoints use the same Claude device key or enabled tailnet
+access as the panel. `GET /rotate/status` returns per-account `claims`,
+`active_by_family`, effective `device_pins` with their source, and switch
+events. The legacy `active_account` field projects the default route.
+`GET /rotate/stats` returns rollups, alerts, the longer `periods` and `billing`.
+Both panel writes require same-origin JSON. `POST /rotate/switch` takes
+`{"account": NAME}` or `{"auto": true}`. `POST /rotate/device-pin` takes
+`{"device": NAME, "account_pin": {"account": ACCOUNT, "mode": MODE}}`.
+Use `"account_pin": null` for Auto until restart or send `"use_config": true`
+with the device name to restore the configured choice.
+The audit trail in `logs/audit.jsonl` contains one JSON record per request.
 
 On either Claude endpoint, `rate_limits` lists upstream 429s, including ones
 the proxy retried. Each entry records the account, rotation verdict, raw
@@ -418,9 +427,9 @@ curl http://<server>:8484/v1/chat/completions \
        "messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Text conversations only (tool use → 400). When every account's window is spent
-it returns `503` + `Retry-After: <seconds to earliest reset>` — point a
-router's circuit breaker at that. Responses carry `x-rotate-account` and the
+Text conversations only (tool use → 400). When the request's model family
+exhausts the available pool, the endpoint returns `503` with `Retry-After`.
+A strict pin passes through its target's first 429. Responses carry `x-rotate-account` and the
 upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 
 ## Other providers
@@ -659,12 +668,12 @@ can lose readings since the last successful save.
 | `plans{}` | extra or corrected plans: `name → {"price": USD a month, "weight": weekly quota relative to Max}`. Built in: `pro` (20, 0.2), `max` (100, 1), `ultra` (200, 2); Anthropic states Max as 5 times Pro every week and Ultra as 10 times. |
 | `accounts[].weight` | weekly capacity relative to a Max account, for accounts without `billing` (default 1): an Ultra is `2`, a Pro `0.2`. With `billing`, the plan sets it. |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
-| `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
+| `switch_threshold_7d` | preferred switching threshold for the general and Fable weekly claims (default 0.98) |
 | `strategy` | `consume-first` (default) or `least-used` — see below |
 | `switch_cooldown_s` | min seconds between voluntary switches (default 300); hard limits ignore it |
 | `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
-| `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
+| `hold_max_s` | wait up to this many seconds for a usable account when a model family is blocked on every account (default 0 = off) |
 | `refresh_idle_s` | send an account with no traffic for this long a 1-token `claude-haiku-4-5` request (~9 tokens of its quota) to read its current usage, so quota spent outside the proxy is seen before a switch (default 1800; 0 = off). Usage is otherwise only learned from traffic. |
 | `panel_tailnet` | `true` lets tailnet users open the panel without a device key, trusting the `Tailscale-User-Login` header from Tailscale Serve; requires a loopback `bind` (default false). See [SECURITY.md](SECURITY.md). |
 | `prices_per_mtok` | `[input, output]` or `[input, output, cached input]` $ per MTok for the cost columns, by a pattern found in the model id; the longest matching pattern wins. Entries change or add to the built-in table (Claude families and OpenAI models, see `BUILTIN_PRICES` in `rotator.py`); without a cached-input price a cache read costs 0.1x input, a cache write 1.25x. Default `{}`. |
@@ -672,28 +681,39 @@ can lose readings since the last successful save.
 
 ### Rotation policy
 
-An account is *usable* while its 5h window is under `switch_threshold` and its
-weekly window under `switch_threshold_7d`; a window past its reset counts as
-0%. State survives restarts in `state.json`.
+Automatic traffic has two routes. A model ID containing `fable` (case-insensitive)
+uses the Fable route. All other requests use the default route. General weekly
+quota and any reported 5h quota apply to both. Fable weekly quota applies to
+Fable. Other reported claims are learned per account and family. Routes and
+readings survive restarts in `state.json`.
+
+Automatic routing prefers accounts below each applicable switch threshold.
+When every account with quota is over a soft threshold, the active account
+can still serve. A claim that is rejected or at 100% blocks the families it
+applies to until reset or a bounded recheck. Expired readings await a fresh
+answer. The weekly chart and billing use general weekly quota.
 
 - **`consume-first`** (default): burn the usable account whose **weekly window
   resets soonest** — weekly quota is use-it-or-lose-it, so the perishable
   account is spent first and no paid quota expires unused. The proxy also
   switches *proactively* (below the threshold) when another usable account's
   weekly reset is at least `consume_first_margin_s` sooner.
-- **`least-used`**: classic — lowest 5h utilization wins.
+- **`least-used`**: compare 5h utilization if present, otherwise the highest
+  applicable utilization.
 - A cooldown plus a hysteresis margin stop accounts ping-ponging at the
   threshold; a hard limit (quota actually rejected) always switches
   immediately.
-- **Burst vs quota 429s**: a per-minute rate-limit 429 (utilization not
-  exhausted) does *not* rotate — rotating would move the burst to the next
-  account and throw away its warm prompt cache. The account is paced for
-  `retry-after` seconds and the request retried.
-- **Hold-until-reset** (`hold_max_s` > 0): when every account is spent, the
-  proxy keeps the request open and retries after the soonest 5h reset instead
-  of failing — an unattended CI/agent run finishes on its own instead of dying
-  at 2am. Make sure your client's request timeout tolerates the wait (Claude
-  Code's default is generous; other clients may need tuning).
+- **Burst vs quota 429s**: an ambiguous 429 paces that account and family
+  using bounded `Retry-After`. A repeated ambiguous Fable 429 can temporarily
+  exclude the account for Fable. An unexplained aggregate rejection blocks
+  the affected family until recheck. Shared-claim exhaustion blocks both.
+- **Holds and recovery**: if every enabled account is blocked for a family,
+  its earliest relief is the first account whose applicable blockers all
+  end. With `hold_max_s` set, the proxy waits within that budget and reselects
+  as windows reopen. A request can probe the earliest-relief account while
+  all accounts are blocked. Each family allows one probe in flight and one
+  start per minute. A successful probe wakes held requests. Local exhaustion
+  replies cap `Retry-After` at the next probe opportunity, even with holds off.
 
 ### Preferring one account over another
 
@@ -701,7 +721,7 @@ Three levels of control, from lazy to pro — all in the same `config.json`,
 deliberately **no separate rules file** (see design note below):
 
 **Level 0 — do nothing.** The defaults (consume-first + thresholds + cooldown)
-already make a sane global decision. Most single-owner setups need nothing else.
+already choose an account for each family.
 
 **Level 1 — priority tiers.** Give accounts a `priority` (lower = preferred):
 
@@ -730,13 +750,29 @@ by deleting the flag; both changes need a restart (hot reload is on the roadmap)
 Combine with `strategy` for the remaining temperament choice: `consume-first`
 (spend perishable weekly quota first) or `least-used` (spread evenly).
 
-**Design note — why no rules YAML:** a rules engine (per-model routes,
-time-of-day windows, per-device pinning) would add a parser, a second config
-file, and an ordering semantics to a one-file tool, and every use case we've
-actually hit decomposes into the four knobs above (strategy, priority,
-disabled, thresholds). If a real need appears that doesn't decompose — say
-per-device account pinning — add it as another plain field on the existing
-config objects, not as a DSL.
+### Pinning a device
+
+Set a pin on a device with the `anthropic` grant. A pin-only device object
+defaults to Claude access. An explicit `providers` list can include other
+grants alongside `anthropic`.
+
+```json
+"devices": {
+  "laptop": {"key": "<device key>", "account_pin": {"account": "acct-1", "mode": "strict"}}
+}
+```
+
+- **Strict** uses the target whenever it is available, even above a threshold
+  or with a recorded quota block. It returns the first upstream 429 to the
+  client. A disabled or unavailable target returns 503.
+- **Fallback** uses the target while it has quota for the requested family,
+  including above a soft threshold. A hard block or unavailable target sends
+  the request through automatic selection. The device returns to the pin
+  when the target becomes eligible again.
+
+On Debian use `sudo claude-rotate-admin pin-device NAME ACCOUNT --mode strict|fallback`
+or `sudo claude-rotate-admin unpin-device NAME`. Reassign or clear config pins
+before removing their account. Revoking the Claude grant also clears its pin.
 
 ## Run as a service
 
@@ -767,9 +803,9 @@ account this almost always means the setup token died (revoked, or hit its
 `tokens/<name>.token` and restart, or on the Debian service run
 `sudo claude-rotate-admin add-token <name>` for the existing account.
 
-**A request seems to hang.** If every account is spent and `hold_max_s` is
-set, that's hold-until-reset doing its job — the request is parked until the
-soonest 5h window reset. Check `recent_events` in `/rotate/status` for a
+**A request seems to hang.** If the model's family is blocked on every account
+and `hold_max_s` is set, the request waits for an account to recover within
+that budget. Check `recent_events` in `/rotate/status` for a
 `hold` entry. Set `hold_max_s: 0` if you'd rather fail fast.
 
 **"Why did it switch accounts?"** Every switch is an event in
@@ -777,8 +813,8 @@ soonest 5h window reset. Check `recent_events` in `/rotate/status` for a
 reason: `quota_exhausted`, `utilization>=<threshold>`, `consume_first`,
 `priority_recovery`, `account_disabled`, or `manual` (someone used the panel's
 switch or ran `claude-rotate-admin rotate`). If you saw a 429 upstream but *no*
-switch, it was a per-minute burst — the proxy paced the same account on
-purpose (see [Rotation policy](#rotation-policy)).
+switch, the verdict in the request's `rate_limits` audit entries identifies
+the outcome. See [Rotation policy](#rotation-policy).
 
 **Config edits don't take effect.** Config is read once at startup. Restart:
 `launchctl kickstart -k gui/$(id -u)/<label>` (macOS) or
@@ -804,15 +840,10 @@ load-bearing fact #2 in the continuation notes.
 
 Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-projects):
 
-- **One active account, globally.** Every device rides the same account at any
-  moment, so a token-hungry CI box drains the window your laptop is using.
-  Per-device *visibility* exists (panel, alerts); per-device *quotas* don't.
-- **No per-model weekly caps.** Anthropic tracks some model families
-  separately; the proxy only tracks the account-wide 5h/7d windows, so an
-  account out of (say) Opus quota gets benched entirely even if Sonnet still
-  has room. teamclaude does this better today.
-- **Switches drop warm prompt caches.** After a rotation, every device's first
-  request re-writes its prompt cache on the new account — that's the cost that
+- **Subscription quota is shared by device.** Devices using the same account
+  draw from its quota. Family routes and device pins select accounts.
+- **Switches drop warm prompt caches.** Traffic moved to another account
+  re-writes its prompt cache there. This is the cost that
   burst-pacing (and the hysteresis margin) exist to avoid paying needlessly.
 - **Restart to reconfigure.** No hot reload yet.
 - **Plain HTTP by design.** Transport privacy is delegated to the network
@@ -853,11 +884,10 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
   back with the [manual procedure](deploy/README.md#immutable-upgrades-and-rollback).
   Other installations should also test with dummy credentials before restarting.
   Check the active account, gauges, and an actual streamed request afterwards.
-- **Manual account switch.** `sudo claude-rotate-admin rotate [ACCOUNT]` makes
-  another usable account active, with a brief restart. The configured policy
-  resumes after the switch cooldown; see [OPERATIONS.md](OPERATIONS.md#switching-the-upstream-account).
-  The panel's **Select** and **Rotate** switch without a restart and hold the
-  pick until the account reaches a threshold.
+- **Manual account switch.** `sudo claude-rotate-admin rotate [ACCOUNT]` sets
+  another active account for eligible family routes with a brief restart.
+  The switch cooldown applies to each changed route. The panel's **Select**
+  and **Rotate** set a soft per-family preference without restarting.
 - **Health check.** Monitor `/rotate/status` using an `Authorization: Bearer`
   header, then separately monitor real provider success. Local readiness/watchdog
   checks cannot detect an expired provider token or an upstream outage. Keep
@@ -960,10 +990,9 @@ Load-bearing implementation facts (each was verified empirically — keep them):
    and the response's `content-encoding` header is dropped — otherwise httpx
    auto-decompresses while the original header survives and the client throws
    Zlib/Brotli errors.
-3. **Quota telemetry** comes from `anthropic-ratelimit-unified-5h-utilization`
-   / `-7d-utilization` / `-5h-reset` / `-status` response headers (present on
-   Max subscription traffic; undocumented — re-verify after Anthropic API
-   changes).
+3. **Quota telemetry** comes from `anthropic-ratelimit-unified-<claim>-*`
+   response headers. Observations and model-family applicability depend on
+   these undocumented headers.
 4. **SSE usage capture** parses `data:` lines containing `"usage"` while
    streaming chunks through untouched; audit is written in the stream's
    `finally`.
@@ -991,11 +1020,10 @@ Roadmap, in intended order:
       forwards NO client headers, refuses tool use with a 400. The rotation
       loop is shared with the transparent proxy (`send_upstream`).
 - [x] **Exhaustion signal.** The OpenAI endpoint returns 503 +
-      `Retry-After: <earliest reset>` when all accounts are spent (after any
-      `hold_max_s` hold is exhausted) — point a router's breaker at it. The
-      transparent proxy deliberately still passes Anthropic's 429 through:
-      Claude Code handles those natively, and that path's contract is
-      transparency.
+      `Retry-After` when the requested family exhausts the pool (after any
+      hold). The transparent proxy relays an upstream 429 or returns a local
+      429 when all accounts are known blocked. A strict pin relays the first
+      upstream 429 on either endpoint.
 - [ ] **Webhook alerts** (Slack/Teams/generic POST) firing on the same rules
       as the panel's alerts section.
 - [ ] **In-process audit rotation** — roll `logs/audit.jsonl` past a size/age

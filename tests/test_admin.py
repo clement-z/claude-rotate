@@ -300,13 +300,35 @@ def test_status_has_no_secrets(f):
 
 def test_status_live_query_uses_header(f):
     seen = {}
+    now = round(time.time())
+    reset = now + 3600
+    active = {"default": "acct-1", "fable": "acct-2"}
+    claims = {"7d": {"utilization": 0.42, "status": "allowed", "reset": reset, "seen_at": now},
+              "7d_oi": {"utilization": 1, "status": "rejected", "reset": reset, "seen_at": now},
+              "learned": {"utilization": 0.8, "reset": now - 60, "seen_at": now - 3600}}
+    live_claims = {
+        "7d": claims["7d"] | {"families": ["default", "fable"], "freshness": "current",
+                              "threshold": 0.98, "effective_utilization": 0.42},
+        "7d_oi": claims["7d_oi"] | {"families": ["fable"], "freshness": "current", "threshold": 0.98,
+                                    "effective_utilization": 1, "block_reason": "rejected", "blocked_until": reset,
+                                    "unrelated": TOKEN},
+        "learned": claims["learned"] | {"families": ["default"], "freshness": "awaiting_reading"},
+    }
+    available = {"default": True, "fable": False}
+    cfg = f.cfg()
+    device = next(iter(cfg["devices"]))
+    pin = {"account": "acct-2", "mode": "strict"}
+    original_config = f.config.read_bytes()
+    original_state = f.state.read_bytes() if f.state.exists() else None
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             seen["path"] = self.path
             seen["auth"] = self.headers.get("Authorization")
-            body = json.dumps({"active_account": "acct-2", "storage_errors": {"state_write": {"count": 3}},
-                               "accounts": {"acct-1": {"effective_util_5h": 0.1}}}).encode()
+            body = json.dumps({"active_account": active["default"], "active_by_family": active,
+                               "storage_errors": {"state_write": {"count": 3}},
+                               "accounts": {"acct-1": {"claims": live_claims, "eligible_by_family": available}},
+                               "device_pins": {device: {"account_pin": None, "source": "runtime"}}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -319,21 +341,45 @@ def test_status_live_query_uses_header(f):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        cfg = f.cfg()
         cfg["port"] = server.server_address[1]
+        cfg["devices"][device] = {"key": cfg["devices"][device], "account_pin": pin}
         f.config.write_text(json.dumps(cfg))
+        write_state(f, {"active_account": "acct-1", "routes": {f: {"active_account": a} for f, a in active.items()},
+                        "accounts": {"acct-1": {"claims": claims, "learned_claims": {"default": ["learned"]},
+                                                "util_5h": 0.75}}, "events": []})
+        f.set_active(False)
+        offline = f.run("status")
         f.set_active(True)
         r = f.run("status", "--json")
         assert r.returncode == 0, r
         report = json.loads(r.stdout)
         assert seen["path"] == "/rotate/status" and seen["auth"].startswith("Bearer dev-")
-        assert report["live"]["active_account"] == "acct-2"
+        assert report["active_by_family"] == report["live"]["active_by_family"] == active
+        assert report["live"]["active_account"] == report["active_account"] == active["default"]
+        disk, live = report["accounts"][0], report["live"]["accounts"]["acct-1"]
+        assert disk["claims"] == live["claims"]
+        assert disk["eligible_by_family"] == live["eligible_by_family"] == available
+        assert "util_5h" not in disk and "effective_util_5h" not in live and TOKEN not in r.stdout
+        assert report["device_pins"][device] == {"account_pin": pin, "source": "config"}
+        assert report["live"]["device_pins"][device] == {"account_pin": None, "source": "runtime"}
         assert report["live"]["storage_errors"] == {"state_write": {"count": 3}}
         human = f.run("status")
         assert "storage_errors" in human.stdout and seen["auth"][7:] not in human.stdout
+        for snippet in ("default acct-1, fable acct-2", "General weekly: 42% used, default/fable",
+                        "Fable weekly: 100% used, fable", "learned: awaiting reading"):
+            assert snippet in offline.stdout and snippet in human.stdout
+        assert "5h" not in human.stdout and "5h" not in offline.stdout
+        assert "acct-2, strict (config)" in offline.stdout
+        assert "auto until restart (runtime)" in human.stdout
     finally:
         server.shutdown()
         server.server_close()
+        f.set_active(False)
+        f.config.write_bytes(original_config)
+        if original_state is None:
+            f.state.unlink(missing_ok=True)
+        else:
+            f.state.write_bytes(original_state)
 
 
 def write_state(f, state):
