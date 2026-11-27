@@ -2106,6 +2106,8 @@ PANEL_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
  .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(380px,100%),1fr));gap:16px}
  .acct-head{display:flex;align-items:baseline;gap:8px;margin-bottom:12px;flex-wrap:wrap} .acct-head b{font-size:16px}
  .acct-side{margin-left:auto;display:flex;align-items:baseline;gap:8px}
+ .acct-badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+ .acct-badges .badge{overflow-wrap:anywhere}
  .badge{font-size:12px;border-radius:999px;padding:1px 8px;border:1px solid var(--border);color:var(--ink2)}
  .meter-row{display:grid;grid-template-columns:28px 1fr 250px;gap:10px;align-items:center;margin:8px 0}
  .meter{position:relative;height:8px;border-radius:4px;background:var(--track)} .meter i{position:absolute;inset:0 auto 0 0;border-radius:4px}
@@ -2537,14 +2539,16 @@ async function refresh(){
   $('accounts').innerHTML=accts.map(([name,a])=>{const bl=(stats.billing||{})[name];
     const seen=a.last_seen?ago(Math.round((Date.now()/1000-a.last_seen)/60)):'never';
     const badges=Object.entries(active).filter(([,n])=>n===name).map(([f])=>
-      `<span class="badge"><span class="dot" style="background:var(--good)"></span>${familyLabel(f)} active${manual[f]===name?' &middot; manual':''}</span>`).join('');
-    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>${badges}`
-      +(bl?`<span class="badge">${esc(bl.plan)}${bl.renews?' &middot; renews '+esc(day(Date.parse(bl.renews+'T00:00')/1000)):''}</span>`:'')
-      +(a.disabled?'<span class="badge">disabled</span>':'')+(a.priority!==100?`<span class="badge">prio ${esc(a.priority)}</span>`:'')
+      `<span class="badge"><span class="dot" style="background:var(--good)"></span>${familyLabel(f)} active${manual[f]===name?' &middot; manual':''}</span>`);
+    if(bl)badges.push(`<span class="badge">${esc(bl.plan)}${bl.renews?' &middot; renews '+esc(day(Date.parse(bl.renews+'T00:00')/1000)):''}</span>`);
+    if(a.disabled)badges.push('<span class="badge">disabled</span>');
+    if(a.priority!==100)badges.push(`<span class="badge">prio ${esc(a.priority)}</span>`);
+    return `<div class="card"><div class="acct-head"><b>${esc(name)}</b>`
       +`<span class="acct-side"><span class="muted small">upstream: ${esc(a.status||'n/a')} &middot; seen ${seen}</span>`
       +(eligible(a).some(f=>manual[f]!==name)?`<button class="linkbtn" data-sw="${esc(name)}">Select</button>`:'')
       +(Object.values(manual).includes(name)?'<button class="linkbtn" data-auto="1">Resume auto</button>':'')+'</span></div>'
-      +claimMeters(a,Date.now()/1000)+'</div>'}).join('');
+      +claimMeters(a,Date.now()/1000)
+      +(badges.length?`<div class="acct-badges">${badges.join('')}</div>`:'')+'</div>'}).join('');
   refreshQuotaCards(st);
   refreshWeekly(wk);
   $('billing').innerHTML=billing(stats.billing);
