@@ -58,6 +58,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 CREDENTIALS = STATE_DIR / "credentials"  # as providers.OpenAISiwc: credentials/<provider>.json
 CRED_MAX_BYTES = 64 * 1024
 ANTHROPIC = "anthropic"  # the Claude accounts, as a device grant
+MODEL_FAMILIES = ("default", "fable")
 TOKEN_PREFIX = "sk-ant-oat01-"
 PLACEHOLDER = "REPLACE-WITH"
 EXIT_OK, EXIT_REFUSED, EXIT_NOT_LIVE, EXIT_SETUP_NEEDED = 0, 1, 2, 3
@@ -237,9 +238,23 @@ def device_key(entry):
 
 
 def device_providers(entry):
-    """What a devices entry may reach; the string form is the Claude accounts only. An
-    object must list its grants: a missing list grants nothing (and fails readiness)."""
-    return entry.get("providers") if isinstance(entry, dict) else [ANTHROPIC]
+    """The string and pin-only forms grant the Claude accounts."""
+    if not isinstance(entry, dict):
+        return [ANTHROPIC]
+    return entry.get("providers", [ANTHROPIC] if "account_pin" in entry else None)
+
+
+def device_pin(entry):
+    return entry.get("account_pin") if isinstance(entry, dict) else None
+
+
+def device_entry(key: str, names: list, pin=None):
+    if names == [ANTHROPIC]:
+        return key if pin is None else {"key": key, "account_pin": pin}
+    entry = {"key": key, "providers": names}
+    if pin is not None:
+        entry["account_pin"] = pin
+    return entry
 
 
 def parse_providers(cfg: dict, text: str, what: str, also=()) -> list:
@@ -393,12 +408,21 @@ def readiness(cfg: dict):
     if len(set(keys)) != len(keys):
         problems.append("device keys are not unique")
     known = known_providers(cfg)
+    account_names = {account["name"] for account in cfg["accounts"]}
     for k, v in devices.items():
         names = device_providers(v)
-        if not isinstance(names, list) or not names or any(n not in known for n in names) \
-                or (isinstance(v, dict) and set(v) - {"key", "providers"}):
+        if not isinstance(names, list) or not names or any(not isinstance(n, str) or n not in known for n in names) \
+                or (isinstance(v, dict) and set(v) - {"key", "providers", "account_pin"}):
             problems.append(f"device '{k}': an object needs \"key\" and a nonempty \"providers\" list "
                             f"of names from: {', '.join(sorted(known))}")
+        if isinstance(v, dict) and "account_pin" in v:
+            pin = device_pin(v)
+            if (not isinstance(pin, dict) or set(pin) != {"account", "mode"}
+                    or not isinstance(pin["account"], str) or pin["account"] not in account_names
+                    or pin["mode"] not in ("strict", "fallback")
+                    or not isinstance(names, list) or ANTHROPIC not in names):
+                problems.append(f"device '{k}': account_pin needs a configured account, "
+                                "mode strict or fallback, and the anthropic grant")
     return not problems, problems, warnings
 
 
@@ -458,7 +482,7 @@ def effective_utilization(info: dict, now: float):
     return util_5h, util_7d
 
 
-def account_eligibility(cfg: dict, state, name: str):
+def account_eligibility(cfg: dict, state, name: str, family: str = "default"):
     """Why an account cannot be made active, or [] when it can."""
     by_name = {a["name"]: a for a in cfg["accounts"]}
     acct = by_name.get(name)
@@ -474,13 +498,30 @@ def account_eligibility(cfg: dict, state, name: str):
         reasons.append("token file is empty")
     info = ((state or {}).get("accounts") or {}).get(name) or {}
     if isinstance(info, dict):
-        util_5h, util_7d = effective_utilization(info, time.time())
+        now = time.time()
         threshold = cfg.get("switch_threshold", 0.8)
         threshold_7d = cfg.get("switch_threshold_7d", 0.98)
-        if util_5h >= threshold:
-            reasons.append(f"5h window at {util_5h:.0%} (threshold {threshold:.0%})")
-        if util_7d >= threshold_7d:
-            reasons.append(f"7d window at {util_7d:.0%} (threshold {threshold_7d:.0%})")
+        limits = {"5h": threshold, "7d": threshold_7d}
+        claims = info.get("claims")
+        if isinstance(claims, dict):
+            if family == "fable":
+                limits["7d_oi"] = threshold_7d
+            learned = info.get("learned_claims", {}).get(family, ())
+            for claim in dict.fromkeys([*limits, *learned]):
+                reading = claims.get(claim, {})
+                reset = reading.get("reset", 0)
+                utilization = reading.get("utilization", 0)
+                if (reset > now and utilization >= 1 or reading.get("status") == "rejected"
+                        and max(reset, reading.get("recheck_at", 0)) > now):
+                    reasons.append(f"{claim} window is exhausted")
+                elif claim in limits and (not reset or reset > now) and utilization >= limits[claim]:
+                    reasons.append(f"{claim} window at {utilization:.0%} (threshold {limits[claim]:.0%})")
+            if info.get("blocks_by_family", {}).get(family, {}).get("until", 0) > now:
+                reasons.append(f"{family} temporarily blocked")
+        else:
+            for (claim, limit), utilization in zip(limits.items(), effective_utilization(info, now)):
+                if utilization >= limit:
+                    reasons.append(f"{claim} window at {utilization:.0%} (threshold {limit:.0%})")
     return reasons
 
 
@@ -718,7 +759,7 @@ def change_grants(args, grant: bool) -> int:
         if not after:
             raise Refused(f"that would leave '{args.name}' with no grant; to revoke its key use "
                           "remove-user; nothing changed")
-        cfg["devices"][args.name] = key if after == [ANTHROPIC] else {"key": key, "providers": after}
+        cfg["devices"][args.name] = device_entry(key, after, device_pin(entry) if ANTHROPIC in after else None)
         write_config(cfg)
         out(f"device '{args.name}' now reaches {', '.join(after)} (was {was}); its key is unchanged")
         return activate(cfg, restart=not args.no_restart, what=f"grants for '{args.name}'")
@@ -730,6 +771,46 @@ def cmd_grant(args) -> int:
 
 def cmd_revoke(args) -> int:
     return change_grants(args, grant=False)
+
+
+def change_device_pin(args, pin: dict | None) -> int:
+    validate_name(args.name, "device name")
+    with AdminLock():
+        check_fixed_tree()
+        cfg = load_config()
+        entry = cfg["devices"].get(args.name)
+        key = device_key(entry)
+        if not key or PLACEHOLDER in key:
+            raise Refused(f"no device '{args.name}' with a usable key; nothing changed")
+        if isinstance(entry, dict) and set(entry) - {"key", "providers", "account_pin"}:
+            raise Refused(f"device '{args.name}' has unknown fields; nothing changed")
+        names = device_providers(entry)
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
+            raise Refused(f"device '{args.name}' has a malformed providers list; nothing changed")
+        if pin is not None:
+            account = pin["account"]
+            validate_name(account, "account name")
+            if account not in {acct["name"] for acct in cfg["accounts"]}:
+                raise Refused(f"account '{account}' is not configured; nothing changed")
+            if ANTHROPIC not in names:
+                raise Refused(f"device '{args.name}' needs the anthropic grant; nothing changed")
+        elif not isinstance(entry, dict) or "account_pin" not in entry:
+            out(f"device '{args.name}' has no account pin")
+            return EXIT_OK
+        if pin is not None and pin == device_pin(entry):
+            out(f"device '{args.name}' already has that account pin")
+            return EXIT_OK
+        cfg["devices"][args.name] = device_entry(key, names, pin)
+        write_config(cfg)
+        return activate(cfg, restart=not args.no_restart, what=f"account pin for '{args.name}'")
+
+
+def cmd_pin_device(args) -> int:
+    return change_device_pin(args, {"account": args.account, "mode": args.mode})
+
+
+def cmd_unpin_device(args) -> int:
+    return change_device_pin(args, None)
 
 
 def cmd_remove_user(args) -> int:
@@ -967,6 +1048,10 @@ def cmd_remove_token(args) -> int:
         acct = next((a for a in cfg["accounts"] if a["name"] == args.name), None)
         if acct is None:
             raise Refused(f"account '{args.name}' does not exist; nothing changed")
+        pins = [name for name, entry in cfg["devices"].items()
+                if isinstance(pin := device_pin(entry), dict) and pin.get("account") == args.name]
+        if pins:
+            raise Refused(f"account '{args.name}' is pinned by {', '.join(pins)}; reassign or unpin them first")
         cfg["accounts"] = [a for a in cfg["accounts"] if a["name"] != args.name]
         write_config(cfg)
         path = token_path(acct)
@@ -1006,10 +1091,13 @@ def choose_rotate_target(cfg: dict, state, requested):
         validate_name(requested, "account name")
         if requested not in names:
             raise Refused(f"account '{requested}' is not in the configuration; nothing changed")
-        if requested == current:
+        eligible = eligible_routes(cfg, state, requested)
+        routes = (state or {}).get("routes", {})
+        if requested == current and all(routes.get(family, {}).get("active_account", current) == current
+                                        for family in eligible):
             return current, None
-        reasons = account_eligibility(cfg, state, requested)
-        if reasons:
+        if not eligible:
+            reasons = account_eligibility(cfg, state, requested)
             raise Refused(f"account '{requested}' cannot be made active: {'; '.join(reasons)}; nothing changed")
         return current, requested
     start = names.index(current) + 1 if current in names else 0
@@ -1017,11 +1105,15 @@ def choose_rotate_target(cfg: dict, state, requested):
     for name in names[start:] + names[:start]:
         if name == current:
             continue
-        reasons = account_eligibility(cfg, state, name)
-        if not reasons:
+        if eligible_routes(cfg, state, name):
             return current, name
+        reasons = account_eligibility(cfg, state, name)
         report.append(f"{name}: {'; '.join(reasons)}")
     raise Refused("no other eligible account; nothing changed" + (": " + " | ".join(report) if report else ""))
+
+
+def eligible_routes(cfg: dict, state, target: str) -> list:
+    return [family for family in MODEL_FAMILIES if not account_eligibility(cfg, state, target, family)]
 
 
 def cmd_rotate(args) -> int:
@@ -1059,8 +1151,9 @@ def cmd_rotate(args) -> int:
         try:
             # The shutdown drain may have saved newer state: decide again from the file.
             state = read_state()
-            reasons = account_eligibility(cfg, state, target)
-            if reasons:
+            eligible = eligible_routes(cfg, state, target)
+            if not eligible:
+                reasons = account_eligibility(cfg, state, target)
                 raise Refused(f"account '{target}' is no longer eligible after the service drained: "
                               f"{'; '.join(reasons)}; rotation state unchanged")
             if state is None:
@@ -1071,11 +1164,30 @@ def cmd_rotate(args) -> int:
                 state["events"] = []
             previous = state.get("active_account")
             now = time.time()
-            state["active_account"] = target
-            state["last_switch_ts"] = now
-            util = effective_utilization(state["accounts"].get(previous) or {}, now)[0] if previous else 0.0
-            state["events"].append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "switch",
-                                    "from": previous, "to": target, "reason": "manual", "util": util})
+            routes = state.setdefault("routes", {})
+            scope = "active account" if "default" in eligible else "Fable active account"
+            display_previous = previous if "default" in eligible else routes.get("fable", {}).get("active_account", previous)
+            legacy_manual = previous if state.get("pinned") == previous else None
+            last_switch = state.get("last_switch_ts")
+            if type(last_switch) not in (int, float) or not 0 <= last_switch < 1e15:
+                last_switch = 0
+            for family in MODEL_FAMILIES:
+                route = routes.setdefault(family, {"active_account": previous or current,
+                                                   "last_switch_ts": last_switch,
+                                                   "manual_account": legacy_manual})
+                source = route["active_account"]
+                if family not in eligible or target == source:
+                    continue
+                route.update(active_account=target, last_switch_ts=now, manual_account=None)
+                util = effective_utilization(state["accounts"].get(source) or {}, now)[0]
+                state["events"].append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "switch", "family": family,
+                                        "from": source, "to": target, "reason": "manual", "util": util})
+            default = routes["default"]
+            state.update(active_account=default["active_account"], last_switch_ts=default["last_switch_ts"])
+            if default.get("manual_account"):
+                state["pinned"] = default["manual_account"]
+            else:
+                state.pop("pinned", None)
             state["events"] = state["events"][-200:]
             write_state(state)
         except Refused as exc:
@@ -1088,14 +1200,14 @@ def cmd_rotate(args) -> int:
             err(f"error: unexpected failure before the state was written ({restore()})")
             raise
         if not stopped_by_us:
-            out(f"active account set to '{target}' (was '{previous}'); the service is not running, "
+            out(f"{scope} set to '{target}' (was '{display_previous}'); the service is not running, "
                 "so it applies at the next start")
             return EXIT_OK
         note = restore()
         if note != "service started again":
-            out(f"state now names '{target}' (was '{previous}') but the {note}")
+            out(f"state now names '{target}' (was '{display_previous}') but the {note}")
             return EXIT_NOT_LIVE
-        out(f"active account is now '{target}' (was '{previous}'); service restarted. "
+        out(f"{scope} is now '{target}' (was '{display_previous}'); service restarted. "
             f"The switch cooldown ({cfg.get('switch_cooldown_s', 300)} s) applies; quota exhaustion "
             "or a disabled account can still move traffic immediately.")
         return EXIT_OK
@@ -1331,6 +1443,14 @@ def build_parser():
         p.add_argument("name", metavar="NAME")
         p.add_argument("providers", metavar="PROVIDERS", help="comma-separated provider names")
         p.add_argument("--no-restart", action="store_true")
+    p = add("pin-device", cmd_pin_device, "pin a device to a Claude account")
+    p.add_argument("name", metavar="NAME")
+    p.add_argument("account", metavar="ACCOUNT")
+    p.add_argument("--mode", choices=("strict", "fallback"), required=True)
+    p.add_argument("--no-restart", action="store_true")
+    p = add("unpin-device", cmd_unpin_device, "remove a device's configured account pin")
+    p.add_argument("name", metavar="NAME")
+    p.add_argument("--no-restart", action="store_true")
     p = add("install-credential", cmd_install_credential,
             "install a Sign in with ChatGPT credential made by siwc_login.py (from --file or stdin); "
             "restarts the service")

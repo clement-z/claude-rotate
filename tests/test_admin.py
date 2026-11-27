@@ -389,6 +389,8 @@ def test_rotate_switches_after_stop_and_preserves_state(f):
     assert state["drained"] is True and state["accounts"]["acct-1"]["util_5h"] == 0.42  # written during stop, kept
     assert state["accounts"]["acct-2"] == {"util_5h": 0.1}
     assert abs(state["last_switch_ts"] - time.time()) < 60
+    assert state["routes"] == {family: {"active_account": "acct-2", "last_switch_ts": state["last_switch_ts"],
+                                       "manual_account": None} for family in ("default", "fable")}
     assert state["events"][-1]["reason"] == "manual" and state["events"][-1]["to"] == "acct-2"
     assert mode(f.state) == 0o600
     hook.unlink()
@@ -440,6 +442,23 @@ def test_rotate_switches_after_stop_and_preserves_state(f):
     assert r.returncode == 1 and "no longer eligible" in r.stderr and "service started again" in r.stderr, r
     assert json.loads(f.state.read_text())["active_account"] == "acct-1"
     assert "start claude-rotate.service" in f.calls()
+    hook.unlink()
+    # The drained state can exclude the target for just one family.
+    state = json.loads(f.state.read_text())
+    state["accounts"]["acct-2"] = {"util_5h": 0.1}
+    write_state(f, state)
+    hook.write_text("#!/bin/sh\n" + f"{sys.executable} - <<'EOF'\n"
+                    "import json, time\n"
+                    f"p = {str(f.state)!r}\n"
+                    "s = json.load(open(p))\n"
+                    "s['accounts']['acct-2'] = {'claims': {'7d_oi': {'utilization': 1, 'reset': time.time() + 3600}}}\n"
+                    "json.dump(s, open(p, 'w'))\nEOF\n")
+    hook.chmod(0o700)
+    r = f.run("rotate", "acct-2")
+    assert r.returncode == 0, r
+    state = json.loads(f.state.read_text())
+    assert state["active_account"] == state["routes"]["default"]["active_account"] == "acct-2"
+    assert state["routes"]["fable"]["active_account"] == "acct-1"
     hook.unlink()
     # No state file yet: the default shape is created.
     f.state.unlink()

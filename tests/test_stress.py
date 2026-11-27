@@ -208,7 +208,7 @@ async def churn():
     for i in range(300):
         active = R.STATE["active_account"]
         other = "b" if active == "a" else "a"
-        await R.note_response(other, httpx.Headers(unified(u5="0.1")), 200, automatic=False)
+        await R.note_response(other, httpx.Headers(unified(u5="0.1")), 200, policy="observe")
         h = httpx.Headers({**unified(u5="1.0", status="rejected"),
                            "anthropic-ratelimit-unified-5h-reset": str(time.time() + 1000 + i)})
         await R.note_response(active, h, 429)

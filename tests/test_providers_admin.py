@@ -629,6 +629,45 @@ def test_grant_revoke():
           and f.run("check").returncode == 0, r)
 
 
+def test_device_pin_commands():
+    f = make()
+    f.set_active(True)
+    reset(f)
+    strict = {"account": "acct-1", "mode": "strict"}
+    r = f.run("pin-device", "laptop", "acct-1", "--mode", "strict", "--no-restart")
+    check("pin-device keeps the key and writes a valid Claude-only pin object",
+          r.returncode == 0 and LAPTOP_KEY not in r.stdout and f.cfg()["devices"]["laptop"] == {
+              "key": LAPTOP_KEY, "account_pin": strict}
+          and not any(call.startswith(("start ", "stop ", "restart ")) for call in f.calls()), r)
+    before = f.config.read_bytes()
+    r = f.run("remove-token", "acct-1", "--no-restart")
+    check("removing a config-pinned account is refused before changing config or its token",
+          r.returncode == 1 and "pinned by laptop" in r.stderr and f.config.read_bytes() == before
+          and (f.tokens / "acct-1.token").is_file(), r)
+    r = f.run("grant", "laptop", "openai", "--no-restart")
+    check("grant keeps the device pin and its key",
+          r.returncode == 0 and f.cfg()["devices"]["laptop"] == {
+              "key": LAPTOP_KEY, "providers": ["anthropic", "openai"], "account_pin": strict}, r)
+    r = f.run("unpin-device", "laptop", "--no-restart")
+    check("unpin-device keeps a device's key and explicit grants",
+          r.returncode == 0 and f.cfg()["devices"]["laptop"] == {
+              "key": LAPTOP_KEY, "providers": ["anthropic", "openai"]}, r)
+    reset(f)
+    r = f.run("pin-device", "laptop", "acct-1", "--mode", "fallback")
+    check("pin-device activates through the normal service restart path",
+          r.returncode == 0 and f.cfg()["devices"]["laptop"]["account_pin"]["mode"] == "fallback"
+          and "restart claude-rotate.service" in f.calls(), r)
+    r = f.run("revoke", "laptop", "anthropic", "--no-restart")
+    check("revoking Anthropic clears the pin while preserving other grants and the key",
+          r.returncode == 0 and f.cfg()["devices"]["laptop"] == {"key": LAPTOP_KEY, "providers": ["openai"]}, r)
+    before = f.config.read_bytes()
+    r = f.run("pin-device", "laptop", "acct-1", "--mode", "strict")
+    missing = f.run("pin-device", "laptop", "missing", "--mode", "strict")
+    check("pin-device rejects provider-only devices and unknown accounts without editing config",
+          r.returncode == missing.returncode == 1 and "anthropic grant" in r.stderr
+          and "not configured" in missing.stderr and f.config.read_bytes() == before, (r, missing))
+
+
 # The real entry point with one os function replaced first; the child that writes
 # as the service user is a fork, so it inherits the replacement.
 FAULTS = {
@@ -702,4 +741,5 @@ test_install_codex_images()
 test_status_reports_images()
 test_readiness_of_object_devices()
 test_grant_revoke()
+test_device_pin_commands()
 print(f"\nall {PASS} checks passed")

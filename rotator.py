@@ -112,21 +112,7 @@ class PrivateResponseHeaders:
 
 def load_config() -> dict:
     cfg = json.loads(CONFIG_PATH.read_text())
-    loaded = []
-    for acct in cfg["accounts"]:
-        w = acct.get("weight", 1)
-        if type(w) not in (int, float) or not w > 0:
-            raise SystemExit(f"account '{acct['name']}': weight must be a number > 0")
-        path = CONFIG_PATH.parent / acct["token_file"]
-        if path.exists():
-            acct["token"] = path.read_text().strip()
-            loaded.append(acct)
-        else:
-            print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} not found",
-                  file=sys.stderr)
-    if not loaded:
-        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
-    cfg["accounts"] = loaded
+    configured = {acct["name"] for acct in cfg["accounts"]}
     # The example config ships a placeholder device key that is PUBLIC (it's in
     # the repo). It must never be accepted as a live credential: refuse to start
     # while one remains, so add-account-without-add-device can't open the proxy
@@ -134,17 +120,21 @@ def load_config() -> dict:
     devices = cfg.get("devices")
     if not isinstance(devices, dict):
         raise SystemExit("devices must map names to nonempty device keys")
-    grants = {}
+    grants, pins = {}, {}
     for name, entry in devices.items():
-        # A string is a key for the Claude accounts alone; an object must name what it
-        # grants, so a missing or misspelt "providers" cannot fall back to the Claude
-        # accounts and the panel.
         if isinstance(entry, dict):
-            names = entry.get("providers")
+            if "account_pin" in entry:
+                pin = entry["account_pin"]
+                if not valid_account_pin(pin, configured):
+                    raise SystemExit(f"device '{name}': account_pin needs a configured account and mode strict or fallback")
+                pins[name] = pin
+            names = entry.get("providers", [ANTHROPIC] if name in pins else None)
             if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names) \
-                    or set(entry) - {"key", "providers"}:
-                raise SystemExit(f"device '{name}': an object needs \"key\" and a nonempty "
-                                 "\"providers\" list, and nothing else")
+                    or set(entry) - {"key", "providers", "account_pin"}:
+                raise SystemExit(f"device '{name}': an object needs \"key\" and a nonempty \"providers\" "
+                                 "list unless it has an account_pin")
+            if name in pins and ANTHROPIC not in names:
+                raise SystemExit(f"device '{name}': account_pin requires the anthropic grant")
             grants[name], entry = names, entry.get("key")
         if not isinstance(entry, str) or not entry.strip():
             raise SystemExit("devices must map names to nonempty device keys")
@@ -158,7 +148,32 @@ def load_config() -> dict:
             f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
             "value is public and must never be a valid credential. "
             "Run: ./setup.sh add-device <name> (it replaces the placeholder).")
+    loaded = []
+    for acct in cfg["accounts"]:
+        w = acct.get("weight", 1)
+        if type(w) not in (int, float) or not w > 0:
+            raise SystemExit(f"account '{acct['name']}': weight must be a number > 0")
+        path = CONFIG_PATH.parent / acct["token_file"]
+        if path.exists():
+            token = path.read_text().strip()
+            if token:
+                acct["token"] = token
+                loaded.append(acct)
+            else:
+                print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} is empty", file=sys.stderr)
+        else:
+            print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} not found",
+                  file=sys.stderr)
+    if not loaded:
+        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
+    cfg["accounts"], cfg["configured_accounts"], cfg["account_pins"] = loaded, configured, pins
     return cfg
+
+
+def valid_account_pin(pin, accounts) -> bool:
+    return (isinstance(pin, dict) and set(pin) == {"account", "mode"}
+            and isinstance(pin["account"], str) and pin["account"] in accounts
+            and pin["mode"] in ("strict", "fallback"))
 
 
 CFG = load_config()
@@ -206,7 +221,7 @@ class RequestAdmission:
     async def __call__(self, scope, receive, send):
         admin = (scope.get("method"), scope.get("path")) in {
             ("GET", "/rotate/status"), ("GET", "/rotate/stats"), ("GET", "/rotate/panel"),
-            ("GET", "/rotate/quota-history"), ("POST", "/rotate/switch")}
+            ("GET", "/rotate/quota-history"), ("POST", "/rotate/switch"), ("POST", "/rotate/device-pin")}
         if scope["type"] != "http" or not self.limit or admin:
             return await self.app(scope, receive, send)
         # One event loop, with no await between the check and increment.
@@ -231,10 +246,18 @@ for _device, _names in CFG.get("device_grants", {}).items():
         raise SystemExit(f"device '{_device}': unknown provider(s) "
                          + ", ".join(sorted(set(_names) - {ANTHROPIC} - set(PROVIDERS))))
 DEVICE_GRANTS = {d: frozenset(n) for d, n in CFG.get("device_grants", {}).items()}
+DEVICE_PIN_OVERRIDES: dict = {}
 
 
 def granted(device: str, provider: str) -> bool:
     return provider in DEVICE_GRANTS.get(device, (ANTHROPIC,))
+
+
+def device_pin(device: str) -> tuple[dict | None, str]:
+    if device in DEVICE_PIN_OVERRIDES:
+        return DEVICE_PIN_OVERRIDES[device], "runtime"
+    pin = CFG["account_pins"].get(device)
+    return pin, "config" if pin else "automatic"
 
 
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
@@ -353,7 +376,8 @@ def load_state() -> dict:
             if info.get("status") == "rejected":
                 info.pop("status")
         state["version"] = STATE_VERSION
-        seed_routes(state)
+        if "routes" not in state:
+            seed_routes(state)
         if exists:
             write_state(state)
     elif state.get("version") == STATE_VERSION:
@@ -628,13 +652,14 @@ def switch_route(family: str, target: str, reason: str, now: float) -> None:
         project_default_route()
 
 
-def select_account(family: str, now: float) -> str | None:
+def select_account(family: str, now: float, *, update: bool = True) -> str | None:
     """Select an automatic account under the state lock."""
     route = family_route(family)
     current = route["active_account"]
     pool = route_pool(family, now)
     under = [name for name in pool if not soft_limited(name, family, now)]
-    if route.get("manual_account") and current not in under:
+    manual = route.get("manual_account") and current in under
+    if update and route.get("manual_account") and not manual:
         route["manual_account"] = None
         if family == "default":
             project_default_route()
@@ -644,7 +669,7 @@ def select_account(family: str, now: float) -> str | None:
     if current not in pool:
         target = ordered_pick(under or pool, family, now)
         reason = "account_disabled" if current not in ACCOUNTS or disabled(current) else "quota_exhausted"
-    elif not under or route.get("manual_account") or now - route["last_switch_ts"] < COOLDOWN_S:
+    elif not under or manual or now - route["last_switch_ts"] < COOLDOWN_S:
         return current
     else:
         target = ordered_pick(under, family, now)
@@ -662,7 +687,7 @@ def select_account(family: str, now: float) -> str | None:
             reason = "consume_first"
         else:
             return current
-    if target != current:
+    if update and target != current:
         switch_route(family, target, reason, now)
         save_state()
     return target
@@ -772,7 +797,7 @@ def aggregate_recheck(info: dict, headers: httpx.Headers, family: str, now: floa
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int, *, family: str | None = "default",
-                        repeated_burst: bool = False, automatic: bool = True) -> str | None:
+                        repeated_burst: bool = False, policy: str = "automatic") -> str | None:
     """Observe headers once and classify an automatic 429 for its own family."""
     async with state_lock:
         info = STATE["accounts"].setdefault(account, {})
@@ -782,11 +807,10 @@ async def note_response(account: str, headers: httpx.Headers, status: int, *, fa
         if aggregate:
             info["status"] = aggregate
         info["last_seen"] = now
-        if not automatic:
+        if policy == "observe":
             save_state()
             return None
         family = family or "default"
-        route = family_route(family)
         if status == 429 and blocker_deadline(account, family, now) <= now:
             if aggregate == "rejected" or repeated_burst:
                 deadline = aggregate_recheck(info, headers, family, now) if aggregate == "rejected" else now + RECHECK_S
@@ -802,10 +826,13 @@ async def note_response(account: str, headers: httpx.Headers, status: int, *, fa
                 save_state()
                 return "burst"
         if status == 429:
-            target = select_account(family, now)
+            if policy == "strict":
+                save_state()
+                return "strict"
+            target = select_account(family, now, update=policy == "automatic")
             save_state()
             return "switched" if target is not None and target != account else "exhausted"
-        if route["active_account"] == account:
+        if policy == "automatic" and family_route(family)["active_account"] == account:
             target = select_account(family, now)
             save_state()
             return "switched" if target is not None and target != account else None
@@ -841,7 +868,7 @@ async def refresh_idle_accounts() -> None:
             print(f"warning: usage refresh of {name} failed ({type(exc).__name__})", file=sys.stderr)
             continue
         if "anthropic-ratelimit-unified-status" in r.headers:
-            await note_response(name, r.headers, r.status_code, family=None, automatic=False)
+            await note_response(name, r.headers, r.status_code, family=None, policy="observe")
         else:
             # note_response would read a headerless 429 as a burst and pace the account.
             print(f"warning: usage refresh of {name}: HTTP {r.status_code} without usage headers",
@@ -1176,8 +1203,7 @@ async def rotate_switch(request: Request):
         return JSONResponse({"error": "unknown device key"}, status_code=401)
     # Serve adds the tailnet identity to any request, a cross-site form post included:
     # only same-origin JSON, which another page cannot send without a CORS preflight.
-    if (request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json"
-            or request.headers.get("sec-fetch-site", "same-origin") != "same-origin"):
+    if not same_origin_json(request):
         return JSONResponse({"error": "send same-origin JSON"}, status_code=403)
     try:
         body = json.loads(await bounded_body(request) or b"{}")
@@ -1208,6 +1234,44 @@ async def rotate_switch(request: Request):
         project_default_route()
         save_state()
     return {"active_account": STATE["active_account"], "pinned": STATE.get("pinned")}
+
+
+def same_origin_json(request: Request) -> bool:
+    return (request.headers.get("content-type", "").split(";")[0].strip().lower() == "application/json"
+            and request.headers.get("sec-fetch-site", "same-origin") == "same-origin")
+
+
+@app.post("/rotate/device-pin")
+async def rotate_device_pin(request: Request):
+    """Set account_pin (null means Auto) or use_config for one device until restart."""
+    if not panel_allowed(request):
+        return JSONResponse({"error": "unknown device key"}, status_code=401)
+    if not same_origin_json(request):
+        return JSONResponse({"error": "send same-origin JSON"}, status_code=403)
+    try:
+        body = json.loads(await bounded_body(request))
+    except (ValueError, RecursionError):
+        body = None
+    if not isinstance(body, dict) or not isinstance(body.get("device"), str):
+        return JSONResponse({"error": "device and pin action are required"}, status_code=400)
+    name = body["device"]
+    use_config = set(body) == {"device", "use_config"} and body["use_config"] is True
+    if not use_config and (set(body) != {"device", "account_pin"}
+                           or (body["account_pin"] is not None
+                               and not valid_account_pin(body["account_pin"], CFG["configured_accounts"]))):
+        return JSONResponse({"error": "send a valid account_pin, null for Auto, or use_config"},
+                            status_code=400)
+    async with state_lock:
+        if name not in CFG["devices"]:
+            return JSONResponse({"error": "unknown device"}, status_code=404)
+        if not granted(name, ANTHROPIC):
+            return JSONResponse({"error": "device needs the anthropic grant"}, status_code=403)
+        if use_config:
+            DEVICE_PIN_OVERRIDES.pop(name, None)
+        else:
+            DEVICE_PIN_OVERRIDES[name] = body["account_pin"]
+        pin, source = device_pin(name)
+    return {"device": name, "account_pin": pin, "source": source}
 
 
 def panel_allowed(request: Request) -> bool:
@@ -2291,11 +2355,22 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
         while True:
             await retry_wait(0, request)
             remaining = hold_deadline - time.monotonic()
-            if pending and verdict == "exhausted" and remaining <= 0:
-                return pending[0], pending[1], retries, "exhausted"
             now = time.time()
             async with state_lock:
-                account = select_account(route_family, now)
+                pin, _ = device_pin(rec["device"])
+                policy = pin["mode"] if pin else "automatic"
+                account = None
+                if pin:
+                    target = pin["account"]
+                    available = target in ACCOUNTS and not disabled(target) and bool(ACCOUNTS[target].get("token"))
+                    if policy == "strict" and not available:
+                        raise HTTPException(status_code=503, detail=f"strict pin target '{target}' is unavailable")
+                    if available and (policy == "strict" or blocker_deadline(target, route_family, now) <= now):
+                        account = target
+                if account is None:
+                    if pending and verdict == "exhausted" and remaining <= 0:
+                        return pending[0], pending[1], retries, "exhausted"
+                    account = select_account(route_family, now, update=policy == "automatic")
                 if account is None:
                     if not any(not disabled(name) for name in ACCOUNTS):
                         raise HTTPException(status_code=503, detail="no enabled accounts")
@@ -2310,7 +2385,8 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                         save_state()
                 else:
                     info = STATE["accounts"].get(account, {})
-                    pace = info.get("pace_by_family", {}).get(route_family, info.get("pace_until", 0)) - now
+                    pace = (0 if policy == "strict" else
+                            info.get("pace_by_family", {}).get(route_family, info.get("pace_until", 0)) - now)
                     token = ACCOUNTS[account]["token"]
             if account is None:
                 if wait > 0:
@@ -2334,12 +2410,14 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes, r
                 client.build_request(method, url, headers=fwd_headers, content=body), stream=True)
             try:
                 verdict = await note_response(account, upstream.headers, upstream.status_code, family=family,
-                                              repeated_burst=account in burst_accounts)
+                                              repeated_burst=account in burst_accounts, policy=policy)
             except BaseException:
                 await upstream.aclose()
                 raise
             if upstream.status_code != 429:
                 return upstream, account, retries, verdict
+            if policy == "strict":
+                verdict = "strict"
             retry_after = upstream.headers.get("retry-after")
             entry = {"account": account, "verdict": verdict,
                      "retry_after": retry_after[:200] if retry_after is not None else None,
@@ -2424,6 +2502,8 @@ async def openai_chat(request: Request):
               "anthropic-ratelimit-unified-status"):
         if upstream.headers.get(h):
             resp_headers[h] = upstream.headers[h]
+    if verdict == "strict" and upstream.headers.get("retry-after") is not None:
+        resp_headers["retry-after"] = upstream.headers["retry-after"]
 
     if upstream.status_code == 429 and verdict == "exhausted":
         content = await bounded_response(upstream)

@@ -14,7 +14,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -351,6 +353,123 @@ async def reporting(c):
           and not any(s in log for s in SECRETS + list(KEY.values())))
 
 
+async def device_pins(c):
+    accounts = dict(R.ACCOUNTS, backup={"name": "backup", "token": "fake-backup-token"})
+    pins = {"claude": {"account": "backup", "mode": "strict"},
+            "allbox": {"account": "backup", "mode": "fallback"}}
+    model = b'{"model":"claude-fable-5","messages":[{"role":"user","content":"hi"}]}'
+    reset = time.time() + 3600
+    refusal = {"type": "error", "error": {"type": "rate_limit_error", "message": "Fable spent"}}
+    denied = False
+
+    def respond(req):
+        backup = req.headers["authorization"] == "Bearer fake-backup-token"
+        if backup:
+            return httpx.Response(429 if denied else 200, json=refusal if denied else {"content": []},
+                                  headers={"anthropic-ratelimit-unified-7d_oi-utilization": "1" if denied else ".99",
+                                           "anthropic-ratelimit-unified-7d_oi-reset": str(reset), "retry-after": "5"})
+        return httpx.Response(200, json={"content": []})
+
+    async def dispatch(name, path="/v1/messages"):
+        before = len(seen["anthropic"])
+        response = await ask(c, path, name, method="POST", body=model)
+        return response, [req.headers["authorization"] for req in seen["anthropic"][before:]]
+
+    async def change(body, device="claude", **headers):
+        return await ask(c, "/rotate/device-pin", device, method="POST", body=json.dumps(body).encode(),
+                         headers={"content-type": "application/json"} | headers)
+
+    with patch.dict(R.CFG, {"account_pins": pins, "configured_accounts": {*accounts, "missing"}}), \
+         patch.object(R, "ACCOUNTS", accounts), patch.object(R, "DEVICE_PIN_OVERRIDES", {}), \
+         patch.object(R, "STATE", {"active_account": "acct", "accounts": {}, "events": []}), \
+         patch.dict(reply, {"anthropic": respond}):
+        default_auth, pinned_auth = f"Bearer {ACCOUNT_TOKEN}", "Bearer fake-backup-token"
+        r = await ask(c, "/rotate/switch", "claude", method="POST", body=b'{"account":"acct"}',
+                      headers={"content-type": "application/json"})
+        check("the legacy panel pick sets both eligible soft preferences",
+              r.status_code == 200 and all(route["manual_account"] == "acct" for route in R.STATE["routes"].values()))
+        for path in ("/v1/messages", "/v1/chat/completions"):
+            denied = False
+            r, sent = await dispatch("allbox", path)
+            check(f"{path} fallback pin takes precedence over the panel pick and soft threshold",
+                  r.status_code == 200 and sent == [pinned_auth])
+            denied = True
+            r, sent = await dispatch("claude", path)
+            r2, sent2 = await dispatch("claude", path)
+            check(f"{path} strict pin relays the first 429 even with a known hard block",
+                  r.status_code == r2.status_code == 429 and sent == sent2 == [pinned_auth]
+                  and r.headers.get("retry-after") == "5" and "Fable spent" in r.text)
+
+            R.STATE["accounts"]["backup"]["claims"]["7d_oi"]["utilization"] = 0.99
+            before = deepcopy(R.STATE["routes"])
+            r, sent = await dispatch("allbox", path)
+            free, free_sent = await dispatch("tiny", path)
+            check(f"{path} fallback retries elsewhere after exhaustion and leaves both routes alone",
+                  r.status_code == free.status_code == 200 and sent == [pinned_auth, default_auth]
+                  and free_sent == [default_auth] and R.STATE["routes"] == before)
+
+            R.STATE["accounts"]["backup"]["claims"]["7d_oi"]["reset"] = time.time() - 1
+        R.family_route("fable").update(active_account="backup", last_switch_ts=time.time(), manual_account=None)
+        r, sent = await dispatch("allbox")
+        check("fallback leaves a shared route pointing at the now-blocked account",
+              r.status_code == 200 and R.family_route("fable")["active_account"] == "backup"
+              and sent == [pinned_auth, default_auth])
+        R.STATE["accounts"]["backup"]["claims"]["7d_oi"]["reset"] = time.time() - 1
+        r = await ask(c, "/rotate/switch", "claude", method="POST", body=b'{"account":"backup"}',
+                      headers={"content-type": "application/json"})
+        assert r.status_code == 200
+        r, sent = await dispatch("tiny")
+        check("an automatic Fable exhaustion releases only the Fable panel preference",
+              r.status_code == 200 and sent == [pinned_auth, default_auth]
+              and R.family_route("fable")["manual_account"] is None
+              and R.family_route("default")["manual_account"] == "backup")
+
+        pins["claude"] = {"account": "missing", "mode": "strict"}
+        r, sent = await dispatch("claude")
+        check("a strict pin to a configured account without an available token returns 503 without dispatch",
+              r.status_code == 503 and "unavailable" in r.json()["detail"] and sent == [])
+        pins["allbox"] = {"account": "missing", "mode": "fallback"}
+        r, sent = await dispatch("allbox")
+        check("fallback can use the automatic choice when the configured target is missing",
+              r.status_code == 200 and sent == [default_auth])
+        pins["claude"] = {"account": "backup", "mode": "strict"}
+        accounts["backup"]["disabled"] = True
+        r, sent = await dispatch("claude")
+        check("a strict pin to a disabled account also returns 503 without dispatch",
+              r.status_code == 503 and sent == [])
+
+        snapshot = (tmp / "state.json").read_bytes()
+        auto = {"device": "claude", "account_pin": None}
+        cases = [(await change(auto, "oaibox"), 401),
+                 (await change(auto, **{"sec-fetch-site": "cross-site"}), 403),
+                 (await change(auto, **{"content-type": "text/plain"}), 403),
+                 (await change(auto | {"device": "oaibox"}), 403),
+                 (await change(auto | {"account_pin": {"account": "unknown", "mode": "strict"}}), 400),
+                 (await change(auto | {"use_config": True}), 400)]
+        check("unauthorized, cross-site, invalid and provider-only pin writes leave the override map empty",
+              all(response.status_code == expected for response, expected in cases) and not R.DEVICE_PIN_OVERRIDES)
+        gate = R.RequestAdmission(R.app, limit=1)
+        gate.active = 1
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gate), base_url="http://proxy") as gated:
+            r = await gated.post("/rotate/device-pin", json=auto, headers={"authorization": f"Bearer {KEY['claude']}"})
+        check("Auto until restart has a runtime source and works at full proxy admission",
+              r.status_code == 200 and r.json() == {"device": "claude", "account_pin": None, "source": "runtime"}
+              and gate.active == 1)
+        check("a runtime pin override never writes the state file", (tmp / "state.json").read_bytes() == snapshot)
+        r, sent = await dispatch("claude")
+        check("runtime Auto overrides the configured strict pin", r.status_code == 200 and sent == [default_auth])
+        with patch.object(R, "DEVICE_PIN_OVERRIDES", {}):
+            check("a fresh override map restores config pin precedence after restart",
+                  R.device_pin("claude") == (pins["claude"], "config"))
+        r = await change({"device": "claude", "account_pin": {"account": "acct", "mode": "strict"}})
+        check("an explicit session pin wins over the configured target",
+              r.status_code == 200 and r.json()["account_pin"]["account"] == "acct" and r.json()["source"] == "runtime")
+        r = await change({"device": "claude", "use_config": True})
+        check("Use config clears the override and differs from runtime Auto",
+              r.status_code == 200 and r.json()["account_pin"] == pins["claude"] and r.json()["source"] == "config"
+              and "claude" not in R.DEVICE_PIN_OVERRIDES)
+
+
 async def connection_lines(c):
     # RFC 9110 section 5.3: Connection sent on two lines is one list.
     reply["lan"] = lambda req: httpx.Response(
@@ -384,10 +503,11 @@ async def main():
         await reporting(c)
         check("no refresh was attempted", seen["auth"] == [])
         await connection_lines(c)
+        await device_pins(c)
 
 
-def load_with(devices):
-    d = fixture({"devices": devices})
+def load_with(devices, **overrides):
+    d = fixture({"devices": devices} | overrides)
     old = R.CONFIG_PATH
     R.CONFIG_PATH = d / "config.json"
     try:
@@ -412,6 +532,12 @@ def refuses(load, arg, word):
 cfg = load_with({"x": {"key": "fake-key-x", "providers": ["lan"]}, "y": "fake-key-y"})
 check("an object device entry boots with its grant",
       cfg["devices"] == {"x": "fake-key-x", "y": "fake-key-y"} and cfg["device_grants"] == {"x": ["lan"]})
+pin = {"account": "missing", "mode": "strict"}
+cfg = load_with({"x": {"key": "fake-key-x", "account_pin": pin}}, accounts=[
+    {"name": "acct", "token_file": "tokens/acct.token"}, {"name": "missing", "token_file": "tokens/not-present.token"}])
+check("a valid pin-only object grants Claude even when the pinned configured token is missing",
+      cfg["account_pins"] == {"x": pin} and cfg["device_grants"] == {"x": ["anthropic"]}
+      and {acct["name"] for acct in cfg["accounts"]} == {"acct"})
 for label, entry, word in (
         ("an object without providers", {"key": "fake-key-x"}, "providers"),
         ("an empty providers list", {"key": "fake-key-x", "providers": []}, "providers"),
@@ -419,6 +545,10 @@ for label, entry, word in (
         ("providers as a string", {"key": "fake-key-x", "providers": "lan"}, "providers"),
         ("a misspelt \"provider\"", {"key": "fake-key-x", "provider": ["lan"]}, "providers"),
         ("an extra key", {"key": "fake-key-x", "providers": ["lan"], "note": "x"}, "providers"),
+        ("a pin to an unknown account", {"key": "fake-key-x", "account_pin": pin}, "account_pin"),
+        ("unknown pin mode", {"key": "fake-key-x", "account_pin": {"account": "acct", "mode": "soft"}}, "account_pin"),
+        ("provider-only pin", {"key": "fake-key-x", "providers": ["lan"],
+                               "account_pin": {"account": "acct", "mode": "strict"}}, "anthropic grant"),
         ("an object without a key", {"providers": ["lan"]}, "device keys")):
     check(f"device entry refused: {label}", refuses(load_with, {"x": entry}, word))
 check("device entry refused: a key shared by an object and a string",
