@@ -17,6 +17,7 @@ import stat
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,8 +131,10 @@ class Body(httpx.AsyncByteStream):
 
     def __init__(self, *items):
         self.items, self.closed = items, False
+        self.reading = asyncio.Event()
 
     async def __aiter__(self):
+        self.reading.set()
         for item in self.items:
             if isinstance(item, BaseException):
                 raise item
@@ -534,14 +537,27 @@ async def search_checks():
           and any(s["limit"] == "search_tool" and s["minutes"] == 300
                   and s["points"][-1][1:] == [19, quota_reset, "inference"] for s in history))
     nb = len(backend.calls)
-    for provider in ("plain", "draw"):
-        r, new = await call("POST", f"/{provider}/v1/alpha/search", content=body, headers=HDRS)
-        sent = siwc[provider].calls[-1]
-        check(f"search without a Codex login on {provider} still uses Sign in with ChatGPT",
-              r.status_code == 200 and len(backend.calls) == nb and "route" not in one(new)
-              and str(sent.url) == P.SIWC_API + "/v1/alpha/search"
-              and sent.headers["authorization"] == f"Bearer {SIWC[provider][0]}"
-              and "x-openai-actor-authorization" not in sent.headers)
+    r, new = await call("POST", "/plain/v1/alpha/search", content=body, headers=HDRS)
+    sent = siwc["plain"].calls[-1]
+    check("search without images enabled still uses Sign in with ChatGPT",
+          r.status_code == 200 and len(backend.calls) == nb and "route" not in one(new)
+          and str(sent.url) == P.SIWC_API + "/v1/alpha/search"
+          and sent.headers["authorization"] == f"Bearer {SIWC['plain'][0]}"
+          and "x-openai-actor-authorization" not in sent.headers)
+
+    nc = len(siwc["draw"].calls)
+    DRAW.images.path.write_text("{}")
+    invalid = P.CodexLogin("draw", tmp)
+    with patch.object(Path, "read_text", side_effect=PermissionError):
+        unreadable = P.CodexLogin("draw", tmp)
+    for failed_login, reason in ((DRAW.images, "no credential"), (invalid, "lacks a token"),
+                                 (unreadable, "is unreadable")):
+        with patch.object(DRAW, "images", failed_login):
+            r, new = await call("POST", "/draw/v1/alpha/search", content=body)
+        check(f"images-enabled search returns 503 without switching upstream ({reason})",
+              r.status_code == 503 and reason in r.json()["error"]["message"]
+              and len(backend.calls) == nb and len(siwc["draw"].calls) == nc
+              and one(new).get("route") == "codex-search" and one(new).get("status") == 503)
     with patch.object(R, "MAX_REQUEST_BYTES", len(body) - 1), patch.object(R, "MAX_IMAGE_REQUEST_BYTES", len(body)):
         r, _ = await call("POST", path, content=body, headers=HDRS)
     check("search over max_request_bytes gets 413 before the backend call",
@@ -556,6 +572,19 @@ async def search_checks():
           and "upstream response too large" in r.text and result not in r.text
           and one(new).get("status") == 502 and one(new).get("upstream_status") == 200 and one(new).get("bytes") == 0)
 
+    gone = asyncio.Event()
+    stream = Body(answer[:8], asyncio.Event())
+    backend.answer = lambda request: httpx.Response(200, stream=stream)
+    before = len(rows())
+    task = asyncio.create_task(direct("POST", path, body, gone=gone))
+    await asyncio.wait_for(stream.reading.wait(), 2)
+    gone.set()
+    head, _ = await asyncio.wait_for(task, 2)
+    rec = one(rows()[before:])
+    check("disconnecting during buffered search closes the upstream and releases admission with 499",
+          head.get("status") == 499 and stream.closed and idle()
+          and rec.get("route") == "codex-search" and rec.get("status") == 499 and rec.get("bytes") == 0)
+
     page = Body(b"<html>fake backend challenge</html>")
     backend.answer = lambda request: httpx.Response(403, headers={"content-type": "text/html"}, stream=page)
     r, new = await call("POST", path, content=body)
@@ -564,6 +593,13 @@ async def search_checks():
           and "fake backend challenge" not in r.text and one(new).get("upstream_content_type") == "text/html")
 
     backend.answer = image_ok
+    for route, nominated in ((path, "x-codex-turn-metadata"), (image_path, "x-codex-image-turn-id")):
+        headers = list((HDRS | {"authorization": f"Bearer {DESK}"}).items())
+        headers += [("connection", "accept"), ("connection", f" {nominated.upper()}")]
+        r = await C.post(route, content=body if route == path else PROMPT, headers=headers)
+        check(f"{route} filters allowed headers named on a second Connection line",
+              r.status_code == 200 and nominated not in backend.calls[-1].headers
+              and backend.calls[-1].headers.get("accept") != HDRS["accept"])
     await call("POST", image_path, content=PROMPT)
     image_status = login.last_answer
     na = len(cx_auth.calls)
@@ -598,6 +634,40 @@ async def search_checks():
 
     na = len(cx_auth.calls)
     login.refreshed_at = 0
+    refusal = js({"error": {"code": "rejected_by_hardened_oauth_boundary"}})
+    access = secret("fake-cx-search-replayed", True)
+    backend.answer = lambda request: (httpx.Response(401, content=refusal)
+                                      if request.headers["authorization"] == f"Bearer {access}" else expired(request))
+    cx_auth.answer = lambda request: httpx.Response(200, json={
+        "access_token": access, "refresh_token": secret("fake-cx-search-replay-rotation", True)})
+    nb = len(backend.calls)
+    r, new = await call("POST", path, content=body)
+    check("the replay's refusal replaces the initial 401 classification and is relayed without Content-Type",
+          r.status_code == 401 and r.content == refusal and len(cx_auth.calls) == na + 1
+          and len(backend.calls) == nb + 2 and login.down is None
+          and one(new).get("retries") == 1 and one(new).get("refresh_after_401") == "attempted"
+          and one(new).get("upstream_error") == "rejected_by_hardened_oauth_boundary")
+
+    stream = Body(b"x" * (P.PEEK_MAX + 1), asyncio.Event())
+    backend.answer = lambda request: httpx.Response(401, stream=stream)
+    refreshing = asyncio.Event()
+
+    async def blocked_refresh(*args, **kwargs):
+        refreshing.set()
+        await asyncio.Event().wait()
+
+    with patch.object(login, "refresh", side_effect=blocked_refresh):
+        task = asyncio.create_task(direct("POST", path, body))
+        await asyncio.wait_for(refreshing.wait(), 2)
+        was_open = not stream.closed
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+    check("cancelling during refresh closes the retained 401 and releases admission",
+          was_open and stream.closed and task.cancelled() and idle())
+
+    na = len(cx_auth.calls)
+    login.refreshed_at = 0
     backend.answer = expired
     cx_auth.answer = lambda request: httpx.Response(401, json={"error": "invalid_grant"})
     r, new = await call("POST", path, content=body)
@@ -609,6 +679,11 @@ async def search_checks():
     r, _ = await call("POST", image_path, content=PROMPT)
     check("a permanent token-endpoint refusal takes the shared login down for images too",
           r.status_code == 503 and len(backend.calls) == nb and idle())
+    nc = len(siwc["openai"].calls)
+    r, _ = await call("POST", path, content=body)
+    check("search with a refused login still returns its 503 reason without switching upstream",
+          r.status_code == 503 and "invalid_grant" in r.json()["error"]["message"]
+          and len(backend.calls) == nb and len(siwc["openai"].calls) == nc)
     check("no search query, result or forwarded metadata appears in the audit",
           not any(s in R.AUDIT_PATH.read_text() for s in (query, result, "fake-secret-repo")))
 

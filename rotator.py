@@ -967,6 +967,27 @@ async def bounded_response(upstream: httpx.Response, limit: int | None = None) -
     return bytes(body)
 
 
+async def buffered_search(request: Request, upstream: httpx.Response) -> bytes:
+    async def wait_for_disconnect():
+        # The request body was consumed before forwarding.
+        while (await request.receive())["type"] != "http.disconnect":
+            pass
+
+    read = asyncio.create_task(bounded_response(upstream, min(MAX_RESPONSE_BYTES, MAX_SEARCH_RESPONSE_BYTES)))
+    disconnected = asyncio.create_task(wait_for_disconnect())
+    try:
+        await asyncio.wait((read, disconnected), return_when=asyncio.FIRST_COMPLETED)
+        if disconnected.done():
+            disconnected.result()
+            raise HTTPException(status_code=499, detail="client disconnected")
+        return read.result()
+    finally:
+        read.cancel()
+        disconnected.cancel()
+        await asyncio.gather(read, disconnected, return_exceptions=True)
+        await upstream.aclose()
+
+
 # API list prices per MTok, [input, output] or [input, output, cached input], matched
 # by the longest pattern found in the model id. Without a cached-input price a cache
 # read costs 0.1x input; a cache write costs 1.25x input. Cost columns are
@@ -2271,7 +2292,7 @@ async def provider_proxy(request: Request, prov):
                          and httpx.URL(prov.upstream).raw_path.strip(b"/") != b"")
     search = request.method == "POST" and path == providers.SEARCH_PATH
     body = await bounded_body(request, MAX_IMAGE_REQUEST_BYTES if images and not search else None)
-    if search and images and images.rec:
+    if search and images:
         return await codex_proxy(request, prov, device, providers.SEARCH_ENDPOINT, path, body, refuse)
     hold = LARGE_BODIES.take(len(body))
     streaming = False
@@ -2404,7 +2425,7 @@ async def codex_proxy(request: Request, prov, device: str, endpoint: str, path: 
                     return unavailable(429, f"{IMAGE_LINE_MAX} image requests are already waiting; retry later",
                                        "rate_limit_error")
             upstream, retries, notes = await login.send(
-                "POST", providers.codex_url(endpoint), providers.codex_headers(dict(request.headers), search),
+                "POST", providers.codex_url(endpoint), providers.codex_headers(forward_headers(request), search),
                 body, alive)
         except providers.ClientGone:
             finish(status=499)
@@ -2436,7 +2457,7 @@ async def codex_proxy(request: Request, prov, device: str, endpoint: str, path: 
 
         if search:
             try:
-                content = await bounded_response(upstream, min(MAX_RESPONSE_BYTES, MAX_SEARCH_RESPONSE_BYTES))
+                content = await buffered_search(request, upstream)
             except HTTPException as exc:
                 finish(status=exc.status_code, upstream_status=upstream.status_code)
                 return refuse(exc.status_code, str(exc.detail), "api_error")

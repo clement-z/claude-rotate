@@ -566,7 +566,7 @@ error type) and `refresh_after_401` (skipped, held back, or attempted) for any 4
 entry, the proxy sends those two requests to the ChatGPT backend Codex uses with its
 own login (`https://chatgpt.com/backend-api/codex`), with a Codex ChatGPT login it
 holds, billed to the same plan. The proxy also sends Codex's web search request
-there when the Codex login is installed. These are private endpoints. See
+there with the Codex login. These are private endpoints. See
 SECURITY.md before turning them on.
 
 1. On the laptop, a login used for nothing else, then on the server:
@@ -587,9 +587,8 @@ SECURITY.md before turning them on.
    ```
    Codex offers `image_gen` to a provider of its own only when that header is set
    (any value, stripped before forwarding). The header also enables the web
-   search tool. The gateway sends `POST /alpha/search` through the Codex login
-   when installed. After a live search succeeds through the gateway, you can
-   drop `web_search = "disabled"`.
+   search tool. After a live search succeeds through the gateway, you can drop
+   `web_search = "disabled"`.
 
 Codex resends each generated image (about 1.3 MB of base64 for a 1536x1024 PNG) with
 every later request of its thread, so under a provider with images the request
@@ -599,9 +598,12 @@ above `max_request_bytes` share `max_image_bytes_in_flight` (256 MiB, then 503),
 generation takes about 8 s. Answers are relayed as they come; an HTML error page
 from the backend becomes a short JSON error, since Codex shows the model the body.
 The audit record carries `route: "codex-images"`, the duration and the bytes.
-Search uses `max_request_bytes`. Search replies are buffered up to 4 MiB or
-`max_response_bytes`, whichever is lower. The audit records `route: "codex-search"`
-without search input or results.
+Search uses `max_request_bytes`. With `"images": true`, the gateway sends
+`POST /alpha/search` through the Codex login and returns 503 if the login is
+unavailable. It buffers replies up to 4 MiB or `max_response_bytes`, whichever
+is lower, and audits them as `route: "codex-search"` without search input or
+results. Without `"images": true`, search follows the ordinary Sign in with
+ChatGPT route.
 
 **Quota.** The proxy keeps the plan's latest figures per limit and shows them in
 `/rotate/status` (`quotas`), the panel's OpenAI card and `claude-rotate-admin status`.

@@ -357,26 +357,35 @@ class OpenAISiwc:
         if upstream.status_code != 401:
             return upstream, 0, {}
         upstream, answer = await peek(upstream)
-        kind = error_type(answer)
-        notes = {"upstream_error": kind} if kind else {}
-        if kind in REFUSED_OPERATION:
-            return upstream, 0, notes | {"refresh_after_401": "skipped: operation refused"}
-        asked = self.refreshed_at
-        await self.refresh(token, force=True)  # waits for one in flight, which may be enough
-        notes["refresh_after_401"] = (
-            "attempted" if self.refreshed_at != asked
-            else "held back: a refresh ran less than 10 min ago" if time.time() - asked < FORCED_REFRESH_MIN_S
-            else "not attempted: the refresh is backing off or the credential is not on disk")
-        if self.down:
+        try:
+            kind = error_type(answer)
+            notes = {"upstream_error": kind} if kind else {}
+            if kind in REFUSED_OPERATION:
+                return upstream, 0, notes | {"refresh_after_401": "skipped: operation refused"}
+            asked = self.refreshed_at
+            await self.refresh(token, force=True)  # waits for one in flight, which may be enough
+            notes["refresh_after_401"] = (
+                "attempted" if self.refreshed_at != asked
+                else "held back: a refresh ran less than 10 min ago" if time.time() - asked < FORCED_REFRESH_MIN_S
+                else "not attempted: the refresh is backing off or the credential is not on disk")
+            if self.down:
+                raise ProviderDown(self.down, notes | {"upstream_status": 401})
+            if self.rec.get("access_token") == token:
+                return upstream, 0, notes
+        except BaseException:
             await upstream.aclose()
-            raise ProviderDown(self.down, notes | {"upstream_status": 401})
-        if self.rec.get("access_token") == token:
-            return upstream, 0, notes  # no replacement: the caller gets OpenAI's 401
+            raise
         await upstream.aclose()
         token = await self.token()
         await _check(alive)  # last, after every wait
-        return await self.client.send(self.client.build_request(
-            method, url, headers=headers | self._auth(token), content=body), stream=True), 1, notes
+        upstream = await self.client.send(self.client.build_request(
+            method, url, headers=headers | self._auth(token), content=body), stream=True)
+        if upstream.status_code == 401:
+            upstream, answer = await peek(upstream)
+            notes.pop("upstream_error", None)
+            if kind := error_type(answer):
+                notes["upstream_error"] = kind
+        return upstream, 1, notes
 
     def _auth(self, token: str) -> dict:
         return {"authorization": f"Bearer {token}"}

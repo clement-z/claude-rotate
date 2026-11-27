@@ -147,7 +147,8 @@ smaller. Under a provider with `"images": true` a body may reach
 `max_image_request_bytes` (32 MiB, set in `config.json`), and the bodies above
 4 MiB held at once are capped by `max_image_bytes_in_flight` (256 MiB), so the
 worst case stays inside the 768M limit. Codex web search uses the ordinary
-request limit and buffers answers up to 4 MiB. Existing swap
+request limit. With `"images": true`, it buffers Codex login replies up to
+4 MiB or the configured response limit, whichever is lower. Existing swap
 is sufficient as an emergency buffer, but heavy swapping makes streaming and the
 watchdog less reliable. Check RSS and restart counts under your actual workload
 before raising limits. The CPU limit is often the tighter constraint on a one-vCPU host.
