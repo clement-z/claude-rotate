@@ -258,7 +258,9 @@ check("an entry marked renews restarts the cycle", R.billing_periods(restart, D(
           (D(2026, 10, 20), D(2026, 11, 20)), (D(2026, 11, 20), D(2026, 12, 20))])
 
 R.BILLING_ERRORS.clear()
-R.CFG = {"plans": {"team": {"price": 30, "weight": 0.3}, "bad": {"price": -1}}}
+R.CFG = {"plans": {"team": {"price": 30, "weight": 0.3}, "bad": {"price": -1},
+                   "infinite-price": {"price": json.loads("1e309"), "weight": 1},
+                   "infinite-weight": {"price": 30, "weight": json.loads("1e309")}}}
 R.ACCOUNTS = {"a": {"name": "a", "billing": [{"from": "2026-09-14", "plan": "max"},
                                              {"from": "2026-10-20", "plan": "ultra"}]},
               "b": {"name": "b"},
@@ -266,8 +268,17 @@ R.ACCOUNTS = {"a": {"name": "a", "billing": [{"from": "2026-09-14", "plan": "max
                                              {"from": "2026-10-05", "plan": "max"}]}}
 R.BILLING = R.load_billing()
 del R.PLANS["team"]
-check("bad plans and out-of-order timelines are reported and ignored, not fatal",
-      set(R.BILLING) == {"a"} and "bad" not in R.PLANS and len(R.BILLING_ERRORS) == 2)
+check("bad plans, non-finite prices or weights and out-of-order timelines are ignored",
+      set(R.BILLING) == {"a"} and not {"bad", "infinite-price", "infinite-weight"} & R.PLANS.keys()
+      and len(R.BILLING_ERRORS) == 4)
+pro_account = {"name": "p", "billing": [{"from": "2026-09-14", "plan": "pro"}]}
+plans, timelines, errors = R.pricing.load_billing({"pro": {"price": 200}}, [pro_account])
+check("price-only overrides preserve a billed Claude Pro account and suggest a separate OpenAI plan",
+      plans["pro"] == {"price": 20, "weight": 0.2} and timelines["claude"]["p"][0][2] == "pro"
+      and len(errors) == 1 and "chatgpt-pro" in errors[0])
+plans, timelines, errors = R.pricing.load_billing({"pro": {"price": 21, "weight": 0.25}}, [pro_account])
+check("a weighted override of a built-in Claude plan still applies",
+      plans["pro"] == {"price": 21, "weight": 0.25} and timelines["claude"]["p"][0][2] == "pro" and not errors)
 midnight = lambda d: time.mktime(d.timetuple())
 check("weight follows the plan in force",
       R.weight("a", midnight(D(2026, 10, 1))) == 1 and R.weight("a", midnight(D(2026, 10, 20))) == 2

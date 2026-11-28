@@ -264,6 +264,10 @@ elements.tip.parentNode=new Element();
   await timers.get(10000)();
   assert(!elements.billing.innerHTML.includes('<mark')&&elements.billing.innerHTML.includes('ChatGPT plan &lt;mark'));
   assert(elements.billing.innerHTML.includes('Plan differs')&&elements.billing.innerHTML.includes('3.0&times; the price'));
+  assert(elements.billing.innerHTML.includes('$50/mo')&&elements.billing.innerHTML.includes('data-l="Price">$50</td>')
+    && !elements.billing.innerHTML.includes('$50.00')&&elements.billing.innerHTML.includes('$200/mo'));
+  const fractional=180.5.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  assert(elements.billing.innerHTML.includes('data-l="Price">$'+fractional+'</td>'));
   assert(elements.billing.innerHTML.includes('<td data-l="Weekly use">–</td>')
      && elements.billing.innerHTML.includes('<td data-l="At its limit">&ndash;</td>'));
   assert(html(elements.oai).includes('Configured &lt;mark'));

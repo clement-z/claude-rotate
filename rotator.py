@@ -561,8 +561,7 @@ def provider_billing_info(name: str, now: float) -> dict:
         return {}
     plan = entry[2]
     quotas = getattr(PROVIDERS.get(name), "quotas", {})
-    reported = quotas.get("codex", {}).get("plan") or next(
-        (figures["plan"] for figures in quotas.values() if isinstance(figures.get("plan"), str)), None)
+    reported = providers.reported_quota_plan(quotas)
     return {"plan": plan, "price": PLANS[plan]["price"], "reported_plan": reported,
             "plan_mismatch": isinstance(reported, str) and provider_plan_id(plan) != provider_plan_id(reported)}
 
@@ -2284,7 +2283,7 @@ function claimMeters(account,now){
 }
 function wlabel(m){return m==null?'':m%10080===0?(m/10080===1?'7d':m/10080+'w'):m%1440===0?(m/1440===1?'24h':m/1440+'d'):m%60===0?m/60+'h':m+'min'}
 function quotas(name,p){const now=Date.now()/1000, q=p.quotas||{}, im=p.images;
-  const plan=p.billing?.reported_plan||q.codex?.plan||(Object.values(q).find(f=>f&&f.plan)||{}).plan;
+  const plan=p.reported_plan||p.billing?.reported_plan||(Object.values(q).find(f=>f&&f.plan)||{}).plan;
   const wins=f=>['primary','secondary'].map(k=>f&&f[k]).filter(Boolean).sort((a,b)=>(a.window_minutes||0)-(b.window_minutes||0));
   // A window that has reset since the figure counts as 0, as for the Claude accounts.
   const row=(what,f,w)=>{const past=w.resets_at&&w.resets_at<=now;
@@ -2462,9 +2461,11 @@ function spark(v){if(!v||!v.length)return '';const w=96,h=24,m=Math.max(...v)||1
 function billing(b, providers){
   const rows=[...Object.entries(b||{}),...Object.entries(providers||{}).map(([name,bill])=>[name,bill,true])];
   const pct=v=>v==null?'–':esc(Math.round(v))+'%', date=s=>esc(day(Date.parse(s+'T00:00')/1000));
+  const price=v=>Number.isFinite(v)?'$'+esc(v.toLocaleString(undefined,{
+    minimumFractionDigits:Number.isInteger(v)?0:2,maximumFractionDigits:2})):'–';
   if(!rows.length) return '<span class="muted small">Add <code>billing</code> to an account or OpenAI provider in config.json to see its plan, renewal date and monthly use.</span>';
   return rows.map(([n,a,openai])=>{const left=Math.ceil((Date.parse(a.renews+'T00:00')-Date.now())/D/1000);
-    let h=`<div class="acct-head"><b>${esc(n)}</b><span class="badge">${esc(a.plan)} &middot; ${money(a.price)}/mo</span>`
+    let h=`<div class="acct-head"><b>${esc(n)}</b><span class="badge">${esc(a.plan)} &middot; ${price(a.price)}/mo</span>`
       +(openai?`<span class="badge">ChatGPT plan${a.reported_plan?' '+esc(a.reported_plan):''}</span>`:'')
       +(openai&&a.plan_mismatch?'<span class="small" style="color:var(--warn)">Plan differs</span>':'')
       +(a.renews?`<span class="muted small">renews ${date(a.renews)}${left>=0?' &middot; in '+left+' d':''}</span>`:'')+'</div>'
@@ -2472,7 +2473,7 @@ function billing(b, providers){
       +(openai?'':'<th>All accounts</th>')+'</tr>';
     for(const p of a.periods||[]){const u=p.usage||{}, notes=[p.elapsed<p.days?`so far: ${esc(p.elapsed)} of ${esc(p.days)} d`:'',!openai&&p.covered<p.elapsed?`${esc(p.covered)} of ${esc(p.elapsed)} d recorded`:''].filter(Boolean);
       h+=`<tr><td>${date(p.start)} &ndash; ${date(p.end)}${notes.length?'<span class="sub">'+notes.join(' &middot; ')+'</span>':''}</td>`
-        +`<td class="l" data-l="Plan">${(p.plans||[]).map(esc).join(' &rarr; ')}</td><td data-l="Price">${money(p.price)}</td>`
+        +`<td class="l" data-l="Plan">${(p.plans||[]).map(esc).join(' &rarr; ')}</td><td data-l="Price">${price(p.price)}</td>`
         +`<td data-l="Weekly use">${pct(p.used)}${p.used==null?'':'<span class="sub">busiest week '+pct(p.peak)+'</span>'}</td>`
         +`<td data-l="At its limit">${openai?'&ndash;':esc(p.limited_h)+' h<span class="sub">all accounts '+esc(p.blocked_h)+' h</span>'}</td>`
         +`<td data-l="$ equiv">${money(u.cost_usd)}<span class="sub">${p.price?((u.cost_usd||0)/p.price).toFixed(1)+'&times; the price':''}</span></td>`

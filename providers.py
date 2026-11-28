@@ -540,8 +540,11 @@ class OpenAISiwc:
                     if minutes and prev.get("window_minutes") == minutes:
                         matching_slot = which
                 latest[matching_slot or empty_slot or slot] = window
-            if "plan" not in latest and "plan" in prior:
-                latest["plan"] = prior["plan"]
+            prior_plan_at = quota_plan_seen_at(prior)
+            if latest.get("plan") and seen >= prior_plan_at:
+                latest["plan_seen_at"] = seen
+            elif prior.get("plan"):
+                latest.update(plan=prior["plan"], plan_seen_at=prior_plan_at)
             self.quotas[limit] = latest
         self.quota_history.cap_series()
 
@@ -549,7 +552,7 @@ class OpenAISiwc:
         now = time.time()
         saved = self.rec.get("refresh_saved_at")
         state = "down" if self.down else "unavailable" if self._remaining() <= 0 else "ok"
-        extra = {"quotas": self.quotas}
+        extra = {"quotas": self.quotas, "reported_plan": reported_quota_plan(self.quotas)}
         if self.images:
             extra["images"] = self.images.login_status()
         return extra | {"kind": self.kind, "prefix": self.prefix, "upstream": self.upstream, "state": state,
@@ -741,6 +744,18 @@ NOTES = "gateway"  # the record's field for what the gateway learnt: a refusal o
 def number(value) -> bool:
     """A JSON number usable as seconds: not a bool, NaN, Infinity or beyond any date."""
     return type(value) in (int, float) and -1e15 < value < 1e15
+
+
+def quota_plan_seen_at(figures):
+    # Older saved figures only have the quota receipt time.
+    seen_at = figures.get("plan_seen_at", figures.get("seen_at"))
+    return seen_at if number(seen_at) else 0
+
+
+def reported_quota_plan(quotas):
+    plans = (figures for figures in quotas.values()
+             if isinstance(figures, dict) and isinstance(figures.get("plan"), str) and figures["plan"])
+    return max(plans, key=quota_plan_seen_at, default={}).get("plan")
 
 
 def usable_record(rec) -> bool:

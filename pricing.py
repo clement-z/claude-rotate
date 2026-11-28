@@ -4,21 +4,32 @@ import re
 import sys
 import time
 from datetime import date
+from math import isfinite
 
 
 DEFAULT_PLANS = {"pro": {"price": 20, "weight": 0.2}, "max": {"price": 100, "weight": 1},
                  "ultra": {"price": 200, "weight": 2}}  # USD per month; weekly quota vs Max
 
 
+def finite_number(value):
+    try:
+        return type(value) in (int, float) and isfinite(value)
+    except OverflowError:
+        return False
+
+
 def load_billing(overrides, accounts, base_plans=DEFAULT_PLANS, *, providers=None):
     """Read monthly prices and separate Claude and OpenAI plan timelines."""
     plans, errors = dict(base_plans), []
     for name, plan in (overrides.items() if isinstance(overrides, dict) else ()):
-        if (isinstance(plan, dict) and type(plan.get("price")) in (int, float) and plan["price"] >= 0
-                and ("weight" not in plan or (type(plan["weight"]) in (int, float) and plan["weight"] > 0))):
+        if isinstance(plan, dict) and name in DEFAULT_PLANS and "weight" not in plan:
+            errors.append(f"plan '{name}' overrides a built-in Claude plan and needs a weight; "
+                          "give OpenAI plans their own name, such as 'chatgpt-pro'")
+        elif (isinstance(plan, dict) and finite_number(plan.get("price")) and plan["price"] >= 0
+              and ("weight" not in plan or (finite_number(plan["weight"]) and plan["weight"] > 0))):
             plans[name] = plan
         else:
-            errors.append(f"plan '{name}' needs a price >= 0 and, if set, a weight > 0")
+            errors.append(f"plan '{name}' needs a finite price >= 0 and, if set, a finite weight > 0")
     openai = (dict(spec, name=name) for name, spec in (providers.items() if isinstance(providers, dict) else ())
               if isinstance(spec, dict) and spec.get("kind") == "openai-siwc")
     timelines = {"claude": {}, "openai": {}}

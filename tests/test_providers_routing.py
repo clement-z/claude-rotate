@@ -444,7 +444,7 @@ async def reporting(c):
 
 
 async def provider_billing(c):
-    plan = "chatgpt-prolite"
+    plan = "chatgpt-pro"
     bill = [{"from": "2026-11-01", "plan": plan}]
     specs = {
         "openai": {"kind": "openai-siwc", "billing": bill},
@@ -460,17 +460,18 @@ async def provider_billing(c):
             R.BILLING = R.load_billing()
             provider = live["openai"]
             window = {"used_percent": 20, "window_minutes": 10080, "resets_at": now + 3600}
-            provider.record_quotas({"codex": {"primary": window, "plan": "pro_lite"}}, "usage", now)
+            provider.record_quotas({"codex": {"primary": window, "plan": "Pro"}}, "usage", now)
             provider.record_quotas({"codex": {"primary": window | {"window_minutes": 300},
-                                             "secondary": window}}, "inference", now)
+                                             "secondary": window}}, "inference", now + 1)
             status = (await ask(c, "/rotate/status", "claude")).json()
             check("provider billing accepts a price-only plan and preserves the reported plan across headers",
                   status["providers"]["openai"]["billing"] ==
-                  {"plan": plan, "price": 50, "reported_plan": "pro_lite", "plan_mismatch": False}
-                  and set(R.PROVIDER_BILLING) == {"openai"})
+                  {"plan": plan, "price": 50, "reported_plan": "Pro", "plan_mismatch": False}
+                  and set(R.PROVIDER_BILLING) == {"openai"} and provider.quotas["codex"]["plan_seen_at"] == now)
             check("OpenAI billing leaves Claude weekly capacity unchanged",
                   status["weekly"]["capacity"] == capacity and not R.BILLING)
-            provider.record_quotas({"codex": {"primary": window, "plan": "plus"}}, "usage", now)
+            stamp = int(now) + 2
+            provider.record_quotas({"codex": {"primary": window, "plan": "plus"}}, "usage", stamp + .1)
             stats = (await ask(c, "/rotate/stats", "claude")).json()
             check("provider subscriptions show reported plan mismatches and flag invalid billing in alerts",
                   stats["provider_billing"]["openai"]["plan_mismatch"]
@@ -478,6 +479,14 @@ async def provider_billing(c):
                   and all(any(f"billing ignored: provider '{name}'" in alert["text"] for alert in stats["alerts"])
                           for name in ("broken", "unknown"))
                   and set(stats["provider_billing"]) == {"openai"})
+            provider.record_quotas({"imagegen_premium": {"primary": window | {"window_minutes": 1440},
+                                                        "plan": "pro"}}, "images", stamp + .2)
+            provider.record_quotas({"codex": {"primary": window}}, "inference", stamp + .3)
+            status = (await ask(c, "/rotate/status", "claude")).json()["providers"]["openai"]
+            check("the newest plan observation wins across limits even after newer utilization-only data",
+                  status["reported_plan"] == status["billing"]["reported_plan"] == "pro"
+                  and not status["billing"]["plan_mismatch"]
+                  and provider.quotas["codex"]["plan_seen_at"] == stamp + .1)
     finally:
         for provider in live.values():
             await provider.client.aclose()
