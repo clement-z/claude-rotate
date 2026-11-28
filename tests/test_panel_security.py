@@ -259,11 +259,14 @@ elements.tip.parentNode=new Element();
   assert(!elements.billing.innerHTML.includes('ChatGPT plan'),'an unbilled provider has no subscription section');
   stats.provider_billing={[value]:{plan:value,reporting_plan:value,reported_plan:value,plan_mismatch:true,price:50,
     periods:[{start:'2026-11-01',end:'2026-12-01',plans:[value],price:50,days:30,elapsed:28,
+              used:null,limited_h:null,usage:{cost_usd:150}},
+             {start:'2026-10-17',end:'2026-11-01',plans:[value],price:25,days:15,elapsed:15,
               used:null,limited_h:null,usage:{cost_usd:150}}]}};
   status.providers[value].billing={plan:value,reported_plan:value};
   await timers.get(10000)();
   assert(!elements.billing.innerHTML.includes('<mark')&&elements.billing.innerHTML.includes('ChatGPT plan &lt;mark'));
   assert(elements.billing.innerHTML.includes('Plan differs')&&elements.billing.innerHTML.includes('3.0&times; the price'));
+  assert(elements.billing.innerHTML.includes('6.0&times; the price'),'shortened period uses its prorated price for the ratio');
   assert(elements.billing.innerHTML.includes('$50/mo')&&elements.billing.innerHTML.includes('data-l="Price">$50</td>')
     && !elements.billing.innerHTML.includes('$50.00')&&elements.billing.innerHTML.includes('$200/mo'));
   const fractional=180.5.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});

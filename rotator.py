@@ -1983,21 +1983,20 @@ def month_add(d, n: int):
 
 
 def billing_periods(timeline: list, today) -> list:
-    """[start, end) of each billing period up to the one holding today: monthly from the
-    first entry's date, restarting at an entry marked renews. Other plan changes keep
-    the renewal date (prorated upgrades)."""
+    """(start, end, natural_end) for each period through today, monthly from the first
+    entry or the last entry marked renews. Keep the scheduled end for proration."""
     starts = [e[1] for i, e in enumerate(timeline) if i == 0 or e[3]]
     out = []
     for i, first in enumerate(starts):
         stop = starts[i + 1] if i + 1 < len(starts) else None
         n = 0
         while True:
-            start, end = month_add(first, n), month_add(first, n + 1)
-            if stop and end >= stop:
-                out.append((start, stop))
+            start, natural_end = month_add(first, n), month_add(first, n + 1)
+            if stop and natural_end >= stop:
+                out.append((start, stop, natural_end))
                 break
-            out.append((start, end))
-            if not stop and end > today:
+            out.append((start, natural_end, natural_end))
+            if not stop and natural_end > today:
                 break
             n += 1
     return [p for p in out if p[0] <= today]
@@ -2017,7 +2016,7 @@ def busiest_week(days: list):
 
 def subscription_period_rows(name, timeline, today, ledger):
     import datetime as dt
-    for start, end in billing_periods(timeline, today)[-13:]:
+    for start, end, natural_end in billing_periods(timeline, today)[-13:]:
         span = [start + dt.timedelta(days=n) for n in range((end - start).days)]
         plans = [pricing.plan_at(timeline, time.mktime(day.timetuple()))[2] for day in span]
         elapsed = [(day, plan) for day, plan in zip(span, plans) if day <= today]
@@ -2027,7 +2026,7 @@ def subscription_period_rows(name, timeline, today, ledger):
                 usage[field] = usage.get(field, 0) + value
         row = {"start": start.isoformat(), "end": end.isoformat(), "days": len(span),
                "elapsed": len(elapsed), "plans": list(dict.fromkeys(plans)), "usage": usage,
-               "price": round(sum(PLANS[p]["price"] for p in plans) / len(span), 2)}
+               "price": round(sum(PLANS[p]["price"] for p in plans) / (natural_end - start).days, 2)}
         yield row, elapsed, plans[-1]
 
 

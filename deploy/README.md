@@ -160,6 +160,11 @@ your actual monthly price in place of the example.
 }
 ```
 
+Web upgrades on chatgpt.com normally start a new cycle and credit unused
+time. Set `"renews": true` when the invoice starts a new cycle so the panel
+prorates the shortened period. Leave it off when the invoice keeps the
+existing renewal date. Record a downgrade on the renewal date it takes effect.
+
 `claude-rotate-admin status` shows the configured provider plan. The panel
 also shows the plan reported by ChatGPT when available. OpenAI billing
 periods sum Responses and Chat Completions usage. Assigning Sign in with

@@ -250,12 +250,16 @@ check("a month later keeps the day or takes the month's last",
       R.month_add(D(2027, 1, 31), 1) == D(2027, 2, 28) and R.month_add(D(2027, 1, 31), 2) == D(2027, 3, 31)
       and R.month_add(D(2028, 1, 31), 1) == D(2028, 2, 29) and R.month_add(D(2026, 11, 14), 2) == D(2027, 1, 14))
 up = [(0, D(2026, 9, 14), "max", False), (0, D(2026, 10, 20), "ultra", False)]
-check("an upgrade keeps the renewal date", R.billing_periods(up, D(2026, 11, 3))
-      == [(D(2026, 9, 14), D(2026, 10, 14)), (D(2026, 10, 14), D(2026, 11, 14))])
-restart = [(0, D(2026, 9, 5), "pro", False), (0, D(2026, 10, 20), "max", True)]
-check("an entry marked renews restarts the cycle", R.billing_periods(restart, D(2026, 11, 25))
-      == [(D(2026, 9, 5), D(2026, 10, 5)), (D(2026, 10, 5), D(2026, 10, 20)),
-          (D(2026, 10, 20), D(2026, 11, 20)), (D(2026, 11, 20), D(2026, 12, 20))])
+check("an upgrade without renews keeps the renewal date", R.billing_periods(up, D(2026, 11, 3))
+      == [(D(2026, 9, 14), D(2026, 10, 14), D(2026, 10, 14)),
+          (D(2026, 10, 14), D(2026, 11, 14), D(2026, 11, 14))])
+restart = [(0, D(2027, 1, 31), "pro", False), (0, D(2027, 3, 16), "max", True)]
+check("renews restarts the cycle and the shortened period's scheduled end follows the original anchor",
+      R.billing_periods(restart, D(2027, 4, 20))
+      == [(D(2027, 1, 31), D(2027, 2, 28), D(2027, 2, 28)),
+          (D(2027, 2, 28), D(2027, 3, 16), D(2027, 3, 31)),
+          (D(2027, 3, 16), D(2027, 4, 16), D(2027, 4, 16)),
+          (D(2027, 4, 16), D(2027, 5, 16), D(2027, 5, 16))])
 
 R.BILLING_ERRORS.clear()
 R.CFG = {"plans": {"team": {"price": 30, "weight": 0.3}, "bad": {"price": -1},
@@ -378,5 +382,26 @@ check("provider billing keeps new usage across restart and leaves Claude plan co
       and R.ROLLUP["accounts"] == existing["accounts"]
       and all(item["plan"] != "chatgpt-prolite" for row in R.billing_report(today)["a"]["periods"]
               for item in row["whatif"]))
+
+upgrade_day = D(2026, 9, 16)
+upgrade = {"from": upgrade_day.isoformat(), "plan": "max", "renews": True}
+R.ACCOUNTS["a"]["billing"] = [{"from": "2026-09-01", "plan": "pro"}, upgrade]
+R.CFG["plans"]["chatgpt-pro"] = {"price": 100}
+R.CFG["providers"]["a"]["billing"] = [{"from": "2026-09-01", "plan": "chatgpt-prolite"},
+                                     upgrade | {"plan": "chatgpt-pro"}]
+R.BILLING = R.load_billing()
+current, prior = R.billing_report(upgrade_day)["a"]["periods"]
+check("an upgrade that renews prices the shortened Claude period against the original month",
+      (prior["start"], prior["end"], prior["days"], prior["elapsed"], prior["price"])
+      == ("2026-09-01", "2026-09-16", 15, 15, 10)
+      and (current["start"], current["end"], current["days"], current["elapsed"], current["price"])
+      == ("2026-09-16", "2026-10-16", 30, 1, 100))
+current, prior = R.provider_billing_report(upgrade_day)["a"]["periods"]
+check("a shortened OpenAI period uses the same proration", prior["price"] == 25 and current["price"] == 100)
+del upgrade["renews"]
+R.BILLING = R.load_billing()
+current, = R.billing_report(upgrade_day)["a"]["periods"]
+check("keeping the original renewal date still averages both prices over the full period",
+      (current["start"], current["end"], current["price"]) == ("2026-09-01", "2026-10-01", 60))
 
 print(f"\nall {PASS} checks passed")

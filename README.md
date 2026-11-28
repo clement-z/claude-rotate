@@ -358,10 +358,10 @@ Live per-account quota gauges, straight from Anthropic's rate-limit headers:
   every 30 min into `usage_history.json` next to `state.json` and kept 14 days.
 - **Subscriptions** — for each account with `billing` set: its plan, price and
   renewal date, and one row per billing period (the last 13). A row shows the
-  plan (an upgrade inside the period prorates the price by days), how much of
-  its weekly quota the account used on average and in its busiest week, hours
-  at its weekly limit and hours with every account at its limit, and the
-  period's cost-equivalent against the price. The last column decides a plan
+  plan and its price prorated by days, including periods cut short by an upgrade.
+  It shows weekly quota use on average and in the busiest week, hours at the
+  account's limit and hours with every account at its limit, and the period's
+  cost-equivalent against the price. The last column decides a plan
   change: the most of the accounts' combined weekly quota used in any 7 days,
   then the same with this account on the next plan down or up. Over 100% means
   every account would have run out; well under it on the plan down means the
@@ -596,9 +596,11 @@ path prefix; the bare root stays the rotated Claude accounts, unchanged.
   rotated token: OpenAI does not document one for this flow.
 - **OpenAI billing.** Add a monthly price under `plans` and the same dated
   `billing` timeline used for accounts to the `openai-siwc` entry in
-  `config.json`. The first entry sets the renewal day. An entry with
-  `"renews": true` restarts the cycle. Replace the example price with what
-  you pay.
+  `config.json`. Web upgrades on chatgpt.com normally start a new cycle
+  and credit unused time. Set `"renews": true` when the invoice starts a new
+  cycle so the panel prorates the shortened period. Leave it off when the
+  invoice keeps the existing renewal date. Record a downgrade on the renewal
+  date it takes effect. Replace the example price with what you pay.
 
   ```json
   "plans": {"chatgpt-prolite": {"price": 50}},
@@ -798,7 +800,7 @@ can lose readings since the last successful save.
 | `max_image_request_bytes`, `max_image_bytes_in_flight`, `max_concurrent_images` | limits for a provider with `"images": true`: request body (default 32 MiB), bytes of bodies above `max_request_bytes` held at once (256 MiB), image requests at the backend at once (2; 8 more wait) |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
-| `accounts[].billing` | the account's plans over time, for the panel's Subscriptions card and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra"}]`. The first date sets the monthly renewal day; a later entry changes plan from its date and keeps the renewal day (Anthropic prorates upgrades). Add `"renews": true` to an entry that restarts the billing cycle, such as Pro to Max. Record a downgrade with the renewal date it takes effect on. A broken entry is ignored and shown as a panel alert. |
+| `accounts[].billing` | the account's plans over time, for Subscriptions and the weekly chart: `[{"from": "2026-09-14", "plan": "max"}, {"from": "2026-10-20", "plan": "ultra", "renews": true}]`. The first date sets the monthly renewal day. Web upgrades on claude.ai start a new cycle and credit unused time. Set `"renews": true` when the invoice starts a new cycle so the panel prorates the shortened period. Leave it off when the invoice keeps the existing renewal date. Record a downgrade on the renewal date it takes effect. A broken entry is ignored and shown as a panel alert. |
 | `providers.<name>.billing` | optional for `openai-siwc`, with the same timeline format and validation as `accounts[].billing`. Used for Subscriptions and Quota rates. |
 | `plans{}` | extra or corrected plans: `name → {"price": USD a month}`. Claude plans also need `"weight"`, the weekly quota relative to Max. Built in: `pro` (20, 0.2), `max` (100, 1), `ultra` (200, 2). OpenAI plan prices come from the config. |
 | `accounts[].weight` | weekly capacity relative to a Max account, for accounts without `billing` (default 1): an Ultra is `2`, a Pro `0.2`. With `billing`, the plan sets it. |
